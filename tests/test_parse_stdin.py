@@ -98,6 +98,7 @@ def test_empty_string_returns_defaults(tmp_path: Path, monkeypatch: pytest.Monke
         "branch": "",
         "user": "n/a",
         "context_tokens": 0,
+        "transcript_path": "",
     }
 
 
@@ -112,6 +113,7 @@ def test_whitespace_only_returns_defaults(tmp_path: Path, monkeypatch: pytest.Mo
         "branch": "",
         "user": "n/a",
         "context_tokens": 0,
+        "transcript_path": "",
     }
 
 
@@ -126,6 +128,7 @@ def test_invalid_json_returns_defaults(tmp_path: Path, monkeypatch: pytest.Monke
         "branch": "",
         "user": "n/a",
         "context_tokens": 0,
+        "transcript_path": "",
     }
 
 
@@ -141,6 +144,7 @@ def test_missing_fields_use_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyP
         "branch": "",
         "user": "n/a",
         "context_tokens": 0,
+        "transcript_path": "",
     }
 
 
@@ -155,6 +159,7 @@ def test_empty_object_uses_all_defaults(tmp_path: Path, monkeypatch: pytest.Monk
         "branch": "",
         "user": "n/a",
         "context_tokens": 0,
+        "transcript_path": "",
     }
 
 
@@ -236,6 +241,36 @@ def test_context_tokens_non_dict_context_window(tmp_path: Path, monkeypatch: pyt
     monkeypatch.chdir(tmp_path)
     payload = json.dumps({"session_id": "s1", "context_window": "big"})
     assert parse_stdin(payload)["context_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# transcript_path extraction (payload.transcript_path)
+# ---------------------------------------------------------------------------
+
+def test_transcript_path_extracted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A string transcript_path lands verbatim in the parsed dict — no
+    existence check here (parse_stdin stays I/O-free apart from git)."""
+    monkeypatch.chdir(tmp_path)
+    payload = json.dumps({
+        "session_id": "s1",
+        "transcript_path": "C:/tmp/does-not-exist-yet.jsonl",
+    })
+    result = parse_stdin(payload)
+    assert result["transcript_path"] == "C:/tmp/does-not-exist-yet.jsonl"
+
+
+def test_transcript_path_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No transcript_path in payload → default ""."""
+    monkeypatch.chdir(tmp_path)
+    result = parse_stdin(json.dumps({"session_id": "s1"}))
+    assert result["transcript_path"] == ""
+
+
+def test_transcript_path_non_str_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defensive: non-str transcript_path (int / dict) → "", not a crash."""
+    monkeypatch.chdir(tmp_path)
+    assert parse_stdin(json.dumps({"transcript_path": 42}))["transcript_path"] == ""
+    assert parse_stdin(json.dumps({"transcript_path": {"p": 1}}))["transcript_path"] == ""
 
 
 def test_get_branch_caches_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

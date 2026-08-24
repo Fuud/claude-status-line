@@ -785,3 +785,107 @@ def test_header_context_zero_without_session(fake_home_with_real_session) -> Non
     assert result.returncode == 0
     header = result.stdout.decode("utf-8").splitlines()[0]
     assert header.endswith("| Context: 0K (0%)"), f"header: {header!r}"
+
+
+# ---------------------------------------------------------------------------
+# 10. Dirless sessions (2026-08-24) — CC only creates `<sid>/` once the
+# session spawns a subagent; sessions without one must still render the
+# main-row table. Jsonl resolution: transcript_path payload → glob.
+# ---------------------------------------------------------------------------
+
+DIRLESS_SID = "99999999-8888-7777-6666-555555555555"
+
+_DIRLESS_MAIN_LINES = [
+    # event 1: in=1000, out=100, cache_create=2000, cache_read=3000
+    '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a"}],"model":"x","stop_reason":"end_turn","usage":{"input_tokens":1000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":3000,"output_tokens":100}},"uuid":"d1","sessionId":"x","timestamp":"2026-08-24T21:00:00.000Z"}',
+    # event 2 (last): in=800, out=50, cache_read=1000
+    '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"b"}],"model":"x","stop_reason":"end_turn","usage":{"input_tokens":800,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000,"output_tokens":50}},"uuid":"d2","sessionId":"x","timestamp":"2026-08-24T21:00:01.000Z"}',
+]
+# Expected aggregates: cum_in=1800 → "2k", cum_out=150 → "150",
+# cum_cache_read=4000 → "4k"; last-event occupancy 800+0+1000=1800 → "2K (1%)".
+_DIRLESS_EXPECTED_CELLS = ["2k", "150", "4k"]
+
+
+def _build_dirless_session(tmp_path: Path, sid: str) -> Path:
+    """Create a jsonl WITHOUT its `<sid>/` directory — the subagentless
+    session layout. Returns the jsonl path."""
+    encoded = "dirless-project"
+    jsonl = tmp_path / ".claude" / "projects" / encoded / f"{sid}.jsonl"
+    jsonl.parent.mkdir(parents=True)
+    jsonl.write_text("\n".join(_DIRLESS_MAIN_LINES) + "\n")
+    return jsonl
+
+
+def test_dirless_session_via_transcript_path_renders_main_row(
+    tmp_path: Path,
+) -> None:
+    """No `<sid>/` dir; payload carries transcript_path → table header +
+    main row render (no sum row, no agent rows), values from the jsonl,
+    Context from the jsonl fallback."""
+    jsonl = _build_dirless_session(tmp_path, DIRLESS_SID)
+    stdin = json.dumps({
+        "session_id": DIRLESS_SID,
+        "model": {"display_name": "X"},
+        "transcript_path": str(jsonl),
+    })
+
+    result = _run_main(stdin, tmp_path)
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    lines = result.stdout.decode("utf-8").splitlines()
+    assert len(lines) == 3, f"expected 3 lines (header, labels, main): {lines!r}"
+    header, labels, main = lines
+    # Context falls back to jsonl-derived occupancy of the LAST event.
+    assert header.endswith("| Context: 2K (1%)"), f"header: {header!r}"
+    assert labels.split() == ["in", "out", "cached"], f"labels: {labels!r}"
+    cells = main.split()
+    assert cells[0] == "main:", f"main row: {main!r}"
+    assert cells[1:] == _DIRLESS_EXPECTED_CELLS, f"main row: {main!r}"
+    assert "sum:" not in result.stdout.decode("utf-8"), "no agents → no sum row"
+
+
+def test_dirless_session_via_glob_renders_main_row(tmp_path: Path) -> None:
+    """Same dirless layout but NO transcript_path in the payload (older CC)
+    → the one-level projects glob still locates the jsonl; identical table."""
+    _build_dirless_session(tmp_path, DIRLESS_SID)
+    stdin = json.dumps({"session_id": DIRLESS_SID, "model": {"display_name": "X"}})
+
+    result = _run_main(stdin, tmp_path)
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    lines = result.stdout.decode("utf-8").splitlines()
+    assert len(lines) == 3, f"expected 3 lines: {lines!r}"
+    assert lines[0].endswith("| Context: 2K (1%)"), f"header: {lines[0]!r}"
+    assert lines[2].split()[1:] == _DIRLESS_EXPECTED_CELLS, f"main: {lines[2]!r}"
+
+
+def test_dirless_session_skips_agents_cache_write(tmp_path: Path) -> None:
+    """No session dir → no agents to cache; agents_<sid>.json must NOT be
+    created (no data/ litter), while main_<sid>.json IS written."""
+    _build_dirless_session(tmp_path, DIRLESS_SID)
+    stdin = json.dumps({
+        "session_id": DIRLESS_SID,
+        "model": {"display_name": "X"},
+        "context_window": {"total_input_tokens": 1000},
+    })
+
+    result = _run_main(stdin, tmp_path)
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    data_dir = tmp_path / ".claude" / "status_line" / "data"
+    assert not (data_dir / f"agents_{DIRLESS_SID}.json").exists()
+    assert (data_dir / f"main_{DIRLESS_SID}.json").exists()
+
+
+def test_no_jsonl_anywhere_still_header_only(tmp_path: Path) -> None:
+    """Session id with neither a session dir, nor a transcript_path, nor a
+    globbable jsonl → header-only degrade (the historical no-dir behavior)."""
+    (tmp_path / ".claude" / "projects" / "empty-project").mkdir(parents=True)
+    stdin = json.dumps({"session_id": "no-such-session", "model": {"display_name": "X"}})
+
+    result = _run_main(stdin, tmp_path)
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    lines = result.stdout.decode("utf-8").splitlines()
+    assert len(lines) == 1, f"header-only expected, got: {lines!r}"
+    assert lines[0].endswith("| Context: 0K (0%)"), f"header: {lines[0]!r}"

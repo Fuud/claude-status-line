@@ -218,6 +218,7 @@ _DEFAULTS: dict[str, Any] = {
     "branch": "",
     "user": "n/a",
     "context_tokens": 0,
+    "transcript_path": "",
 }
 
 
@@ -273,12 +274,16 @@ def parse_stdin(json_str: str) -> dict:
     module-level TTL cache. Returns "" on any failure (not a git repo, git
     missing, timeout).
 
-    Returns keys: session_id, prompt_id, model, branch, user, context_tokens.
+    Returns keys: session_id, prompt_id, model, branch, user,
+    context_tokens, transcript_path.
     context_tokens is payload.context_window.total_input_tokens — the
     context-window occupancy at the most recent API response (input +
     cache writes + cache reads), per the statusline docs. 0 when absent
     (pre-first-API-call, older CC versions); the orchestrator then falls
     back to the jsonl-derived value.
+    transcript_path is payload.transcript_path — the main session jsonl
+    path per Claude Code. "" when absent; the orchestrator uses it as the
+    primary source when resolving the main jsonl (see _find_main_jsonl).
     """
     # defensive copy so we don't mutate the module default dict on error paths
     out = dict(_DEFAULTS)
@@ -298,6 +303,13 @@ def parse_stdin(json_str: str) -> dict:
     sid = payload.get("session_id", "")
     if isinstance(sid, str):
         out["session_id"] = sid
+
+    # transcript_path — main session jsonl location per CC. Kept verbatim
+    # (no existence check here; parse_stdin stays I/O-free apart from the
+    # branch subprocess). _find_main_jsonl validates it on use.
+    tpath = payload.get("transcript_path", "")
+    if isinstance(tpath, str):
+        out["transcript_path"] = tpath
 
     pid = payload.get("prompt_id", "")
     if isinstance(pid, str):
@@ -890,6 +902,59 @@ def find_session_dir(
 
 
 # ---------------------------------------------------------------------------
+# _find_main_jsonl
+# ---------------------------------------------------------------------------
+
+def _find_main_jsonl(
+    transcript_path: str,
+    session_id: str,
+    session_dir: Path | None,
+    projects_root: Path | None = None,
+) -> Path | None:
+    """Resolve the main session jsonl path for `session_id`.
+
+    Priority (first existing file wins):
+        1. `transcript_path` from the stdin payload — Claude Code's own
+           statement of where the session jsonl lives. Works even for
+           sessions that never spawned a subagent (and thus have no
+           `<sid>/` directory on disk at all).
+        2. Sibling of a found `session_dir` (the historical layout —
+           `main()` used to derive the jsonl exclusively this way).
+        3. One-level glob `<projects_root>/*/<session_id>.jsonl`.
+
+    [deviation] The glob is one level (`*/`), not recursive (`**/`):
+    the on-disk convention is `<encoded-project>/<sid>.jsonl` with encoded
+    project dirs as direct children of `projects/`, and a recursive walk
+    would descend into every session dir (incl. `subagents/` trees) for
+    no gain. `find_session_dir` above stays recursive for directories —
+    its historical contract.
+
+    Returns None when `session_id` is empty or nothing matches — the
+    orchestrator then degrades to a header-only line.
+
+    Like `find_session_dir`, `projects_root` defaults to
+    `<home>/.claude/projects` and is injectable for tests.
+    """
+    if not session_id:
+        return None
+    if transcript_path:
+        candidate = Path(transcript_path)
+        if candidate.is_file():
+            return candidate
+    if session_dir is not None:
+        sibling = session_dir.parent / f"{session_id}.jsonl"
+        if sibling.is_file():
+            return sibling
+    if projects_root is None:
+        projects_root = Path.home() / ".claude" / "projects"
+    if projects_root.exists():
+        for candidate in projects_root.glob(f"*/{session_id}.jsonl"):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # sort_agents
 # ---------------------------------------------------------------------------
 
@@ -1289,8 +1354,16 @@ def _main_unsafe() -> int:
         return 0
 
     session_dir = find_session_dir(session_id)
-    if session_dir is None:
-        # no matching session dir on disk → header only (payload context)
+    # main jsonl: transcript_path payload → session_dir sibling → projects
+    # glob (see _find_main_jsonl). The session dir itself is NOT a gate —
+    # CC only materializes `<sid>/` once the session spawns its first
+    # subagent, and a subagentless session still deserves its main-row
+    # table + jsonl-derived Context.
+    main_jsonl = _find_main_jsonl(
+        parsed.get("transcript_path", ""), session_id, session_dir
+    )
+    if main_jsonl is None:
+        # no main jsonl anywhere → header only (payload context)
         print(_build_header(parsed, _context_segment(parsed, None)))
         return 0
 
@@ -1298,8 +1371,6 @@ def _main_unsafe() -> int:
     main_cache = _cache_path(data_dir, "main", session_id)
     agents_cache = _cache_path(data_dir, "agents", session_id)
 
-    # main jsonl lives as a SIBLING of session_dir (see deviation note above)
-    main_jsonl = session_dir.parent / f"{session_id}.jsonl"
     main_cum = compute_main_cum(main_jsonl, main_cache)
 
     # Header needs main_cum for the jsonl-fallback context occupancy, so it
@@ -1313,8 +1384,14 @@ def _main_unsafe() -> int:
     # in that case.
     task_notifications = main_cum.get("task_notifications", {})
 
-    agents = _compute_agents(session_dir, agents_cache, task_notifications)
-    _write_agents_cache(agents_cache, agents)
+    agents: list = []
+    if session_dir is not None:
+        agents = _compute_agents(session_dir, agents_cache, task_notifications)
+        _write_agents_cache(agents_cache, agents)
+    # else: no session dir → no subagents ever spawned → agents stays [].
+    # The agents cache write is skipped too: there is nothing to cache,
+    # and writing an empty dict would litter data/ with agents_<sid>.json
+    # files for every dirless session.
 
     # sort_agents calls .get(...) on the second argument, so it MUST be a
     # dict. A malformed cache (e.g. tool_use_positions accidentally written

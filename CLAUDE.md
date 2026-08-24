@@ -15,7 +15,7 @@ the public surface one function per test module.
 | read / compute    | `_read_last_event`, `_scan_main_jsonl`,                | no    |
 |                   | `_atomic_write_json`, `_load_meta_dict`, `_meta_mtime` |       |
 | cache / aggregate | `compute_main_cum`, `compute_agent_snapshot`,          | no    |
-|                   | `find_session_dir`, `sort_agents`                      |       |
+|                   | `find_session_dir`, `_find_main_jsonl`, `sort_agents`  |       |
 | render            | `render_output`                                        | yes   |
 | orchestrator      | `main()`                                               | no    |
 
@@ -155,9 +155,28 @@ jsonl is a **sibling** of the session directory, not a child:
 ~/.claude/projects/<encoded-project>/<sid>/subagents/agent-*.jsonl
 ```
 
-`main()` is the only place that knows this layout — it computes
-`main_jsonl = session_dir.parent / f"{sid}.jsonl"` and feeds it to
-`compute_main_cum`. All `compute_*` helpers are layout-agnostic.
+[deviation] The `<sid>/` directory (containing only `subagents/`) is
+created by Claude Code only once the session spawns its first subagent.
+Sessions without subagents have a jsonl sibling but **no session dir at
+all**, so the session dir must not gate rendering. `_find_main_jsonl`
+resolves the jsonl with this priority (first existing file wins):
+
+1. payload `transcript_path` (extracted by `parse_stdin`) — CC's own
+   statement of the jsonl location;
+2. sibling of a found `session_dir` (the historical resolution);
+3. one-level glob `~/.claude/projects/*/<sid>.jsonl` (one level, not
+   recursive — encoded-project dirs are direct children of `projects/`,
+   and a recursive walk would descend into every session dir for no
+   gain; `find_session_dir` stays recursive for directories).
+
+When no jsonl resolves, `main()` degrades to the header-only line.
+When the jsonl resolves but no session dir exists, `_compute_agents`
+is skipped entirely: agents stay `[]`, the agents cache write is
+skipped (nothing to cache — avoids `data/` litter for every dirless
+session), and the table renders as header labels + `main:` row only
+(`sum:` appears only when agents exist). The header `Context:` field
+falls back to the jsonl-derived occupancy as usual. All `compute_*`
+helpers are layout-agnostic.
 
 ## Git Bash wrapper
 
@@ -212,3 +231,11 @@ point to the relevant explanation.
   `resolve_context_limit` / `format_context`; `parse_stdin` grew a
   `context_tokens` key; `compute_main_cum` persists `context_tokens`
   with a field-presence guard on cache hit.
+- **2026-08-24** — dirless sessions render the main-row table: the
+  session dir is no longer a gate in `main()`. New `_find_main_jsonl`
+  resolves the jsonl via `transcript_path` payload → session-dir
+  sibling → one-level projects glob; `parse_stdin` grew a
+  `transcript_path` key. Without this, any session that had not yet
+  spawned a subagent (no `<sid>/` dir on disk) rendered header-only —
+  the table from the token-breakdown-table merge was invisible exactly
+  in the sessions most likely to be looked at.
