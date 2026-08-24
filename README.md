@@ -11,12 +11,12 @@ hook. Layout:
 
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a
-         in     out   cached
-sum:     1.2M   35k   53.2M
-main:    1.1M   30k   50.8M
-[ok]    Review: implementation plan     12k    4k   100k
-[err]   Review: quality                 0      0      0
-[run]   Task 4: MissingGlyphLog          3k    1k    12k
+|          in     out   cached
+| sum:     1.2M   35k   53.2M
+| main:    1.1M   30k   50.8M
+| [ok]    Review: implementation plan     12k    4k   100k
+| [err]   Review: quality                 0      0      0
+| [run]   Task 4: MissingGlyphLog          3k    1k    12k
 ```
 
 Line layout:
@@ -30,6 +30,10 @@ Line layout:
 - Lines 5+ — one row per agent, each with three numeric cells:
   input, output, cache-read. `cache_creation` tokens are tracked but
   NOT displayed.
+
+Every table row (lines 2+) starts with the `| ` marker: Claude Code
+strips leading whitespace from status-line rows, and the marker keeps the
+all-spaces table-header row aligned with the rows below it.
 
 Each numeric cell is formatted via `format_tokens` (so `1000` renders
 as `1k`, `1_500_000` as `1.5M`).

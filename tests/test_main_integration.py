@@ -136,11 +136,11 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
     assert not lines[1].startswith("sum:"), (
         f"line 1 must be the table header, not the sum line: {lines[1]!r}"
     )
-    assert lines[2].startswith("sum:"), f"line 2: {lines[2]!r}"
-    assert lines[3].startswith("main:"), f"line 3: {lines[3]!r}"
-    # All agent lines start with a bracketed status tag
+    assert lines[2].startswith("| sum:"), f"line 2: {lines[2]!r}"
+    assert lines[3].startswith("| main:"), f"line 3: {lines[3]!r}"
+    # All agent lines start with the table prefix + a bracketed status tag
     for line in lines[4:]:
-        assert line.startswith("["), f"agent line missing status tag: {line!r}"
+        assert line.startswith("| ["), f"agent line missing status tag: {line!r}"
     # The first agent in the output should be the one with the LOWEST
     # tool_use position in main jsonl. In the f5044e4f session that's
     # "Review implementation plan" (toolUseId=Agent_61, position 260 in
@@ -837,10 +837,11 @@ def test_dirless_session_via_transcript_path_renders_main_row(
     header, labels, main = lines
     # Context falls back to jsonl-derived occupancy of the LAST event.
     assert header.endswith("| Context: 2K (1%)"), f"header: {header!r}"
-    assert labels.split() == ["in", "out", "cached"], f"labels: {labels!r}"
+    # "| " table-row prefix, then the three labels
+    assert labels.split() == ["|", "in", "out", "cached"], f"labels: {labels!r}"
     cells = main.split()
-    assert cells[0] == "main:", f"main row: {main!r}"
-    assert cells[1:] == _DIRLESS_EXPECTED_CELLS, f"main row: {main!r}"
+    assert cells[:2] == ["|", "main:"], f"main row: {main!r}"
+    assert cells[2:] == _DIRLESS_EXPECTED_CELLS, f"main row: {main!r}"
     assert "sum:" not in result.stdout.decode("utf-8"), "no agents → no sum row"
 
 
@@ -856,7 +857,7 @@ def test_dirless_session_via_glob_renders_main_row(tmp_path: Path) -> None:
     lines = result.stdout.decode("utf-8").splitlines()
     assert len(lines) == 3, f"expected 3 lines: {lines!r}"
     assert lines[0].endswith("| Context: 2K (1%)"), f"header: {lines[0]!r}"
-    assert lines[2].split()[1:] == _DIRLESS_EXPECTED_CELLS, f"main: {lines[2]!r}"
+    assert lines[2].split()[2:] == _DIRLESS_EXPECTED_CELLS, f"main: {lines[2]!r}"
 
 
 def test_dirless_session_skips_agents_cache_write(tmp_path: Path) -> None:

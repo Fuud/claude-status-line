@@ -1014,6 +1014,13 @@ _ICON_COL_WIDTH = 6
 # 20260824-subagent-status-via-queue-notifications). detect_status itself
 # still returns only {ok, err, stop, run}.
 _STATUSES = ("ok", "run", "err", "stop", "kill")
+# Prefix prepended to every table row (everything except the session
+# header line). Claude Code strips leading whitespace from status-line
+# rows, which would left-shift the all-spaces token-header row and break
+# its alignment with the sum/main/agent rows. A constant non-space prefix
+# survives the strip and shifts all rows equally, so relative column
+# alignment is preserved.
+_TABLE_ROW_PREFIX = "| "
 
 
 def _col_width(values: list, label: str) -> int:
@@ -1054,12 +1061,16 @@ def render_output(
 
     Layout:
         <header>
-        <table header — labels "in" / "out" / "cached", each right-aligned
-         within its own column>
-        sum: <in> <out> <cached>      # only if len(agents) > 0
-        main: <in> <out> <cached>
-        for each agent (in input order):
-            [<status>]  <description>  <in> <out> <cached>
+        | <table header — labels "in" / "out" / "cached", each right-aligned
+          within its own column>
+        | sum: <in> <out> <cached>    # only if len(agents) > 0
+        | main: <in> <out> <cached>
+        | for each agent (in input order):
+              [<status>]  <description>  <in> <out> <cached>
+
+    Every table row carries the "| " prefix (_TABLE_ROW_PREFIX) so that
+    Claude Code's leading-whitespace strip cannot left-shift the
+    all-spaces token-header row relative to the label/icon rows below.
 
     Every numeric cell is formatted via format_tokens() (so 1000 → "1k")
     BEFORE applying :>W — formatting raw 1000 with width 7 would render
@@ -1170,7 +1181,13 @@ def render_output(
             f"{format_tokens(cached_v):>{w_cached}}"
         )
 
-    return "\n".join(lines)
+    # Prepend the table-row marker to everything except the session header
+    # (see _TABLE_ROW_PREFIX). A single post-processing pass guarantees the
+    # prefix is uniform across all row kinds — no per-f-string repetition
+    # to drift out of sync.
+    return "\n".join(
+        [lines[0], *(_TABLE_ROW_PREFIX + line for line in lines[1:])]
+    )
 
 
 # ---------------------------------------------------------------------------

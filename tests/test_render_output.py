@@ -3,11 +3,15 @@
 render_output(header, main_in, main_out, main_cached, agents) returns a
 string built as:
     header
-    <table header — labels "in" / "out" / "cached", right-aligned per column>
-    sum: <in> <out> <cached>     # only if len(agents) > 0
-    main: <in> <out> <cached>
-    for each agent (in input order):
+    | <table header — labels "in" / "out" / "cached", right-aligned per column>
+    | sum: <in> <out> <cached>  # only if len(agents) > 0
+    | main: <in> <out> <cached>
+    | for each agent (in input order):
         "[<status>]  <description>  <in> <out> <cached>"
+
+Every table row (all lines except the session header) starts with the
+"| " prefix (_TABLE_ROW_PREFIX) so Claude Code's leading-whitespace strip
+cannot left-shift the all-spaces token-header row.
 
 Every numeric cell is formatted through format_tokens() (so 1000 → "1k")
 and right-aligned to a per-column width (max of label length, the widest
@@ -31,6 +35,7 @@ from status_line import (
     _DESC_TOKEN_GAP,
     _ICON_COL_WIDTH,
     _STATUS_GAP,
+    _TABLE_ROW_PREFIX,
     _TOKEN_COLUMN_WIDTH,
     _col_width,
     format_tokens,
@@ -67,17 +72,17 @@ def test_single_ok_agent() -> None:
     assert "out" in lines[1]
     assert "cached" in lines[1]
     # sum line: in=1300→"1k", out=900→"900", cached=300→"300"
-    assert lines[2].startswith("sum:")
+    assert lines[2].startswith(_TABLE_ROW_PREFIX + "sum:")
     assert "1k" in lines[2]
     assert "900" in lines[2]
     assert "300" in lines[2]
     # main line: 1000→"1k", 500→"500", 200→"200"
-    assert lines[3].startswith("main:")
+    assert lines[3].startswith(_TABLE_ROW_PREFIX + "main:")
     assert "1k" in lines[3]
     assert "500" in lines[3]
     assert "200" in lines[3]
     # agent line: starts with [ok], contains description and three numbers
-    assert lines[4].startswith("[ok]")
+    assert lines[4].startswith(_TABLE_ROW_PREFIX + "[ok]")
     assert "Task 1: foo" in lines[4]
     assert "300" in lines[4]
     assert "400" in lines[4]
@@ -100,7 +105,7 @@ def test_zero_agents_no_sum_line() -> None:
     # table header line follows
     assert "in" in lines[1] and "out" in lines[1] and "cached" in lines[1]
     # main line follows
-    assert lines[2].startswith("main:")
+    assert lines[2].startswith(_TABLE_ROW_PREFIX + "main:")
     assert "42" in lines[2]
     # no "sum:" line at all
     assert "sum:" not in out
@@ -132,11 +137,11 @@ def test_38_agents_produce_42_lines() -> None:
     assert lines[0] == header
     # table header is line 1
     assert "in" in lines[1] and "out" in lines[1] and "cached" in lines[1]
-    assert lines[2].startswith("sum:")
-    assert lines[3].startswith("main:")
-    # remaining 38 lines all start with a status tag
+    assert lines[2].startswith(_TABLE_ROW_PREFIX + "sum:")
+    assert lines[3].startswith(_TABLE_ROW_PREFIX + "main:")
+    # remaining 38 lines all start with the table prefix + a status tag
     for line in lines[4:]:
-        assert line.startswith("[")
+        assert line.startswith(_TABLE_ROW_PREFIX + "[")
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +262,7 @@ def test_long_description_truncated() -> None:
     # header + table header + sum + main + 1 agent = 5
     agent_line = lines[4]
 
-    assert agent_line.startswith("[ok]")
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[ok]")
     # description portion ends with U+2026
     assert "…" in agent_line, f"ellipsis missing from line {agent_line!r}"
     # The description column runs from after the status tag prefix up
@@ -267,7 +272,7 @@ def test_long_description_truncated() -> None:
     # _DESC_TOKEN_GAP length. Slicing this way avoids splitting on
     # _DESC_TOKEN_GAP, which would mis-split on a description
     # containing internal double-space runs.
-    prefix = f"{'[ok]':<{_ICON_COL_WIDTH}}" + _STATUS_GAP
+    prefix = _TABLE_ROW_PREFIX + f"{'[ok]':<{_ICON_COL_WIDTH}}" + _STATUS_GAP
     cell_section_len = _TOKEN_COLUMN_WIDTH * 3 + 2  # 3 cells + 2 separators
     desc_part = agent_line[len(prefix) : -(cell_section_len + len(_DESC_TOKEN_GAP))]
     assert len(desc_part) <= 40, (
@@ -299,7 +304,7 @@ def test_sum_calculation() -> None:
     sum_line = lines[2]
 
     # sum in = 350, format_tokens(350) = "350"
-    assert sum_line.startswith("sum:")
+    assert sum_line.startswith(_TABLE_ROW_PREFIX + "sum:")
     assert "350" in sum_line  # in column
     assert "60" in sum_line   # out column
     assert "30" in sum_line   # cached column
@@ -354,7 +359,7 @@ def test_run_agent_shows_current_values() -> None:
     lines = out.split("\n")
     agent_line = lines[4]
 
-    assert agent_line.startswith("[run]")
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[run]")
     assert "Working on it" in agent_line
     # 2500 → round(2.5)=2 (banker's) → "2k"
     # 800 → "800"
@@ -392,7 +397,7 @@ def test_kill_status_renders_as_kill_tag() -> None:
     lines = out.split("\n")
     agent_line = lines[4]
 
-    assert agent_line.startswith("[kill]")
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[kill]")
     assert "agent killed mid-flight" in agent_line
     assert "100" in agent_line
     assert "50" in agent_line
@@ -414,7 +419,7 @@ def test_kill_status_zero_breakdown_renders_zeros() -> None:
     lines = out.split("\n")
     agent_line = lines[4]
 
-    assert agent_line.startswith("[kill]")
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[kill]")
     assert "killed before tokens" in agent_line
     # Cells are right-padded zeros — three "0"s in the trailing cell section.
     cell_section = agent_line[-23:]
@@ -451,7 +456,7 @@ def test_unknown_status_renders_as_question_mark() -> None:
     lines = out.split("\n")
     agent_line = lines[4]
 
-    assert agent_line.startswith("[?]")
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[?]")
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +478,7 @@ def test_agent_no_assistant_events_renders_zeros() -> None:
     # header + table header + sum + main + 1 agent = 5
     agent_line = lines[4]
 
-    assert agent_line.startswith("[run]")
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[run]")
     assert "no events yet" in agent_line
     # Three right-aligned "0" cells of width _TOKEN_COLUMN_WIDTH=7. With
     # all values being 0, format_tokens gives "0" (1 char) and the column
@@ -543,24 +548,26 @@ def test_table_header_row() -> None:
     assert "in" in table_header
     assert "out" in table_header
     assert "cached" in table_header
-    # not a sum/main line
-    assert not table_header.startswith("sum:")
-    assert not table_header.startswith("main:")
+    # carries the table-row prefix, and is not a sum/main line
+    assert table_header.startswith(_TABLE_ROW_PREFIX)
+    assert not table_header.startswith(_TABLE_ROW_PREFIX + "sum:")
+    assert not table_header.startswith(_TABLE_ROW_PREFIX + "main:")
 
-    # The table header has exactly the three labels separated by single
-    # spaces, each right-aligned to the column width, padded on the left
-    # by `w_desc + _ICON_COL_WIDTH + 4` spaces (the prefix width that
-    # agent rows also use, after the icon column is padded to a fixed
-    # width). We can verify by reconstructing what the renderer would
-    # produce, using the production _col_width helper (so the test tracks
-    # the formula rather than recomputing it).
+    # The table header carries the "| " prefix followed by exactly the
+    # three labels separated by single spaces, each right-aligned to the
+    # column width, padded on the left by `w_desc + _ICON_COL_WIDTH + 4`
+    # spaces (the prefix width that agent rows also use, after the icon
+    # column is padded to a fixed width). We can verify by reconstructing
+    # what the renderer would produce, using the production _col_width
+    # helper (so the test tracks the formula rather than recomputing it).
     in_width = _col_width([50000, 1000], "in")
     out_width = _col_width([200, 0], "out")
     cached_width = _col_width([700, 0], "cached")
     w_desc = max(len(a["description"]) for a in agents)
     header_pad = w_desc + _ICON_COL_WIDTH + 4
     expected_table_header = (
-        f"{' ' * header_pad}{'in':>{in_width}} {'out':>{out_width}} {'cached':>{cached_width}}"
+        f"{_TABLE_ROW_PREFIX}{' ' * header_pad}"
+        f"{'in':>{in_width}} {'out':>{out_width}} {'cached':>{cached_width}}"
     )
     assert table_header == expected_table_header, (
         f"table header mismatch: got {table_header!r}, expected "
@@ -607,7 +614,7 @@ def test_unknown_status_renders_question_mark_icon() -> None:
     out = render_output(header, 0, 0, 0, agents)
     agent_line = out.split("\n")[4]
 
-    assert agent_line.startswith("[?]"), (
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[?]"), (
         f"unknown status should render as [?], got: {agent_line!r}"
     )
     assert "future-state" in agent_line
