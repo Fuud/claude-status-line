@@ -307,9 +307,10 @@ def _read_last_event(
     may be None if no such event exists.
 
     Used by compute_agent_snapshot, which needs both: the assistant
-    event drives `tokens` and `last_uuid`, while the last event of any
-    type drives status detection (a user "[Request interrupted by
-    user]" event after the final assistant must surface as "stop").
+    event drives `tokens_in` / `tokens_out` / `tokens_cached` and
+    `last_uuid`, while the last event of any type drives status
+    detection (a user "[Request interrupted by user]" event after the
+    final assistant must surface as "stop").
     """
     if not jsonl_path.exists():
         return (None, None)
@@ -341,20 +342,6 @@ def _read_last_event(
         if last_event is not None and last_assistant is not None:
             break
     return (last_assistant, last_event)
-
-
-def _sum_usage(usage: dict) -> int:
-    """Sum the four token counters from a `usage` dict.
-
-    Returns input + output + cache_creation + cache_read. Coerces each
-    value through `int(... or 0)` so missing/None values count as 0.
-    """
-    return (
-        int(usage.get("input_tokens", 0) or 0)
-        + int(usage.get("output_tokens", 0) or 0)
-        + int(usage.get("cache_creation_input_tokens", 0) or 0)
-        + int(usage.get("cache_read_input_tokens", 0) or 0)
-    )
 
 
 def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, int], str, dict[str, str]]:
@@ -477,7 +464,6 @@ _EMPTY_MAIN_RESULT: dict = {
     "cum_out": 0,
     "cum_cache_create": 0,
     "cum_cache_read": 0,
-    "total": 0,
     "last_uuid": "",
     "mtime_jsonl": 0.0,
     "tool_use_positions": {},
@@ -499,7 +485,7 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     to `cache_path`.
 
     Returns a dict with keys:
-        cum_in, cum_out, cum_cache_create, cum_cache_read, total, last_uuid,
+        cum_in, cum_out, cum_cache_create, cum_cache_read, last_uuid,
         mtime_jsonl, tool_use_positions, task_notifications
 
     [deviation] Cache key includes `mtime_jsonl` so that queue-operation
@@ -507,6 +493,13 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     still invalidate the cache (last_uuid alone would miss them). Without
     mtime in the key, newly-fired task-notifications would be invisible
     to the orchestrator override for as long as the main session stays idle.
+
+    [deviation] The legacy `total` field was removed in Task 2 of the
+    breakdown-table plan. The total is now derived by render from the three
+    breakdown values (in + out + cached). Persisted `total` keys in old
+    cache files from before this change are harmless: cache-hit returns
+    the cached dict unchanged, and render ignores the extra field. We do
+    not actively migrate.
 
     If `jsonl_path` does not exist, returns a zero-valued result without
     writing the cache.
@@ -544,7 +537,6 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
         "cum_out": cum_out,
         "cum_cache_create": cum_cache_create,
         "cum_cache_read": cum_cache_read,
-        "total": cum_in + cum_out + cum_cache_create + cum_cache_read,
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime_jsonl,
         "tool_use_positions": positions,
@@ -599,22 +591,34 @@ def compute_agent_snapshot(
     """Return snapshot dict for a single subagent.
 
     Returns a dict with keys:
-        agentId      — jsonl filename without `.jsonl` extension
-        status       — one of {"ok","err","stop","run"} (see detect_status)
-        tokens       — sum of input+output+cache_creation+cache_read from
-                       the last assistant event's `usage`; None if there is
-                       no assistant event or status is "run" (mid-flow).
-        description  — meta.description, truncated to 40 chars with "…".
-                       Falls back to meta.agentType, then "unknown".
-        toolUseId    — meta.toolUseId (string; "" if missing)
-        last_uuid    — uuid of the last assistant event, or None
-        mtime_jsonl  — st_mtime of jsonl_path, or 0.0 if missing
-        mtime_meta   — st_mtime of meta_path, or 0.0 if missing
+        agentId       — jsonl filename without `.jsonl` extension
+        status        — one of {"ok","err","stop","run"} (see detect_status)
+        tokens_in     — input_tokens from the last assistant event's usage
+                        (or 0 if no assistant event / no usage block)
+        tokens_out    — output_tokens from the last assistant event's usage
+                        (or 0 if no assistant event / no usage block)
+        tokens_cached — cache_read_input_tokens from the last assistant event's
+                        usage (or 0 if no assistant event / no usage block).
+                        cache_creation_input_tokens is NOT surfaced.
+        description   — meta.description, truncated to 40 chars with "…".
+                        Falls back to meta.agentType, then "unknown".
+        toolUseId     — meta.toolUseId (string; "" if missing)
+        last_uuid     — uuid of the last assistant event, or None
+        mtime_jsonl   — st_mtime of jsonl_path, or 0.0 if missing
+        mtime_meta    — st_mtime of meta_path, or 0.0 if missing
+
+    Breakdown fields (tokens_in / tokens_out / tokens_cached) are ALWAYS
+    populated as ints, even for status="run" (mid-flow) — the user sees
+    current values, not blanks. Agents with no assistant events or with
+    a missing `usage` block get zeros in all three fields.
 
     Cache hit: if `cache_entry` is provided AND its last_uuid AND
-    mtime_jsonl match the current jsonl state, the cache_entry is returned
-    unchanged. This function does NOT write to any cache file — the caller
-    (orchestrator) owns cache persistence.
+    mtime_jsonl AND mtime_meta match the current on-disk state AND all
+    three breakdown fields are present in cache_entry, the cache_entry is
+    returned unchanged. The field-presence check guards against stale
+    pre-upgrade caches (which would render zeros via `int(a.get(field)
+    or 0)` until the next jsonl mutation). This function does NOT write
+    to any cache file — the caller (orchestrator) owns cache persistence.
 
     [deviation] When the jsonl contains zero assistant events at all, status
     is forced to "err" (or "stop" if meta.stoppedByUser=true) regardless of
@@ -625,9 +629,10 @@ def compute_agent_snapshot(
 
     # 2. Last assistant event AND last event of any type — both extracted
     # from a single reverse pass via _read_last_event. The assistant
-    # event drives `tokens` and `last_uuid`; the very last event of any
-    # type drives status detection (e.g. a user "[Request interrupted
-    # by user]" event after the final assistant must surface as "stop").
+    # event drives breakdown fields and `last_uuid`; the very last event
+    # of any type drives status detection (e.g. a user "[Request
+    # interrupted by user]" event after the final assistant must surface
+    # as "stop").
     last_event, last_jsonl_event = _read_last_event(jsonl_path)
 
     # 3. Load meta ({} on any failure).
@@ -636,6 +641,10 @@ def compute_agent_snapshot(
     # 4. Cache hit check. mtime_meta is part of the key: if meta.json
     # mutates (e.g. stoppedByUser added later, description edited),
     # cache must invalidate even if jsonl mtime+uuid are unchanged.
+    # Field-presence check for the three breakdown fields is REQUIRED:
+    # a pre-upgrade cache (old format) would otherwise satisfy the
+    # key-match but lack the new fields, leading to render zeros in the
+    # breakdown columns until the next jsonl mutation.
     mtime_meta_for_compare = _meta_mtime(meta_path)
     last_uuid_for_compare: str | None = (
         last_event.get("uuid") if last_event else None
@@ -644,10 +653,14 @@ def compute_agent_snapshot(
     # _AGENT_CACHE_FIELDS comment) and below in the cache-miss builder.
     agent_id = jsonl_path.stem
     if cache_entry is not None:
+        breakdown_present = all(
+            f in cache_entry for f in ("tokens_in", "tokens_out", "tokens_cached")
+        )
         if (
             cache_entry.get("last_uuid") == last_uuid_for_compare
             and cache_entry.get("mtime_jsonl") == mtime_jsonl
             and cache_entry.get("mtime_meta") == mtime_meta_for_compare
+            and breakdown_present
         ):
             # Preserve the invariant: the returned snapshot always has
             # `agentId` inside, regardless of cache hit or miss. The
@@ -675,14 +688,19 @@ def compute_agent_snapshot(
         detect_input = last_jsonl_event if last_jsonl_event is not None else last_event
         status = detect_status(detect_input, meta)
 
-    # tokens — None if no assistant event or status is "run"; otherwise sum
-    # input + output + cache_creation + cache_read from last_event.message.usage.
-    if last_event is None or status == "run":
-        tokens: int | None = None
+    # breakdown — input_tokens / output_tokens / cache_read_input_tokens from
+    # the last assistant event's `message.usage`. Coerce via `int(... or 0)`
+    # so missing/None values are 0. cache_creation_input_tokens is NOT
+    # surfaced. Always returns three ints — including for status="run"
+    # (mid-flow) and for missing/empty jsonl — so render always sees numbers.
+    msg = (last_event.get("message") or {}) if last_event else {}
+    usage = msg.get("usage") if isinstance(msg, dict) else None
+    if isinstance(usage, dict):
+        tokens_in = int(usage.get("input_tokens") or 0)
+        tokens_out = int(usage.get("output_tokens") or 0)
+        tokens_cached = int(usage.get("cache_read_input_tokens") or 0)
     else:
-        msg = last_event.get("message") or {}
-        usage = msg.get("usage") if isinstance(msg, dict) else None
-        tokens = _sum_usage(usage) if isinstance(usage, dict) else None
+        tokens_in = tokens_out = tokens_cached = 0
 
     # description — meta.description, fallback to meta.agentType, then
     # "unknown". Truncate to 40 chars with U+2026 if longer.
@@ -696,7 +714,9 @@ def compute_agent_snapshot(
     return {
         "agentId": agent_id,
         "status": status,
-        "tokens": tokens,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "tokens_cached": tokens_cached,
         "description": description,
         "toolUseId": tool_use_id,
         "last_uuid": last_uuid_for_compare,
@@ -820,57 +840,132 @@ _DESC_TOKEN_GAP = "  "
 _STATUSES = ("ok", "run", "err", "stop", "kill")
 
 
-def render_output(header: str, main_total: int, agents: list) -> str:
-    """Build the multi-line status line string.
+def _col_width(values: list, label: str) -> int:
+    """Compute a right-aligned column width for a numeric column.
+
+    Width is the maximum of:
+        - _TOKEN_COLUMN_WIDTH (the floor — guarantees readability even
+          for narrow columns),
+        - len(label) (so labels like "cached" don't overflow),
+        - the longest formatted value across `values` (so values like
+          "1.2M" don't overflow).
+
+    Exposed at module scope so tests can mirror the width formula
+    without copying it. `values` is expected to be a list of ints; the
+    `default=0` on the max() handles the empty-list case.
+
+    [deviation] Plan spec (step 2 of the breakdown-table section) wrote
+    this as `max(len(format_tokens(v)) for v in col + [label])` with the
+    floor pulled in separately: `min(_TOKEN_COLUMN_WIDTH, computed)`.
+    Mathematically equivalent — appending `label` to `col` only adds
+    `len(label)` to the candidate set, and the floor is just another
+    `max` operand — but the refactor splits the floor into an explicit
+    named constant so the intent ("never narrower than 7") is visible
+    at the call site rather than buried inside a generator expression.
+    """
+    longest_value = max((len(format_tokens(v)) for v in values), default=0)
+    return max(_TOKEN_COLUMN_WIDTH, len(label), longest_value)
+
+
+def render_output(
+    header: str,
+    main_in: int,
+    main_out: int,
+    main_cached: int,
+    agents: list,
+) -> str:
+    """Build the multi-line status line string with a tabular breakdown.
 
     Layout:
         <header>
-        sum: <sum_total>            # only when len(agents) > 0
-        main: <format_tokens(main_total)>
-        [<status>]  <description>  <tokens>      # one line per agent
+        <table header — labels "in" / "out" / "cached", each right-aligned
+         within its own column>
+        sum: <in> <out> <cached>      # only if len(agents) > 0
+        main: <in> <out> <cached>
+        for each agent (in input order):
+            [<status>]  <description>  <in> <out> <cached>
 
-    Sum = main_total + sum(a.tokens for a in agents if a.tokens is not None).
+    Every numeric cell is formatted via format_tokens() (so 1000 → "1k")
+    BEFORE applying :>W — formatting raw 1000 with width 7 would render
+    "   1000" instead of "     1k". Each column's width is computed
+    independently as
+        max(_TOKEN_COLUMN_WIDTH,
+            len(label),
+            len(format_tokens(v)) for v in column)
+    so columns with wider labels ("cached") or wider formatted values
+    ("1.2M") expand independently.
 
-    Description column is left-aligned and width-padded so token counts
-    right-align cleanly. Agents with `tokens=None` render without the
-    token column (the description fills the rest of the line, no
-    trailing whitespace after the description).
+    Description is truncated to 40 chars with U+2026 by _truncate_description
+    (re-applied here for defense-in-depth). The description column itself
+    is NOT padded — only the numeric columns are right-aligned.
+
+    Agents are NEVER skipped: a run-agent renders its current breakdown
+    values (not None), and an agent with no breakdown data renders three
+    zeros. The cache-hit invariant in compute_agent_snapshot guarantees
+    all three tokens_* fields are populated; defensive `int(... or 0)`
+    here handles pre-upgrade caches or callers that build snapshots by
+    hand.
     """
+    # 1. Build per-column value lists (main row first, then agents).
+    # The agent loop runs once, projecting each agent into a triple of
+    # ints and summing in lockstep — saves three separate list
+    # comprehensions and three separate sum() calls for the sum row.
+    agent_in: list[int] = []
+    agent_out: list[int] = []
+    agent_cached: list[int] = []
+    for a in agents:
+        agent_in.append(int(a.get("tokens_in") or 0))
+        agent_out.append(int(a.get("tokens_out") or 0))
+        agent_cached.append(int(a.get("tokens_cached") or 0))
+
+    in_col = [main_in, *agent_in]
+    out_col = [main_out, *agent_out]
+    cached_col = [main_cached, *agent_cached]
+
+    # 2. Compute per-column width: at least _TOKEN_COLUMN_WIDTH, at least
+    # the label length, at least the longest formatted cell. See
+    # _col_width at module scope (importable for tests).
+    w_in = _col_width(in_col, "in")
+    w_out = _col_width(out_col, "out")
+    w_cached = _col_width(cached_col, "cached")
+
+    # 3. Assemble lines.
     lines: list[str] = [header]
+    lines.append(
+        f"{'in':>{w_in}} {'out':>{w_out}} {'cached':>{w_cached}}"
+    )
 
     if agents:
-        sum_total = main_total + sum(
-            a["tokens"] for a in agents if a.get("tokens") is not None
+        sum_in = main_in + sum(agent_in)
+        sum_out = main_out + sum(agent_out)
+        sum_cached = main_cached + sum(agent_cached)
+        lines.append(
+            f"sum: {format_tokens(sum_in):>{w_in}} "
+            f"{format_tokens(sum_out):>{w_out}} "
+            f"{format_tokens(sum_cached):>{w_cached}}"
         )
-        lines.append(f"sum: {format_tokens(sum_total)}")
 
-    lines.append(f"main: {format_tokens(main_total)}")
+    lines.append(
+        f"main: {format_tokens(main_in):>{w_in}} "
+        f"{format_tokens(main_out):>{w_out}} "
+        f"{format_tokens(main_cached):>{w_cached}}"
+    )
 
-    for agent in agents:
+    for agent, in_v, out_v, cached_v in zip(agents, agent_in, agent_out, agent_cached):
         status = agent.get("status", "run")
-        # ASCII status tag: "[<status>]" — derived inline from the status
-        # value. Unknown statuses surface as "[?]" rather than failing.
         icon = f"[{status}]" if status in _STATUSES else "[?]"
         description = agent.get("description", "") or ""
-        # Defensive truncation: callers (compute_agent_snapshot) already
-        # truncate to 40, but render_output is the final formatter and
-        # shouldn't trust upstream. Re-apply the rule so a buggy or
-        # future caller can't blow up the column layout.
+        # Defensive truncation: callers already truncate to 40, but
+        # render_output is the final formatter and shouldn't trust
+        # upstream. Re-apply so a buggy or future caller can't blow up
+        # the column layout.
         description = _truncate_description(description)
-        tokens = agent.get("tokens")
-
-        if tokens is None:
-            # no token column — just status + description (no trailing ws)
-            lines.append(f"{icon}{_STATUS_GAP}{description}")
-        else:
-            formatted = format_tokens(tokens)
-            # left-pad description so formatted tokens right-align within
-            # _TOKEN_COLUMN_WIDTH. We use a single f-string with width
-            # specifier on the token side.
-            lines.append(
-                f"{icon}{_STATUS_GAP}{description}{_DESC_TOKEN_GAP}"
-                f"{formatted:>{_TOKEN_COLUMN_WIDTH}}"
-            )
+        lines.append(
+            f"{icon}{_STATUS_GAP}{description}{_DESC_TOKEN_GAP}"
+            f"{format_tokens(in_v):>{w_in}} "
+            f"{format_tokens(out_v):>{w_out}} "
+            f"{format_tokens(cached_v):>{w_cached}}"
+        )
 
     return "\n".join(lines)
 
@@ -891,13 +986,15 @@ def render_output(header: str, main_total: int, agents: list) -> str:
 # so NOT stored inside each entry; compute_agent_snapshot re-injects
 # agentId on the cache-hit path to keep the returned dict shape stable
 # for downstream consumers (see _write_agents_cache and _AGENT_CACHE_FIELDS
-# invariant). mtime_jsonl/last_uuid drive invalidation; the rest is the
-# render-ready snapshot.
+# invariant). mtime_jsonl/mtime_meta drive invalidation; the breakdown
+# fields are the new render-ready shape (replacing the prior `tokens` sum).
 _AGENT_CACHE_FIELDS = (
     "last_uuid",
     "mtime_jsonl",
     "status",
-    "tokens",
+    "tokens_in",
+    "tokens_out",
+    "tokens_cached",
     "description",
     "toolUseId",
     "mtime_meta",
@@ -1064,7 +1161,13 @@ def _main_unsafe() -> int:
     # main()'s except clause — silently degrading to the fallback header.
     tool_use_positions = main_cum.get("tool_use_positions")
     agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
-    output = render_output(header, main_cum.get("total", 0), agents)
+    # Task 4 — breakdown-table refactor: pass the three cum_* values
+    # directly to render (no `total` field in main_cum anymore). render
+    # applies format_tokens to each cell; we hand it raw ints.
+    cum_in = main_cum.get("cum_in", 0)
+    cum_out = main_cum.get("cum_out", 0)
+    cum_cache_read = main_cum.get("cum_cache_read", 0)
+    output = render_output(header, cum_in, cum_out, cum_cache_read, agents)
     print(output)
     return 0
 

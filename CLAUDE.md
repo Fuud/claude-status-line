@@ -4,7 +4,7 @@ Architecture and design notes for `~/.claude/status_line/`.
 
 ## Module layout
 
-`status_line.py` is the entire runtime (~900 lines). Test files mirror
+`status_line.py` is the entire runtime (~1000 lines). Test files mirror
 the public surface one function per test module.
 
 | Layer             | Functions                                              | Pure? |
@@ -39,8 +39,9 @@ the orchestrator override in `_compute_agents` when a main-log
 - **Read:** `compute_main_cum` does a single forward scan to extract
   `last_uuid` AND stat the file for `mtime_jsonl`; if both match the
   cached values, return the cached payload (skipping the cache write).
-- **Write:** on cache miss, recompute totals and atomically write
-  via `.tmp` + `os.replace`. The cached payload also includes a
+- **Write:** on cache miss, recompute the `cum_*` fields
+  (`cum_in / cum_out / cum_cache_create / cum_cache_read`) and atomically
+  write via `.tmp` + `os.replace`. The cached payload also includes a
   `task_notifications: dict[<task-id>, {ok,kill,err}]` field extracted
   from `<task-notification>` queue-operation events during the same
   forward scan — consumed by the orchestrator override in
@@ -74,6 +75,13 @@ hit → stale task_notifications returned).
 the cache even when the jsonl itself is unchanged. Without `mtime_meta`
 in the key, agents would silently render stale `status`/`description`
 fields after a meta-only update.
+
+[deviation] Cache hit additionally checks that all three breakdown
+fields (`tokens_in`, `tokens_out`, `tokens_cached`) are present in the
+cached entry. Stale caches from a prior version that match the three
+keys but lack the breakdown fields are treated as misses and
+recomputed — otherwise the renderer would show three zeros for one
+cycle after upgrade on any session with a pre-existing agents cache.
 
 ## Status priority and overrides
 
@@ -160,3 +168,11 @@ The plan in `docs/plans/completed/20260824-status-line-tokens-aggregation.md`
 documents several intentional deviations; this file mirrors those and
 adds review-time ones. Inline `[deviation]` markers in `status_line.py`
 point to the relevant explanation.
+
+- **2026-08-24** — switched to the tabular breakdown format
+  (`in / out / cached` columns) and dropped the flat `sum: / main:`
+  fields. `compute_agent_snapshot` now exposes `tokens_in`,
+  `tokens_out`, `tokens_cached` instead of a single `tokens` field;
+  `compute_main_cum` no longer exposes `total`. Render is now a table
+  with header labels and per-column right-alignment. See plan
+  `docs/plans/20260824-token-breakdown-table.md`.
