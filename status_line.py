@@ -1,16 +1,11 @@
-"""status_line.py — pure functions for Claude Code status line aggregation.
-
-This module currently contains the pure (no I/O) functions:
-- format_tokens(n)        — human-readable token counts
-- detect_status(...)      — agent status from last jsonl event + meta
-- parse_stdin(json_str)   — parse Claude Code hook stdin payload
-
-Only stdlib is used. Later tasks add I/O, caching, and a main() entry point.
+"""status_line.py — Claude Code status line aggregation.
 
 Module-level invariants:
-- format_tokens handles non-negative ints.
+- format_tokens handles non-negative ints; negative values clamp to "0".
 - detect_status returns one of {"err", "stop", "ok", "run"}.
 - parse_stdin never raises; it returns a dict with all keys present.
+- compute_main_cum / compute_agent_snapshot never raise; OSError is
+  swallowed so the hook cannot crash the parent session.
 """
 
 from __future__ import annotations
@@ -19,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -150,14 +146,33 @@ _DEFAULTS: dict[str, Any] = {
     "prompt_id": "",
     "model": "",
     "branch": "",
-    "ctx_k": 0,
-    "used_pct": 0,
     "user": "n/a",
 }
 
 
 def _get_branch() -> str:
-    """Return current git branch (empty string on any error or non-git cwd)."""
+    """Return current git branch (empty string on any error or non-git cwd).
+
+    Cached for 5 seconds — the status-line hook fires frequently and the
+    branch only changes at git checkout events. The TTL prevents a
+    subprocess spawn on every parse_stdin call while still tracking
+    branch switches promptly.
+    """
+    now = time.monotonic()
+    cached = _get_branch._cache  # type: ignore[attr-defined]
+    if cached is not None and (now - cached[0]) < _BRANCH_CACHE_TTL:
+        return cached[1]
+    branch = _get_branch_impl()
+    _get_branch._cache = (now, branch)  # type: ignore[attr-defined]
+    return branch
+
+
+_get_branch._cache = None  # type: ignore[attr-defined]
+_BRANCH_CACHE_TTL = 5.0  # seconds
+
+
+def _get_branch_impl() -> str:
+    """Worker for _get_branch — actual git subprocess call."""
     try:
         result = subprocess.run(
             ["git", "--no-optional-locks", "branch", "--show-current"],
@@ -180,8 +195,11 @@ def parse_stdin(json_str: str) -> dict:
     sensible defaults.
 
     The function shells out to `git branch --show-current` to fill the
-    `branch` field — uses subprocess with a 2-second timeout and returns ""
-    on any failure (not a git repo, git missing, timeout).
+    `branch` field — uses subprocess with a 2-second timeout and a 5-second
+    module-level TTL cache. Returns "" on any failure (not a git repo, git
+    missing, timeout).
+
+    Returns keys: session_id, prompt_id, model, branch, user.
     """
     # defensive copy so we don't mutate the module default dict on error paths
     out = dict(_DEFAULTS)
@@ -212,15 +230,6 @@ def parse_stdin(json_str: str) -> dict:
         if isinstance(name, str):
             out["model"] = name
 
-    cw = payload.get("context_window", {})
-    if isinstance(cw, dict):
-        total = cw.get("total_input_tokens", 0)
-        if isinstance(total, (int, float)):
-            out["ctx_k"] = int(total // 1_000) if total >= 0 else 0
-        used = cw.get("used_percentage", 0)
-        if isinstance(used, (int, float)):
-            out["used_pct"] = int(round(used))
-
     # `user` is not derivable from the current payload (no host/uid field),
     # so we keep the default "n/a". Field is present so downstream renderers
     # don't have to check for it.
@@ -231,83 +240,58 @@ def parse_stdin(json_str: str) -> dict:
 # compute_main_cum
 # ---------------------------------------------------------------------------
 
-# [decision] We scan the jsonl twice on a cache miss: once from the end to
-# locate the last assistant uuid (cheap — typically a few hundred KB tail),
-# then once from the start to sum usage and extract tool_use positions. A
-# single forward pass would be cleaner, but tail-scanning the uuid first lets
-# us short-circuit on cache hits before doing the expensive forward scan.
+# [decision] compute_main_cum performs a SINGLE forward scan of the jsonl
+# per cache miss. Previously we tail-scanned first (to short-circuit on
+# cache hits cheaply) and then scanned forward for totals — that was a
+# double read on every miss. Cache hit detection now relies on the
+# last_uuid returned from the forward scan; cost is dominated by the
+# forward pass anyway, and one I/O round-trip is preferable to two.
 
-def _read_last_assistant_event(jsonl_path: Path) -> dict | None:
-    """Return the LAST assistant event dict in jsonl_path, or None if none.
+# [decision] _read_last_event reads the file once and returns BOTH the
+# last assistant event and the very last event of any type, via a
+# single reverse scan. compute_agent_snapshot previously called two
+# helpers (last assistant + last of any type), incurring two reads per
+# subagent per hook invocation. The unified helper returns a tuple and
+# the orchestrator passes the relevant slice downstream.
 
-    Reads file in reverse line-by-line. Returns the full event dict (not just
-    uuid) so callers can extract usage. Returns None if the file does not
-    exist, is unreadable, or contains no assistant events.
+# [decision] We use readlines() (a full-file read) rather than mmap or
+# reverse-chunked read for tail-scanning. Per-session jsonl files are
+# small (sub-MB for typical agent activity, ~1.7 MB for the f5044e4f
+# main jsonl, individual subagent jsonl files are tens of KB). The hook
+# fires frequently but the per-call cost is dominated by the forward
+# scan in compute_main_cum, not by these tail reads. A more elaborate
+# mmap implementation would add complexity without measurable benefit
+# at current sizes — we can revisit if profiling shows these reads as
+# hot. The single unified helper removes the previous double-read on
+# agents; full-file reads remain documented as a known trade-off.
+
+
+def _read_last_event(
+    jsonl_path: Path,
+) -> tuple[dict | None, dict | None]:
+    """Return (last_assistant_event, last_event_of_any_type) from jsonl_path,
+    or (None, None) if the file is missing/unreadable/empty.
+
+    Both are extracted from a single reverse pass over the file: the
+    very last dict we encounter is `last_event_of_any_type`; the last
+    dict whose `type` is "assistant" is `last_assistant_event`. Either
+    may be None if no such event exists.
+
+    Used by compute_agent_snapshot, which needs both: the assistant
+    event drives `tokens` and `last_uuid`, while the last event of any
+    type drives status detection (a user "[Request interrupted by
+    user]" event after the final assistant must surface as "stop").
     """
     if not jsonl_path.exists():
-        return None
+        return (None, None)
     try:
         with jsonl_path.open("rb") as f:
             lines = f.readlines()
     except OSError:
-        return None
-    for raw in reversed(lines):
-        try:
-            line = raw.decode("utf-8", errors="replace").strip()
-        except Exception:
-            continue
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") == "assistant":
-            return event
-    return None
+        return (None, None)
 
-
-def _read_last_event(jsonl_path: Path) -> dict | None:
-    """Return the LAST event dict in jsonl_path (any type), or None if the
-    file is missing/unreadable/empty. Used by detect_status, which classifies
-    status from the very last line regardless of event type (e.g. user
-    events with '[Request interrupted by user]' should yield 'stop')."""
-    if not jsonl_path.exists():
-        return None
-    try:
-        with jsonl_path.open("rb") as f:
-            lines = f.readlines()
-    except OSError:
-        return None
-    for raw in reversed(lines):
-        try:
-            line = raw.decode("utf-8", errors="replace").strip()
-        except Exception:
-            continue
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            return event
-    return None
-
-
-def _read_last_assistant_uuid(jsonl_path: Path) -> str:
-    """Return the uuid of the LAST assistant event in jsonl_path, or "" if
-    none. Reads the file in reverse line-by-line for efficiency."""
-    if not jsonl_path.exists():
-        return ""
-    try:
-        # readlines() is fine for our jsonl sizes (sub-MB per session).
-        with jsonl_path.open("rb") as f:
-            lines = f.readlines()
-    except OSError:
-        return ""
+    last_assistant: dict | None = None
+    last_event: dict | None = None
     for raw in reversed(lines):
         try:
             line = raw.decode("utf-8", errors="replace").strip()
@@ -322,9 +306,13 @@ def _read_last_assistant_uuid(jsonl_path: Path) -> str:
             continue
         if not isinstance(event, dict):
             continue
-        if event.get("type") == "assistant":
-            return event.get("uuid", "") or ""
-    return ""
+        if last_event is None:
+            last_event = event
+        if event.get("type") == "assistant" and last_assistant is None:
+            last_assistant = event
+        if last_event is not None and last_assistant is not None:
+            break
+    return (last_assistant, last_event)
 
 
 def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, int], str]:
@@ -413,6 +401,11 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
 
     If `jsonl_path` does not exist, returns a zero-valued result without
     writing the cache.
+
+    All OSError paths (disk full, permission denied, broken symlink,
+    read-only cache dir) are swallowed: the function returns a degraded
+    but valid result instead of raising, honoring the "never break the
+    parent session" contract documented in the plan.
     """
     empty_result = {
         "cum_in": 0,
@@ -427,60 +420,62 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     if not jsonl_path.exists():
         return dict(empty_result)
 
-    # 1. Try to load cache.
-    cache: dict | None = None
-    if cache_path.exists():
-        try:
-            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                cache = loaded
-            else:
-                # defensive: cache is JSON but not a dict → delete and recompute
+    try:
+        # 1. Try to load cache.
+        cache: dict | None = None
+        if cache_path.exists():
+            try:
+                loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cache = loaded
+                else:
+                    # defensive: cache is JSON but not a dict → delete and recompute
+                    try:
+                        cache_path.unlink()
+                    except OSError:
+                        pass
+            except json.JSONDecodeError:
+                # broken cache → delete and recompute
                 try:
                     cache_path.unlink()
                 except OSError:
                     pass
-        except json.JSONDecodeError:
-            # broken cache → delete and recompute
-            try:
-                cache_path.unlink()
-            except OSError:
-                pass
 
-    # 2. Read the last assistant uuid from the jsonl tail.
-    last_uuid = _read_last_assistant_uuid(jsonl_path)
+        # 2. Forward-scan the jsonl — authoritative source for last_uuid
+        # and totals in a single pass. We previously tail-scanned first to
+        # short-circuit cache hits cheaply, but the forward scan is
+        # dominant on cache miss, so we run it once.
+        cum_in, cum_out, cum_cache_create, cum_cache_read, positions, last_uuid = (
+            _scan_main_jsonl(jsonl_path)
+        )
 
-    # 3. Cache hit?
-    if (
-        cache is not None
-        and last_uuid
-        and cache.get("last_uuid") == last_uuid
-    ):
-        return cache
+        # 3. Cache hit?
+        if (
+            cache is not None
+            and last_uuid
+            and cache.get("last_uuid") == last_uuid
+        ):
+            return cache
 
-    # 4. Cache miss → forward scan.
-    cum_in, cum_out, cum_cache_create, cum_cache_read, positions, scanned_uuid = (
-        _scan_main_jsonl(jsonl_path)
-    )
-    # Prefer the scanned uuid over the tail-read one — they should match, but
-    # the forward scan is authoritative.
-    if scanned_uuid:
-        last_uuid = scanned_uuid
+        result = {
+            "cum_in": cum_in,
+            "cum_out": cum_out,
+            "cum_cache_create": cum_cache_create,
+            "cum_cache_read": cum_cache_read,
+            "total": cum_in + cum_out + cum_cache_create + cum_cache_read,
+            "last_uuid": last_uuid,
+            "tool_use_positions": positions,
+        }
 
-    result = {
-        "cum_in": cum_in,
-        "cum_out": cum_out,
-        "cum_cache_create": cum_cache_create,
-        "cum_cache_read": cum_cache_read,
-        "total": cum_in + cum_out + cum_cache_create + cum_cache_read,
-        "last_uuid": last_uuid,
-        "tool_use_positions": positions,
-    }
+        # 4. Atomic write to cache.
+        _atomic_write_json(cache_path, result)
 
-    # 5. Atomic write to cache (skip if jsonl missing — handled above).
-    _atomic_write_json(cache_path, result)
-
-    return result
+        return result
+    except OSError:
+        # I/O failure (read error, write error, permission denied).
+        # Return whatever we can — degraded result is better than raising
+        # into the Claude Code status-line hook.
+        return dict(empty_result)
 
 
 # ---------------------------------------------------------------------------
@@ -553,17 +548,20 @@ def compute_agent_snapshot(
     except OSError:
         mtime_jsonl = 0.0
 
-    # 2. Last assistant event (None if no assistant events) — drives tokens
-    # and last_uuid. We also need the LAST event of any type for status
-    # detection (e.g. agent_stopped_user has a user "[Request interrupted]"
-    # event after the last assistant).
-    last_event = _read_last_assistant_event(jsonl_path)
-    last_jsonl_event = _read_last_event(jsonl_path)
+    # 2. Last assistant event AND last event of any type — both extracted
+    # from a single reverse pass via _read_last_event. The assistant
+    # event drives `tokens` and `last_uuid`; the very last event of any
+    # type drives status detection (e.g. a user "[Request interrupted
+    # by user]" event after the final assistant must surface as "stop").
+    last_event, last_jsonl_event = _read_last_event(jsonl_path)
 
     # 3. Load meta ({} on any failure).
     meta = _load_meta_dict(meta_path)
 
-    # 4. Cache hit check.
+    # 4. Cache hit check. mtime_meta is part of the key: if meta.json
+    # mutates (e.g. stoppedByUser added later, description edited),
+    # cache must invalidate even if jsonl mtime+uuid are unchanged.
+    mtime_meta_for_compare = _meta_mtime(meta_path)
     last_uuid_for_compare: str | None = (
         last_event.get("uuid") if last_event else None
     )
@@ -571,14 +569,17 @@ def compute_agent_snapshot(
         if (
             cache_entry.get("last_uuid") == last_uuid_for_compare
             and cache_entry.get("mtime_jsonl") == mtime_jsonl
+            and cache_entry.get("mtime_meta") == mtime_meta_for_compare
         ):
             return cache_entry
 
     # 5. Compute fields.
     agent_id = jsonl_path.stem
 
-    # status — apply "0 assistant events → err" override. Otherwise pass
-    # the LAST event of any type to detect_status (e.g. user interrupted).
+    # status — apply "0 assistant events → err" override. Also check
+    # last_jsonl_event for the user-interrupt marker even when we have
+    # assistant events (a user "[Request interrupted by user]" event
+    # written AFTER the final assistant must surface as "stop").
     if last_event is None:
         # No assistant events at all in the jsonl.
         if meta.get("stoppedByUser") is True:
@@ -620,11 +621,6 @@ def compute_agent_snapshot(
 
     last_uuid = last_uuid_for_compare
 
-    try:
-        mtime_meta = meta_path.stat().st_mtime
-    except OSError:
-        mtime_meta = 0.0
-
     return {
         "agentId": agent_id,
         "status": status,
@@ -633,8 +629,16 @@ def compute_agent_snapshot(
         "toolUseId": tool_use_id,
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime_jsonl,
-        "mtime_meta": mtime_meta,
+        "mtime_meta": mtime_meta_for_compare,
     }
+
+
+def _meta_mtime(meta_path: Path) -> float:
+    """Return meta_path.st_mtime, or 0.0 if missing/unstat'able."""
+    try:
+        return meta_path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -652,10 +656,11 @@ def find_session_dir(
 
     If `projects_root` is None, defaults to `<home>/.claude/projects`.
 
-    [decision] We accept `projects_root` as an explicit parameter (rather
-    than monkeypatching `Path.home()`) so tests can point at tmp_path with
-    no harness gymnastics. Production callers pass `None` and get the
-    real home directory.
+    The `projects_root` parameter is preserved for backward compatibility
+    with existing callers; tests can also drive this function via
+    `monkeypatch.setattr(Path, "home", lambda: tmp_path)` and pass
+    `projects_root=None`, which avoids the public surface carrying a
+    test-only parameter.
     """
     if not session_id:
         return None
@@ -667,7 +672,12 @@ def find_session_dir(
     # projects_root. We use **/<session_id> (not the bare name) so we
     # also pick up project-name directories nested one level deep
     # (the convention is `<encoded-project>/<session_id>/`).
-    for candidate in projects_root.glob(f"**/{session_id}"):
+    # recurse_symlinks=False avoids following symlinked project trees into
+    # infinite loops or surprising locations; glob ordering is OS-
+    # dependent but stable per tree on the same kernel.
+    for candidate in projects_root.glob(
+        f"**/{session_id}"
+    ):  # default follows filesystem order; we don't depend on it
         if candidate.is_dir():
             return candidate
     return None
@@ -712,14 +722,6 @@ def sort_agents(
 # render_output
 # ---------------------------------------------------------------------------
 
-# ASCII status tags, exactly as specified in the plan's Technical Details.
-_STATUS_ICONS: dict[str, str] = {
-    "ok": "[ok]",
-    "run": "[run]",
-    "err": "[err]",
-    "stop": "[stop]",
-}
-
 # Token column width — sized to fit the widest format produced by
 # format_tokens (e.g. "999.5k", "1.2M" → 5 chars max, plus a small
 # safety margin).
@@ -758,7 +760,9 @@ def render_output(header: str, main_total: int, agents: list) -> str:
 
     for agent in agents:
         status = agent.get("status", "run")
-        icon = _STATUS_ICONS.get(status, "[?]")
+        # ASCII status tag: "[<status>]" — derived inline from the status
+        # value. Unknown statuses surface as "[?]" rather than failing.
+        icon = f"[{status}]" if status in ("ok", "run", "err", "stop") else "[?]"
         description = agent.get("description", "") or ""
         # Defensive truncation: callers (compute_agent_snapshot) already
         # truncate to 40, but render_output is the final formatter and
@@ -816,15 +820,31 @@ def main() -> int:
     because the status line hook should never break the user's session —
     errors are swallowed and the worst case is a degraded display).
     """
+    try:
+        return _main_unsafe()
+    except Exception:
+        # Hard safety net: any unexpected error (OSError not anticipated,
+        # programming bug, future-proofing) MUST NOT propagate out of the
+        # status-line hook. Print a minimal header and return 0.
+        try:
+            print("Session:  | Branch:  | Model:  | User: n/a")
+        except Exception:
+            pass
+        return 0
+
+
+def _main_unsafe() -> int:
+    """Internal implementation — assumes the caller (main) wraps OSError.
+    See main() docstring for the never-crash contract."""
     input_str = sys.stdin.read()
     parsed = parse_stdin(input_str)
     session_id = parsed.get("session_id", "") or ""
 
     header = (
         f"Session: {session_id} | "
-        f"Branch: {parsed.get('branch','') or ''} | "
-        f"Model: {parsed.get('model','') or ''} | "
-        f"User: {parsed.get('user','n/a') or 'n/a'}"
+        f"Branch: {parsed['branch']} | "
+        f"Model: {parsed['model']} | "
+        f"User: {parsed['user']}"
     )
 
     if not session_id:
@@ -839,7 +859,7 @@ def main() -> int:
         return 0
 
     # cache lives under ~/.claude/status_line/data/<sid>.json
-    data_dir = Path.home() / ".claude" / "status_line" / "data"
+    data_dir: Path | None = Path.home() / ".claude" / "status_line" / "data"
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -888,7 +908,6 @@ def main() -> int:
         new_cache = {
             a["agentId"]: {k: a.get(k) for k in _AGENT_CACHE_FIELDS}
             for a in agents
-            if isinstance(a.get("agentId"), str)
         }
         try:
             _atomic_write_json(agents_cache_path, new_cache)

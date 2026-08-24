@@ -318,3 +318,62 @@ def test_cache_miss_recomputes() -> None:
     )
     assert result2["tokens"] == 650
     assert result2["description"] == "Fixer: smells findings"
+
+
+def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
+    """[deviation] Cache key includes mtime_meta so a meta.json edit (e.g.
+    stoppedByUser added later, description updated) invalidates the cache
+    even when jsonl mtime+uuid are unchanged.
+
+    Strategy: copy AGENT_OK to tmp, copy META_NORMAL to tmp with a different
+    filename, build cache_entry with matching last_uuid+mtime_jsonl but
+    STALE mtime_meta, then mutate the meta file (touch with new mtime) and
+    verify the cache is invalidated."""
+    src_jsonl = AGENT_OK
+    src_meta = META_NORMAL
+    work_jsonl = tmp_path / "agent-test.jsonl"
+    work_meta = tmp_path / "agent-test.meta.json"
+    work_jsonl.write_bytes(src_jsonl.read_bytes())
+    work_meta.write_bytes(src_meta.read_bytes())
+
+    # Ensure mtime_meta is recorded at a slightly earlier time so we can
+    # bump it forward via touch without clock-skew flakes.
+    mtime_jsonl = work_jsonl.stat().st_mtime
+    mtime_meta_v1 = work_meta.stat().st_mtime
+    last_uuid = "a0000000-0000-0000-0000-000000000004"
+
+    # Cache built when meta was at v1.
+    cache_v1 = {
+        "agentId": "agent-test",
+        "status": "ok",
+        "tokens": 999_999_999,  # sentinel — should not survive
+        "description": "stale-from-v1",
+        "toolUseId": "toolu_v1",
+        "last_uuid": last_uuid,
+        "mtime_jsonl": mtime_jsonl,
+        "mtime_meta": mtime_meta_v1,
+    }
+
+    # First call: cache hits (matching key).
+    r1 = compute_agent_snapshot(work_jsonl, work_meta, cache_entry=cache_v1)
+    assert r1["tokens"] == 999_999_999, "expected cache hit on first call"
+
+    # Mutate the meta file — write new content AND bump mtime forward.
+    work_meta.write_text(json.dumps({
+        "description": "edited description",
+        "agentType": "general-purpose",
+        "toolUseId": "toolu_v2",
+    }))
+    # Force a clearly newer mtime (1.5s in the future to dodge FS resolution).
+    future_mtime = mtime_meta_v1 + 5.0
+    import os
+    os.utime(work_meta, (future_mtime, future_mtime))
+
+    # Second call: cache should miss because mtime_meta changed.
+    r2 = compute_agent_snapshot(work_jsonl, work_meta, cache_entry=cache_v1)
+    assert r2["tokens"] != 999_999_999, (
+        "cache should have invalidated on meta mtime change, but the "
+        "sentinel survived"
+    )
+    assert r2["description"] == "edited description"
+    assert r2["toolUseId"] == "toolu_v2"

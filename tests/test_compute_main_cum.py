@@ -48,8 +48,8 @@ def test_empty_jsonl_returns_zeros(tmp_path: Path) -> None:
     assert result["cum_cache_create"] == 0
     assert result["cum_cache_read"] == 0
     assert result["tool_use_positions"] == {}
-    # last_uuid is "" or None — we pick "" (empty string) per spec.
-    assert result["last_uuid"] in ("", None)
+    # last_uuid is "" (empty string) per spec — code never returns None.
+    assert result["last_uuid"] == ""
     # fresh compute → cache file should exist and be valid JSON
     assert cache.exists()
     assert json.loads(cache.read_text())["total"] == 0
@@ -66,8 +66,8 @@ def test_no_assistant_events_returns_empty(tmp_path: Path) -> None:
     assert result["cum_cache_create"] == 0
     assert result["cum_cache_read"] == 0
     assert result["tool_use_positions"] == {}
-    # No assistant event exists → last_uuid is empty.
-    assert result["last_uuid"] in ("", None)
+    # No assistant event exists → last_uuid is "" (empty string).
+    assert result["last_uuid"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +264,7 @@ def test_missing_jsonl_returns_zeros(tmp_path: Path) -> None:
     assert result["cum_cache_create"] == 0
     assert result["cum_cache_read"] == 0
     assert result["tool_use_positions"] == {}
-    assert result["last_uuid"] in ("", None)
+    assert result["last_uuid"] == ""
     # No jsonl → no cache file written (per spec: "Skip the write if jsonl_path
     # doesn't exist").
     assert not cache.exists()

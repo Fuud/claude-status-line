@@ -202,7 +202,11 @@ def test_status_tag_counts(fake_home_with_real_session) -> None:
     result = _run_main(stdin, tmp_path)
     assert result.returncode == 0
     output = result.stdout.decode("utf-8")
-    assert output.count("[err]") >= 1
+    # The current f5044e4f fixture has exactly 1 [err] agent (Review:
+    # quality) at the time of this test. If the fixture is regenerated,
+    # update this count to match — but the loose ">= 1" assertion would
+    # silently accept regressions in the count.
+    assert output.count("[err]") == 1
     assert output.count("[ok]") >= 1
 
 
@@ -234,6 +238,57 @@ def test_broken_cache_recovery(fake_home_with_real_session) -> None:
     assert "last_uuid" in loaded
     assert "total" in loaded
     assert loaded["total"] > 0
+
+
+def test_broken_agents_cache_recovery(fake_home_with_real_session) -> None:
+    """Pre-write garbage to data/agents_<sid>.json; main() must recover,
+    exit 0, and leave a parseable agents cache file behind.
+
+    This mirrors test_broken_cache_recovery but exercises the per-agent
+    cache path, which has a separate load+validate block in main().
+    """
+    tmp_path, sid = fake_home_with_real_session
+    data_dir = tmp_path / ".claude" / "status_line" / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    agents_cache_path = data_dir / f"agents_{sid}.json"
+    agents_cache_path.write_text("not json {", encoding="utf-8")
+    assert agents_cache_path.exists()
+
+    stdin = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, (
+        f"non-zero exit; stderr={result.stderr.decode('utf-8', 'replace')}"
+    )
+    # The agents cache must now be valid JSON (main() falls through to
+    # writing a fresh cache after detecting JSONDecodeError).
+    assert agents_cache_path.exists(), "agents cache should be rewritten"
+    loaded = json.loads(agents_cache_path.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    # Should have one entry per subagent jsonl file (38 in the fixture).
+    assert len(loaded) >= 1
+    # Spot-check: each entry has last_uuid + mtime_jsonl + status.
+    sample_key = next(iter(loaded))
+    sample = loaded[sample_key]
+    assert "last_uuid" in sample
+    assert "mtime_jsonl" in sample
+    assert "status" in sample
+
+
+def test_agents_cache_non_dict_recovery(fake_home_with_real_session) -> None:
+    """Pre-write a JSON LIST (valid JSON, not a dict) to agents_<sid>.json;
+    main() must detect non-dict payload, delete the bad cache, and rebuild."""
+    tmp_path, sid = fake_home_with_real_session
+    data_dir = tmp_path / ".claude" / "status_line" / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    agents_cache_path = data_dir / f"agents_{sid}.json"
+    agents_cache_path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+
+    stdin = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0
+    loaded = json.loads(agents_cache_path.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    assert len(loaded) >= 1
 
 
 # ---------------------------------------------------------------------------

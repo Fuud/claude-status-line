@@ -1,22 +1,11 @@
 """pytest fixtures for status_line tests.
 
-Provides `tmp_data_dir` — a pytest fixture returning a tmp Path for the
-status_line data/ cache directory. Tests use this to point
-compute_main_cum / compute_agent_snapshot cache paths at an isolated
-location without polluting the real `~/.claude/status_line/data/`.
+Provides a `tmp_data_dir` placeholder hook for future tests that may want
+a tmp cache directory. (Currently no tests use it directly; the
+integration tests build their own tmp_path with `.claude/status_line/data`.)
 """
 
 from __future__ import annotations
 
-import pytest
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path: pytest.TempPathFactory) -> "pytest.Path":
-    """Return a tmp directory path to be used as a status_line `data/` cache.
-
-    The directory is created (empty) by pytest's `tmp_path`. Tests are
-    responsible for creating sub-paths inside it as needed (e.g.
-    `tmp_data_dir / "main_<sid>.json"`).
-    """
-    return tmp_path
+# Intentionally empty — no fixtures required at this layer. Tests build
+# their own tmp paths via the built-in `tmp_path` fixture from pytest.

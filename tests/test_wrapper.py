@@ -14,8 +14,12 @@ def test_wrapper_syntax():
     assert result.returncode == 0, f"bash -n failed: {result.stderr.decode()}"
 
 
-def test_wrapper_empty_stdin():
-    """Wrapper end-to-end: empty stdin → header line, exit 0."""
+def test_wrapper_empty_object_stdin():
+    """Wrapper end-to-end: empty-object stdin → header line, exit 0.
+
+    The test feeds `b"{}"` (a parseable empty JSON object) — a
+    representative "no fields" payload from the hook. The status line
+    must still emit a header line (with empty session_id) and exit 0."""
     result = subprocess.run(
         ["bash", str(SH_PATH)], input=b"{}", capture_output=True, timeout=10
     )

@@ -125,3 +125,95 @@ def test_api_error_status_500_triggers_err() -> None:
     }
     meta = _load_meta("meta_normal.json")
     assert detect_status(last, meta) == "err"
+
+
+# ---------------------------------------------------------------------------
+# _is_user_interrupted — coverage for all 3 content-shape branches
+# ---------------------------------------------------------------------------
+
+from status_line import _is_user_interrupted
+
+
+_INTERRUPT = "[Request interrupted by user]"
+
+
+def test_user_interrupted_string_content() -> None:
+    """Content is a plain string containing the marker → True."""
+    event = {
+        "type": "user",
+        "message": {"role": "user", "content": f"hello {_INTERRUPT} goodbye"},
+    }
+    assert _is_user_interrupted(event) is True
+
+
+def test_user_interrupted_list_text_block() -> None:
+    """Content is a list with a text block containing the marker → True."""
+    event = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"first part {_INTERRUPT}"},
+            ],
+        },
+    }
+    assert _is_user_interrupted(event) is True
+
+
+def test_user_interrupted_list_content_field() -> None:
+    """Content is a list with a block whose `content` field contains marker
+    (alternate shape, used by some Claude Code versions)."""
+    event = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "text", "content": f"x {_INTERRUPT} y"},
+            ],
+        },
+    }
+    assert _is_user_interrupted(event) is True
+
+
+def test_user_interrupted_tool_result_nested() -> None:
+    """Content is a list with a tool_result whose inner content list contains
+    a text block with the marker → True (third branch)."""
+    event = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "content": [
+                        {"type": "text", "text": f"got {_INTERRUPT}"},
+                    ],
+                },
+            ],
+        },
+    }
+    assert _is_user_interrupted(event) is True
+
+
+def test_user_interrupted_negative_cases() -> None:
+    """Content is normal user message → False."""
+    event = {
+        "type": "user",
+        "message": {"role": "user", "content": "just a regular prompt"},
+    }
+    assert _is_user_interrupted(event) is False
+
+
+def test_user_interrupted_wrong_type() -> None:
+    """Non-user events (e.g. assistant) with the marker → False."""
+    event = {
+        "type": "assistant",
+        "message": {"role": "assistant", "content": _INTERRUPT},
+    }
+    assert _is_user_interrupted(event) is False
+
+
+def test_user_interrupted_empty_content() -> None:
+    """User event with empty content → False."""
+    event = {"type": "user", "message": {"role": "user", "content": ""}}
+    assert _is_user_interrupted(event) is False
