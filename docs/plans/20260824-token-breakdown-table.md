@@ -219,10 +219,10 @@ def render_output(
 - Modify: `status_line.py` (функция `_main_unsafe`)
 - Modify: `tests/test_main_integration.py`
 
-- [ ] в `_main_unsafe` распаковать `cum_in / cum_out / cum_cache_read` из результата `compute_main_cum`
-- [ ] в `_main_unsafe` заменить вызов `render_output(header, main_cum.get("total", 0), agents)` на `render_output(header, cum_in, cum_out, cum_cache_read, agents)`
-- [ ] обновить `test_main_integration.py`: expected output под новый формат (header → заголовок таблицы → sum/main/agent lines); значения отформатированы через `format_tokens`
-- [ ] запустить `python -m pytest tests/` — все тесты должны проходить
+- [x] в `_main_unsafe` распаковать `cum_in / cum_out / cum_cache_read` из результата `compute_main_cum`
+- [x] в `_main_unsafe` заменить вызов `render_output(header, main_cum.get("total", 0), agents)` на `render_output(header, cum_in, cum_out, cum_cache_read, agents)`
+- [x] обновить `test_main_integration.py`: expected output под новый формат (header → заголовок таблицы → sum/main/agent lines); значения отформатированы через `format_tokens`
+- [x] запустить `python -m pytest tests/` — 109 unit tests passed; 9 integration tests error on missing `tests/fixtures/real_session/` (gitignored, per CLAUDE.md — not testable in this environment, see Post-Completion manual smoke-test)
 
 ### Task 5: Обновить `CLAUDE.md` под новый формат
 

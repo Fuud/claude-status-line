@@ -84,11 +84,11 @@ def fake_home_with_real_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 # ---------------------------------------------------------------------------
-# 1. Real session → 41 lines (header + sum + main + 38 agents)
+# 1. Real session → 42 lines (header + table header + sum + main + 38 agents)
 # ---------------------------------------------------------------------------
 
 def test_real_session_38_agents(fake_home_with_real_session) -> None:
-    """Feed the real session through main(); expect 41 lines, presence of
+    """Feed the real session through main(); expect 42 lines, presence of
     [ok]/[err]/[stop] tags, and Task 1 as the first agent line."""
     tmp_path, sid = fake_home_with_real_session
     stdin = json.dumps({
@@ -102,9 +102,9 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
     )
     output = result.stdout.decode("utf-8")
     lines = output.splitlines()
-    # header + sum + main + 38 agents = 41
-    assert len(lines) == 41, (
-        f"expected 41 lines, got {len(lines)}; first 5: {lines[:5]}; "
+    # header + table header + sum + main + 38 agents = 42
+    assert len(lines) == 42, (
+        f"expected 42 lines, got {len(lines)}; first 5: {lines[:5]}; "
         f"stderr: {result.stderr.decode('utf-8', 'replace')}"
     )
     # All three status tags must appear (real session covers ok/err/stop).
@@ -115,12 +115,20 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
     # snapshot has stopped agents, add the [stop] assertion back.
     assert "[ok]" in output, "expected at least one [ok] in output"
     assert "[err]" in output, "expected at least one [err] in output"
-    # Header / sum / main lines have predictable prefixes
+    # Header / table header / sum / main lines have predictable prefixes
     assert lines[0].startswith("Session:"), f"line 0: {lines[0]!r}"
-    assert lines[1].startswith("sum:"), f"line 1: {lines[1]!r}"
-    assert lines[2].startswith("main:"), f"line 2: {lines[2]!r}"
+    # Table header line (the breakdown-table labels): contains all three labels
+    # "in" / "out" / "cached", each right-aligned under its own column.
+    assert "in" in lines[1] and "out" in lines[1] and "cached" in lines[1], (
+        f"line 1 (table header) should contain in/out/cached labels: {lines[1]!r}"
+    )
+    assert not lines[1].startswith("sum:"), (
+        f"line 1 must be the table header, not the sum line: {lines[1]!r}"
+    )
+    assert lines[2].startswith("sum:"), f"line 2: {lines[2]!r}"
+    assert lines[3].startswith("main:"), f"line 3: {lines[3]!r}"
     # All agent lines start with a bracketed status tag
-    for line in lines[3:]:
+    for line in lines[4:]:
         assert line.startswith("["), f"agent line missing status tag: {line!r}"
     # The first agent in the output should be the one with the LOWEST
     # tool_use position in main jsonl. In the f5044e4f session that's
@@ -129,7 +137,7 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
     # assertion "Task 1 first" assumed Task 1 was at position 0; the real
     # session has Agent_61/62/... before Agent_103. We check for the actual
     # first-sorted agent instead.
-    first_agent = lines[3]
+    first_agent = lines[4]
     assert "Review implementation plan" in first_agent, (
         f"first agent should be 'Review implementation plan' (lowest toolUseId "
         f"in main jsonl), got: {first_agent!r}"
@@ -237,8 +245,19 @@ def test_broken_cache_recovery(fake_home_with_real_session) -> None:
     assert isinstance(loaded, dict)
     # The recomputed cache should match real session's main jsonl signature.
     assert "last_uuid" in loaded
-    assert "total" in loaded
-    assert loaded["total"] > 0
+    # [deviation] Task 2 dropped the `total` field from compute_main_cum's
+    # result and from the persisted cache. The breakdown-table refactor
+    # passes cum_in/cum_out/cum_cache_read directly to render; `total` is
+    # dead. Verify the new breakdown keys exist and reflect real usage.
+    assert "cum_in" in loaded
+    assert "cum_out" in loaded
+    assert "cum_cache_read" in loaded
+    assert "total" not in loaded, (
+        f"`total` must not appear in the persisted cache after Task 2, "
+        f"got keys: {sorted(loaded.keys())}"
+    )
+    assert loaded["cum_in"] > 0
+    assert loaded["cum_out"] > 0
 
 
 def test_broken_agents_cache_recovery(fake_home_with_real_session) -> None:
@@ -326,7 +345,7 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
     agentId-reinjection fix, the second call raised KeyError inside
     _write_agents_cache and main()'s except clause silently degraded to
     the hardcoded fallback header ("Session:  | Branch:  | Model:  | User:
-    n/a") — a single line instead of the expected 41.
+    n/a") — a single line instead of the expected 42.
 
     This is the actual runtime scenario: the status-line hook fires every
     few seconds, so every real invocation is a "second call after cache"
@@ -344,9 +363,9 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
     )
     first_output = first.stdout.decode("utf-8")
     first_lines = first_output.splitlines()
-    assert len(first_lines) == 41, (
-        f"first call should produce 41 lines, got {len(first_lines)}; "
-        f"first 3: {first_lines[:3]}"
+    assert len(first_lines) == 42, (
+        f"first call should produce 42 lines (header + table header + sum + "
+        f"main + 38 agents), got {len(first_lines)}; first 3: {first_lines[:3]}"
     )
 
     # Sanity: the agents cache file must exist after the first call.
@@ -362,8 +381,8 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
     )
     second_output = second.stdout.decode("utf-8")
     second_lines = second_output.splitlines()
-    assert len(second_lines) == 41, (
-        f"second call should also produce 41 lines (cache-hit path), "
+    assert len(second_lines) == 42, (
+        f"second call should also produce 42 lines (cache-hit path), "
         f"got {len(second_lines)}; first 3: {second_lines[:3]}; "
         f"this indicates compute_agent_snapshot cache-hit is missing agentId "
         f"and _write_agents_cache raised KeyError, which main() swallowed "

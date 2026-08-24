@@ -1129,7 +1129,13 @@ def _main_unsafe() -> int:
     # main()'s except clause — silently degrading to the fallback header.
     tool_use_positions = main_cum.get("tool_use_positions")
     agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
-    output = render_output(header, main_cum.get("total", 0), agents)
+    # Task 4 — breakdown-table refactor: pass the three cum_* values
+    # directly to render (no `total` field in main_cum anymore). render
+    # applies format_tokens to each cell; we hand it raw ints.
+    cum_in = main_cum.get("cum_in", 0)
+    cum_out = main_cum.get("cum_out", 0)
+    cum_cache_read = main_cum.get("cum_cache_read", 0)
+    output = render_output(header, cum_in, cum_out, cum_cache_read, agents)
     print(output)
     return 0
 
