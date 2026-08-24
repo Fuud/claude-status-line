@@ -237,6 +237,66 @@ def parse_stdin(json_str: str) -> dict:
 # single forward pass would be cleaner, but tail-scanning the uuid first lets
 # us short-circuit on cache hits before doing the expensive forward scan.
 
+def _read_last_assistant_event(jsonl_path: Path) -> dict | None:
+    """Return the LAST assistant event dict in jsonl_path, or None if none.
+
+    Reads file in reverse line-by-line. Returns the full event dict (not just
+    uuid) so callers can extract usage. Returns None if the file does not
+    exist, is unreadable, or contains no assistant events.
+    """
+    if not jsonl_path.exists():
+        return None
+    try:
+        with jsonl_path.open("rb") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for raw in reversed(lines):
+        try:
+            line = raw.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "assistant":
+            return event
+    return None
+
+
+def _read_last_event(jsonl_path: Path) -> dict | None:
+    """Return the LAST event dict in jsonl_path (any type), or None if the
+    file is missing/unreadable/empty. Used by detect_status, which classifies
+    status from the very last line regardless of event type (e.g. user
+    events with '[Request interrupted by user]' should yield 'stop')."""
+    if not jsonl_path.exists():
+        return None
+    try:
+        with jsonl_path.open("rb") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for raw in reversed(lines):
+        try:
+            line = raw.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            return event
+    return None
+
+
 def _read_last_assistant_uuid(jsonl_path: Path) -> str:
     """Return the uuid of the LAST assistant event in jsonl_path, or "" if
     none. Reads the file in reverse line-by-line for efficiency."""
@@ -421,3 +481,157 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     _atomic_write_json(cache_path, result)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# compute_agent_snapshot
+# ---------------------------------------------------------------------------
+
+# [deviation] Plan spec says "agent с 0 assistant event-ов → status='err'".
+# Pure detect_status would return "run" for that case (last event is user,
+# no error/stop/ok match). I add an explicit override here: if there are
+# zero assistant events in the jsonl at all, status is forced to "err"
+# (or "stop" if meta.stoppedByUser=true — consistent with the rest of the
+# logic). This is a deliberate behavior difference from detect_status, called
+# out in the deviation log.
+
+# Description truncation uses U+2026 HORIZONTAL ELLIPSIS ("…"), not three
+# ASCII dots. Per the rendering rules in the plan's Technical Details section.
+_DESCRIPTION_MAX_LEN = 40
+_DESCRIPTION_ELLIPSIS = "…"  # …
+
+
+def _truncate_description(s: str) -> str:
+    """Truncate `s` to at most 40 chars; if longer, take first 39 + U+2026."""
+    if len(s) > _DESCRIPTION_MAX_LEN:
+        return s[: _DESCRIPTION_MAX_LEN - 1] + _DESCRIPTION_ELLIPSIS
+    return s
+
+
+def _load_meta_dict(meta_path: Path) -> dict:
+    """Read meta_path as JSON; return {} on any failure (missing file,
+    OSError, malformed JSON, non-dict payload)."""
+    try:
+        loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    if isinstance(loaded, dict):
+        return loaded
+    return {}
+
+
+def compute_agent_snapshot(
+    jsonl_path: Path, meta_path: Path, cache_entry: dict | None
+) -> dict:
+    """Return snapshot dict for a single subagent.
+
+    Returns a dict with keys:
+        agentId      — jsonl filename without `.jsonl` extension
+        status       — one of {"ok","err","stop","run"} (see detect_status)
+        tokens       — sum of input+output+cache_creation+cache_read from
+                       the last assistant event's `usage`; None if there is
+                       no assistant event or status is "run" (mid-flow).
+        description  — meta.description, truncated to 40 chars with "…".
+                       Falls back to meta.agentType, then "unknown".
+        toolUseId    — meta.toolUseId (string; "" if missing)
+        last_uuid    — uuid of the last assistant event, or None
+        mtime_jsonl  — st_mtime of jsonl_path, or 0.0 if missing
+        mtime_meta   — st_mtime of meta_path, or 0.0 if missing
+
+    Cache hit: if `cache_entry` is provided AND its last_uuid AND
+    mtime_jsonl match the current jsonl state, the cache_entry is returned
+    unchanged. This function does NOT write to any cache file — the caller
+    (orchestrator) owns cache persistence.
+
+    [deviation] When the jsonl contains zero assistant events at all, status
+    is forced to "err" (or "stop" if meta.stoppedByUser=true) regardless of
+    what detect_status would return. See module-level note above.
+    """
+    # 1. mtime_jsonl (0.0 if missing).
+    try:
+        mtime_jsonl = jsonl_path.stat().st_mtime
+    except OSError:
+        mtime_jsonl = 0.0
+
+    # 2. Last assistant event (None if no assistant events) — drives tokens
+    # and last_uuid. We also need the LAST event of any type for status
+    # detection (e.g. agent_stopped_user has a user "[Request interrupted]"
+    # event after the last assistant).
+    last_event = _read_last_assistant_event(jsonl_path)
+    last_jsonl_event = _read_last_event(jsonl_path)
+
+    # 3. Load meta ({} on any failure).
+    meta = _load_meta_dict(meta_path)
+
+    # 4. Cache hit check.
+    last_uuid_for_compare: str | None = (
+        last_event.get("uuid") if last_event else None
+    )
+    if cache_entry is not None and isinstance(cache_entry, dict):
+        if (
+            cache_entry.get("last_uuid") == last_uuid_for_compare
+            and cache_entry.get("mtime_jsonl") == mtime_jsonl
+        ):
+            return cache_entry
+
+    # 5. Compute fields.
+    agent_id = jsonl_path.stem
+
+    # status — apply "0 assistant events → err" override. Otherwise pass
+    # the LAST event of any type to detect_status (e.g. user interrupted).
+    if last_event is None:
+        # No assistant events at all in the jsonl.
+        if meta.get("stoppedByUser") is True:
+            status = "stop"
+        else:
+            status = "err"
+    else:
+        # detect_status inspects the very last jsonl line for type=user with
+        # '[Request interrupted by user]'. If the jsonl has no last event
+        # (degenerate empty file mid-write), fall back to the last assistant.
+        detect_input = last_jsonl_event if last_jsonl_event is not None else last_event
+        status = detect_status(detect_input, meta)
+
+    # tokens — None if no assistant event or status is "run"; otherwise sum
+    # input + output + cache_creation + cache_read from last_event.message.usage.
+    if last_event is None or status == "run":
+        tokens: int | None = None
+    else:
+        msg = last_event.get("message") or {}
+        usage = msg.get("usage") if isinstance(msg, dict) else None
+        if isinstance(usage, dict):
+            tokens = (
+                int(usage.get("input_tokens", 0) or 0)
+                + int(usage.get("output_tokens", 0) or 0)
+                + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                + int(usage.get("cache_read_input_tokens", 0) or 0)
+            )
+        else:
+            tokens = None
+
+    # description — meta.description, fallback to meta.agentType, then
+    # "unknown". Truncate to 40 chars with U+2026 if longer.
+    description = meta.get("description") or ""
+    if not description:
+        description = meta.get("agentType") or "unknown"
+    description = _truncate_description(description)
+
+    tool_use_id = meta.get("toolUseId") or ""
+
+    last_uuid = last_uuid_for_compare
+
+    try:
+        mtime_meta = meta_path.stat().st_mtime
+    except OSError:
+        mtime_meta = 0.0
+
+    return {
+        "agentId": agent_id,
+        "status": status,
+        "tokens": tokens,
+        "description": description,
+        "toolUseId": tool_use_id,
+        "last_uuid": last_uuid,
+        "mtime_jsonl": mtime_jsonl,
+        "mtime_meta": mtime_meta,
+    }

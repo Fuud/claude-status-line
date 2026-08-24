@@ -230,16 +230,16 @@ main: 78k
 - Modify: `~/.claude/status_line/status_line.py`
 - Create: `~/.claude/status_line/tests/test_compute_agent_snapshot.py`
 
-- [ ] написать тесты: для каждой фикстуры (agent_ok, agent_err_*, agent_stopped_user, agent_running, agent_no_assistant) + meta_normal + meta_stopped_by_user + meta_long_description — проверить: status правильный; tokens правильный (для ok/err с assistant event); description правильный (обрезан до 40 для long); agentId, toolUseId, last_uuid, mtime_jsonl заполнены; cache hit (mtime и uuid не изменились) → return cached; cache miss → пересчёт; meta файл отсутствует → fallback на agentType="unknown"
-- [ ] реализовать `compute_agent_snapshot(jsonl_path, meta_path, cache_entry) -> dict`:
+- [x] написать тесты: для каждой фикстуры (agent_ok, agent_err_*, agent_stopped_user, agent_running, agent_no_assistant) + meta_normal + meta_stopped_by_user + meta_long_description — проверить: status правильный; tokens правильный (для ok/err с assistant event); description правильный (обрезан до 40 для long); agentId, toolUseId, last_uuid, mtime_jsonl заполнены; cache hit (mtime и uuid не изменились) → return cached; cache miss → пересчёт; meta файл отсутствует → fallback на agentType="unknown"
+- [x] реализовать `compute_agent_snapshot(jsonl_path, meta_path, cache_entry) -> dict`:
   - load meta (try/except → fallback)
   - `mtime_jsonl = jsonl_path.stat().st_mtime`
   - `last_assistant = read_last_assistant_event(jsonl_path)` (с конца файла)
   - если `cache.last_uuid == last_assistant["uuid"] and cache.mtime_jsonl == mtime_jsonl` → return cache
   - иначе: extract usage из last_assistant.message.usage; detect_status(last_assistant, meta); truncate description до 40; заполнить все поля; return
-- [ ] тест: `description` длиной 60 → "…" на позиции 39
-- [ ] тест: agent с 0 assistant event-ов → status="err", tokens=None (или 0)
-- [ ] прогнать `python3 -m pytest tests/test_compute_agent_snapshot.py -v` — все PASS
+- [x] тест: `description` длиной 60 → "…" на позиции 39
+- [x] тест: agent с 0 assistant event-ов → status="err", tokens=None (или 0)
+- [x] прогнать `python3 -m pytest tests/test_compute_agent_snapshot.py -v` — все PASS
 
 ### Task 5: find_session_dir + sort_agents + render_output (TDD)
 
