@@ -230,9 +230,9 @@ def render_output(
 
 - Modify: `CLAUDE.md`
 
-- [ ] в `CLAUDE.md` проверить, нет ли описания старого формата вывода. Текущий формат документирован в `status_line.py:render_output` docstring (status_line.py:766-779) и в `docs/plans/completed/20260824-status-line-tokens-aggregation.md` — не в CLAUDE.md
-- [ ] в `CLAUDE.md` добавить короткую заметку в секцию Deviations log: «2026-08-24 — переход на табличный формат с breakdown in/out/cached. См. plan `20260824-token-breakdown-table.md`»
-- [ ] убедиться, что описание cache-стратегии остаётся актуальным (ключи кэша те же, новое — field-presence check)
+- [x] в `CLAUDE.md` проверить, нет ли описания старого формата вывода. Текущий формат документирован в `status_line.py:render_output` docstring (status_line.py:766-779) и в `docs/plans/completed/20260824-status-line-tokens-aggregation.md` — не в CLAUDE.md
+- [x] в `CLAUDE.md` добавить короткую заметку в секцию Deviations log: «2026-08-24 — переход на табличный формат с breakdown in/out/cached. См. plan `20260824-token-breakdown-table.md`»
+- [x] убедиться, что описание cache-стратегии остаётся актуальным (ключи кэша те же, новое — field-presence check)
 
 ### Task 6: Верификация и финализация
 
