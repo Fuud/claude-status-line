@@ -838,57 +838,102 @@ _DESC_TOKEN_GAP = "  "
 _STATUSES = ("ok", "run", "err", "stop", "kill")
 
 
-def render_output(header: str, main_total: int, agents: list) -> str:
-    """Build the multi-line status line string.
+def render_output(
+    header: str,
+    main_in: int,
+    main_out: int,
+    main_cached: int,
+    agents: list,
+) -> str:
+    """Build the multi-line status line string with a tabular breakdown.
 
     Layout:
         <header>
-        sum: <sum_total>            # only when len(agents) > 0
-        main: <format_tokens(main_total)>
-        [<status>]  <description>  <tokens>      # one line per agent
+        <table header — labels "in" / "out" / "cached", each right-aligned
+         within its own column>
+        sum: <in> <out> <cached>      # only if len(agents) > 0
+        main: <in> <out> <cached>
+        for each agent (in input order):
+            [<status>]  <description>  <in> <out> <cached>
 
-    Sum = main_total + sum(a.tokens for a in agents if a.tokens is not None).
+    Every numeric cell is formatted via format_tokens() (so 1000 → "1k")
+    BEFORE applying :>W — formatting raw 1000 with width 7 would render
+    "   1000" instead of "     1k". Each column's width is computed
+    independently as
+        max(_TOKEN_COLUMN_WIDTH,
+            len(label),
+            len(format_tokens(v)) for v in column)
+    so columns with wider labels ("cached") or wider formatted values
+    ("1.2M") expand independently.
 
-    Description column is left-aligned and width-padded so token counts
-    right-align cleanly. Agents with `tokens=None` render without the
-    token column (the description fills the rest of the line, no
-    trailing whitespace after the description).
+    Description is truncated to 40 chars with U+2026 by _truncate_description
+    (re-applied here for defense-in-depth). The description column itself
+    is NOT padded — only the numeric columns are right-aligned.
+
+    Agents are NEVER skipped: a run-agent renders its current breakdown
+    values (not None), and an agent with no breakdown data renders three
+    zeros. The cache-hit invariant in compute_agent_snapshot guarantees
+    all three tokens_* fields are populated; defensive `int(... or 0)`
+    here handles pre-upgrade caches or callers that build snapshots by
+    hand.
     """
+    # 1. Build per-column value lists (main row first, then agents).
+    in_col = [main_in] + [int(a.get("tokens_in") or 0) for a in agents]
+    out_col = [main_out] + [int(a.get("tokens_out") or 0) for a in agents]
+    cached_col = [main_cached] + [int(a.get("tokens_cached") or 0) for a in agents]
+
+    # 2. Compute per-column width: at least _TOKEN_COLUMN_WIDTH, at least
+    # the label length, at least the longest formatted cell.
+    def _col_width(values: list, label: str) -> int:
+        longest_value = max((len(format_tokens(v)) for v in values), default=0)
+        return max(_TOKEN_COLUMN_WIDTH, len(label), longest_value)
+
+    w_in = _col_width(in_col, "in")
+    w_out = _col_width(out_col, "out")
+    w_cached = _col_width(cached_col, "cached")
+
+    # 3. Assemble lines.
     lines: list[str] = [header]
+    lines.append(
+        f"{'in':>{w_in}} {'out':>{w_out}} {'cached':>{w_cached}}"
+    )
 
     if agents:
-        sum_total = main_total + sum(
-            a["tokens"] for a in agents if a.get("tokens") is not None
+        sum_in = main_in + sum(int(a.get("tokens_in") or 0) for a in agents)
+        sum_out = main_out + sum(int(a.get("tokens_out") or 0) for a in agents)
+        sum_cached = main_cached + sum(
+            int(a.get("tokens_cached") or 0) for a in agents
         )
-        lines.append(f"sum: {format_tokens(sum_total)}")
+        lines.append(
+            f"sum: {format_tokens(sum_in):>{w_in}} "
+            f"{format_tokens(sum_out):>{w_out}} "
+            f"{format_tokens(sum_cached):>{w_cached}}"
+        )
 
-    lines.append(f"main: {format_tokens(main_total)}")
+    lines.append(
+        f"main: {format_tokens(main_in):>{w_in}} "
+        f"{format_tokens(main_out):>{w_out}} "
+        f"{format_tokens(main_cached):>{w_cached}}"
+    )
 
     for agent in agents:
         status = agent.get("status", "run")
-        # ASCII status tag: "[<status>]" — derived inline from the status
-        # value. Unknown statuses surface as "[?]" rather than failing.
         icon = f"[{status}]" if status in _STATUSES else "[?]"
         description = agent.get("description", "") or ""
-        # Defensive truncation: callers (compute_agent_snapshot) already
-        # truncate to 40, but render_output is the final formatter and
-        # shouldn't trust upstream. Re-apply the rule so a buggy or
-        # future caller can't blow up the column layout.
+        # Defensive truncation: callers already truncate to 40, but
+        # render_output is the final formatter and shouldn't trust
+        # upstream. Re-apply so a buggy or future caller can't blow up
+        # the column layout.
         description = _truncate_description(description)
-        tokens = agent.get("tokens")
-
-        if tokens is None:
-            # no token column — just status + description (no trailing ws)
-            lines.append(f"{icon}{_STATUS_GAP}{description}")
-        else:
-            formatted = format_tokens(tokens)
-            # left-pad description so formatted tokens right-align within
-            # _TOKEN_COLUMN_WIDTH. We use a single f-string with width
-            # specifier on the token side.
-            lines.append(
-                f"{icon}{_STATUS_GAP}{description}{_DESC_TOKEN_GAP}"
-                f"{formatted:>{_TOKEN_COLUMN_WIDTH}}"
-            )
+        in_v = int(agent.get("tokens_in") or 0)
+        out_v = int(agent.get("tokens_out") or 0)
+        cached_v = int(agent.get("tokens_cached") or 0)
+        lines.append(
+            f"{icon}{_STATUS_GAP}{description}{_DESC_TOKEN_GAP}"
+            f"{format_tokens(in_v):>{w_in}} "
+            f"{format_tokens(out_v):>{w_out}} "
+            f"{format_tokens(cached_v):>{w_cached}}"
+        )
 
     return "\n".join(lines)
 

@@ -192,25 +192,25 @@ def render_output(
 - Modify: `status_line.py` (функция `render_output`)
 - Modify: `tests/test_render_output.py`
 
-- [ ] обновить `test_single_ok_agent`: новый формат — header, заголовок таблицы, `sum:`, `main:`, строка агента с тремя числами (через `format_tokens`)
-- [ ] обновить `test_zero_agents_no_sum_line`: новый формат — header, заголовок таблицы, `main:` (без `sum:`)
-- [ ] обновить `test_38_agents_produce_41_lines`: новое ожидание — 42 строки (+1 на заголовок таблицы)
-- [ ] обновить `test_token_alignment_right_aligned`: три колонки, каждая выровнена независимо; проверить, что для 1000 рендерится `1k`, а не `1000`
-- [ ] обновить `test_long_description_truncated`: формат строки агента с тремя числами, эллипсис всё ещё присутствует
-- [ ] удалить `test_agent_with_no_tokens` (семантика ушла) → заменить на `test_run_agent_shows_current_values`
-- [ ] обновить `test_sum_calculation`: sum = сумма breakdown (in+out+cached) по всем строкам
-- [ ] добавить `test_table_header_row`: после `header` идёт строка с метками `in / out / cached`, каждая right-aligned
-- [ ] добавить `test_three_columns_right_aligned`: 3 агента с разной шириной in/out/cached → каждая колонка выравнивается независимо
-- [ ] добавить `test_sum_aggregates_all_rows`: sum = main_in + sum(agent_in), аналогично для out/cached
-- [ ] добавить `test_agent_no_assistant_events_renders_zeros`: агент с отсутствующими/None breakdown полями → рендер `0 0 0` (не пропускается)
-- [ ] добавить `test_run_agent_shows_current_values`: status `run`, но breakdown из last_event не нули
-- [ ] добавить `test_large_values_format_as_k`: in=2000 → рендерится как `2k`, не `2000`
-- [ ] в `render_output` заменить сигнатуру: `header, main_in, main_out, main_cached, agents`
-- [ ] в `render_output` вычислить ширины трёх колонок через `max(len(format_tokens(v)) for v in col + [label])`
-- [ ] в `render_output` собрать строки: header → заголовок таблицы → (если есть агенты) `sum:` → `main:` → по строке на агента
-- [ ] **критично:** в каждом f-string с числом обернуть значение в `format_tokens()` ДО `:>W` (строки sum, main, агент)
-- [ ] обработать `tokens_in/out/cached is None` → подставить `0` через `int(a.get(field) or 0)`
-- [ ] запустить `python -m pytest tests/test_render_output.py` — все тесты должны проходить
+- [x] обновить `test_single_ok_agent`: новый формат — header, заголовок таблицы, `sum:`, `main:`, строка агента с тремя числами (через `format_tokens`)
+- [x] обновить `test_zero_agents_no_sum_line`: новый формат — header, заголовок таблицы, `main:` (без `sum:`)
+- [x] обновить `test_38_agents_produce_41_lines`: новое ожидание — 42 строки (+1 на заголовок таблицы)
+- [x] обновить `test_token_alignment_right_aligned`: три колонки, каждая выровнена независимо; проверить, что для 1000 рендерится `1k`, а не `1000`
+- [x] обновить `test_long_description_truncated`: формат строки агента с тремя числами, эллипсис всё ещё присутствует
+- [x] удалить `test_agent_with_no_tokens` (семантика ушла) → заменить на `test_run_agent_shows_current_values`
+- [x] обновить `test_sum_calculation`: sum = сумма breakdown (in+out+cached) по всем строкам
+- [x] добавить `test_table_header_row`: после `header` идёт строка с метками `in / out / cached`, каждая right-aligned
+- [x] добавить `test_three_columns_right_aligned`: 3 агента с разной шириной in/out/cached → каждая колонка выравнивается независимо
+- [x] добавить `test_sum_aggregates_all_rows`: sum = main_in + sum(agent_in), аналогично для out/cached
+- [x] добавить `test_agent_no_assistant_events_renders_zeros`: агент с отсутствующими/None breakdown полями → рендер `0 0 0` (не пропускается)
+- [x] добавить `test_run_agent_shows_current_values`: status `run`, но breakdown из last_event не нули
+- [x] добавить `test_large_values_format_as_k`: in=2000 → рендерится как `2k`, не `2000`
+- [x] в `render_output` заменить сигнатуру: `header, main_in, main_out, main_cached, agents`
+- [x] в `render_output` вычислить ширины трёх колонок через `max(len(format_tokens(v)) for v in col + [label])`
+- [x] в `render_output` собрать строки: header → заголовок таблицы → (если есть агенты) `sum:` → `main:` → по строке на агента
+- [x] **критично:** в каждом f-string с числом обернуть значение в `format_tokens()` ДО `:>W` (строки sum, main, агент)
+- [x] обработать `tokens_in/out/cached is None` → подставить `0` через `int(a.get(field) or 0)`
+- [x] запустить `python -m pytest tests/test_render_output.py` — все тесты должны проходить
 
 ### Task 4: Обновить `_main_unsafe` под новую сигнатуру `render_output`
 
