@@ -635,3 +635,149 @@ def compute_agent_snapshot(
         "mtime_jsonl": mtime_jsonl,
         "mtime_meta": mtime_meta,
     }
+
+
+# ---------------------------------------------------------------------------
+# find_session_dir
+# ---------------------------------------------------------------------------
+
+def find_session_dir(
+    session_id: str, projects_root: Path | None = None
+) -> Path | None:
+    """Locate the directory for `session_id` under `projects_root`.
+
+    Walks `<projects_root>/**/<session_id>` and returns the first matching
+    *directory* as a Path. Returns None if `session_id` is empty, if
+    `projects_root` does not exist, or if no matching directory is found.
+
+    If `projects_root` is None, defaults to `<home>/.claude/projects`.
+
+    [decision] We accept `projects_root` as an explicit parameter (rather
+    than monkeypatching `Path.home()`) so tests can point at tmp_path with
+    no harness gymnastics. Production callers pass `None` and get the
+    real home directory.
+    """
+    if not session_id:
+        return None
+    if projects_root is None:
+        projects_root = Path.home() / ".claude" / "projects"
+    if not projects_root.exists():
+        return None
+    # glob for a directory whose name matches session_id anywhere under
+    # projects_root. We use **/<session_id> (not the bare name) so we
+    # also pick up project-name directories nested one level deep
+    # (the convention is `<encoded-project>/<session_id>/`).
+    for candidate in projects_root.glob(f"**/{session_id}"):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# sort_agents
+# ---------------------------------------------------------------------------
+
+def sort_agents(
+    agents: list, tool_use_positions: dict[str, int]
+) -> list:
+    """Return a NEW list of `agents` sorted by tool_use_positions then
+    mtime_meta.
+
+    Sort key: `(tool_use_positions.get(toolUseId, +inf), mtime_meta)`.
+    Agents without `toolUseId` (or with one not in `tool_use_positions`)
+    sort LAST (sentinel +inf), and among themselves they break ties by
+    `mtime_meta`. Python's `sorted()` is stable, so agents with identical
+    keys preserve input order.
+
+    The input list is NOT mutated.
+    """
+    if not agents:
+        return []
+    sentinel = float("inf")
+
+    def sort_key(agent: dict) -> tuple[float, float]:
+        tool_use_id = agent.get("toolUseId", "")
+        if not isinstance(tool_use_id, str):
+            tool_use_id = ""
+        position = tool_use_positions.get(tool_use_id, sentinel)
+        mtime_meta = agent.get("mtime_meta", 0)
+        if not isinstance(mtime_meta, (int, float)):
+            mtime_meta = 0
+        return (position, mtime_meta)
+
+    return sorted(agents, key=sort_key)
+
+
+# ---------------------------------------------------------------------------
+# render_output
+# ---------------------------------------------------------------------------
+
+# ASCII status tags, exactly as specified in the plan's Technical Details.
+_STATUS_ICONS: dict[str, str] = {
+    "ok": "[ok]",
+    "run": "[run]",
+    "err": "[err]",
+    "stop": "[stop]",
+}
+
+# Token column width — sized to fit the widest format produced by
+# format_tokens (e.g. "999.5k", "1.2M" → 5 chars max, plus a small
+# safety margin).
+_TOKEN_COLUMN_WIDTH = 7
+# Gap between the status tag and the description column (2 spaces).
+_STATUS_GAP = "  "
+# Gap between the description column and the token column (2 spaces).
+_DESC_TOKEN_GAP = "  "
+
+
+def render_output(header: str, main_total: int, agents: list) -> str:
+    """Build the multi-line status line string.
+
+    Layout:
+        <header>
+        sum: <sum_total>            # only when len(agents) > 0
+        main: <format_tokens(main_total)>
+        [<status>]  <description>  <tokens>      # one line per agent
+
+    Sum = main_total + sum(a.tokens for a in agents if a.tokens is not None).
+
+    Description column is left-aligned and width-padded so token counts
+    right-align cleanly. Agents with `tokens=None` render without the
+    token column (the description fills the rest of the line, no
+    trailing whitespace after the description).
+    """
+    lines: list[str] = [header]
+
+    if agents:
+        sum_total = main_total + sum(
+            a["tokens"] for a in agents if a.get("tokens") is not None
+        )
+        lines.append(f"sum: {format_tokens(sum_total)}")
+
+    lines.append(f"main: {format_tokens(main_total)}")
+
+    for agent in agents:
+        status = agent.get("status", "run")
+        icon = _STATUS_ICONS.get(status, "[?]")
+        description = agent.get("description", "") or ""
+        # Defensive truncation: callers (compute_agent_snapshot) already
+        # truncate to 40, but render_output is the final formatter and
+        # shouldn't trust upstream. Re-apply the rule so a buggy or
+        # future caller can't blow up the column layout.
+        description = _truncate_description(description)
+        tokens = agent.get("tokens")
+
+        if tokens is None:
+            # no token column — just status + description (no trailing ws)
+            lines.append(f"{icon}{_STATUS_GAP}{description}")
+        else:
+            formatted = format_tokens(tokens)
+            # left-pad description so formatted tokens right-align within
+            # _TOKEN_COLUMN_WIDTH. We use a single f-string with width
+            # specifier on the token side.
+            lines.append(
+                f"{icon}{_STATUS_GAP}{description}{_DESC_TOKEN_GAP}"
+                f"{formatted:>{_TOKEN_COLUMN_WIDTH}}"
+            )
+
+    return "\n".join(lines)

@@ -250,13 +250,13 @@ main: 78k
 - Create: `~/.claude/status_line/tests/test_sort_agents.py`
 - Create: `~/.claude/status_line/tests/test_render_output.py`
 
-- [ ] написать тесты `test_find_session_dir`: мокать `Path.home()` через monkeypatch, создать tmp-структуру `~/.claude/projects/projA/<sid1>`, `~/.claude/projects/projB/<sid2>`; ищем sid1 → находит; несуществующий sid → None
-- [ ] реализовать `find_session_dir(session_id) -> Path | None` — `Path.home() / ".claude" / "projects"` → glob `**/<session_id>` → первый match → None если пусто
-- [ ] написать тесты `test_sort_agents`: 3 агента с toolUseId в tool_use_positions → сортируются по position; один агент без toolUseId в positions → fallback на mtime_meta; стабильность сортировки
-- [ ] реализовать `sort_agents(agents, tool_use_positions) -> list` — sort key = `(positions.get(a.toolUseId, inf), a.mtime_meta)`; стабильный sort
-- [ ] написать тесты `test_render_output`: 1 agent [ok] с токенами → 4 строки; 0 agents → 2 строки (header + main); 38 agents → 41 строка; выравнивание токенов по правому краю; description >40 → обрезан с "…"; порядок: header, sum, main, per-agent (по sort_agents)
-- [ ] реализовать `render_output(header, main_total, agents)` — собирает список строк, выравнивает колонку токенов через `f"{tokens:>7}"` (или аналог)
-- [ ] прогнать `python3 -m pytest tests/test_find_session_dir.py tests/test_sort_agents.py tests/test_render_output.py -v` — все PASS
+- [x] написать тесты `test_find_session_dir`: мокать `Path.home()` через monkeypatch, создать tmp-структуру `~/.claude/projects/projA/<sid1>`, `~/.claude/projects/projB/<sid2>`; ищем sid1 → находит; несуществующий sid → None
+- [x] реализовать `find_session_dir(session_id) -> Path | None` — `Path.home() / ".claude" / "projects"` → glob `**/<session_id>` → первый match → None если пусто
+- [x] написать тесты `test_sort_agents`: 3 агента с toolUseId в tool_use_positions → сортируются по position; один агент без toolUseId в positions → fallback на mtime_meta; стабильность сортировки
+- [x] реализовать `sort_agents(agents, tool_use_positions) -> list` — sort key = `(positions.get(a.toolUseId, inf), a.mtime_meta)`; стабильный sort
+- [x] написать тесты `test_render_output`: 1 agent [ok] с токенами → 4 строки; 0 agents → 2 строки (header + main); 38 agents → 41 строка; выравнивание токенов по правому краю; description >40 → обрезан с "…"; порядок: header, sum, main, per-agent (по sort_agents)
+- [x] реализовать `render_output(header, main_total, agents)` — собирает список строк, выравнивает колонку токенов через `f"{tokens:>7}"` (или аналог)
+- [x] прогнать `python3 -m pytest tests/test_find_session_dir.py tests/test_sort_agents.py tests/test_render_output.py -v` — все PASS
 
 ### Task 6: main() — оркестрация + интеграционный тест с реальной сессией
 
