@@ -265,21 +265,21 @@ main: 78k
 - Modify: `~/.claude/status_line/status_line.py`
 - Create: `~/.claude/status_line/tests/test_main_integration.py`
 
-- [ ] реализовать `main()`:
+- [x] реализовать `main()`:
   - `input_str = sys.stdin.read()` → `parse_stdin`
   - если session_id пустой → print только header, return
   - `session_dir = find_session_dir(session_id)` → если None, print только header, return
-  - `main_jsonl = session_dir / f"{session_id}.jsonl"`
+  - `main_jsonl = session_dir / f"{session_id}.jsonl"` (см. deviation: в реальности main jsonl лежит рядом с session_dir, не внутри)
   - `main_cum = compute_main_cum(main_jsonl, data_dir / f"main_{session_id}.json")`
   - `agents_dir = session_dir / "subagents"` → list `agent-*.jsonl`
   - для каждого: `meta_path = jsonl.with_suffix("").with_suffix(".meta.json")` или glob parallel; `compute_agent_snapshot`
   - `sort_agents(agents, main_cum["tool_use_positions"])`
   - `output = render_output(header, main_cum["total"], agents)` → `print(output)`
-- [ ] написать интеграционный тест: `monkeypatch` HOME на `fixtures/real_session`-like структуру (через tmp-каталог с symlink на `fixtures/real_session/<sid>/`); feed stdin с JSON для session_id=f5044e4f; assert stdout содержит 1+1+1+38=41 строк; assert правильный порядок (Task 1 первый — `Agent_103`); assert наличие `[ok]`, `[err]`, `[stop]` тегов
-- [ ] прогнать `python3 -m pytest tests/ -v` — все PASS (все ранее зелёные + этот)
-- [ ] ручной smoke: `echo '{}' | python3 ~/.claude/status_line/status_line.py` — выводит header без падения
-- [ ] ручной smoke с реальной stdin от Claude Code (вызвать `status_line.sh` вручную в Git Bash): `cat <(echo '{"session_id":"","model":{"display_name":"MiniMax-M3"},"context_window":{"used_percentage":12,"total_input_tokens":45000}}') | bash ~/.claude/status_line/status_line.sh` — пустой session_id упражняет ветку `find_session_dir → None → только header + main: 0` (или header + main: 45k если контекст успел проставиться до пустого session_id)
-- [ ] интеграционный тест `test_main_integration.py` должен содержать отдельный кейс: "non-existent session_id → stdout содержит ровно 1 строку (header) и exit 0"
+- [x] написать интеграционный тест: `monkeypatch` HOME на `fixtures/real_session`-like структуру (через tmp-каталог с symlink на `fixtures/real_session/<sid>/`); feed stdin с JSON для session_id=f5044e4f; assert stdout содержит 1+1+1+38=41 строк; assert правильный порядок (Task 1 первый — `Agent_103`); assert наличие `[ok]`, `[err]`, `[stop]` тегов
+- [x] прогнать `python3 -m pytest tests/ -v` — все PASS (все ранее зелёные + этот)
+- [x] ручной smoke: `echo '{}' | python3 ~/.claude/status_line/status_line.py` — выводит header без падения
+- [x] ручной smoke с реальной stdin от Claude Code (вызвать `status_line.sh` вручную в Git Bash): `cat <(echo '{"session_id":"","model":{"display_name":"MiniMax-M3"},"context_window":{"used_percentage":12,"total_input_tokens":45000}}') | bash ~/.claude/status_line/status_line.sh` — пустой session_id упражняет ветку `find_session_dir → None → только header + main: 0` (или header + main: 45k если контекст успел проставиться до пустого session_id)
+- [x] интеграционный тест `test_main_integration.py` должен содержать отдельный кейс: "non-existent session_id → stdout содержит ровно 1 строку (header) и exit 0"
 
 ### Task 7: Обёртка status_line.sh + финальная валидация
 

@@ -781,3 +781,128 @@ def render_output(header: str, main_total: int, agents: list) -> str:
             )
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# main — entry point / orchestrator
+# ---------------------------------------------------------------------------
+
+# [deviation] Production Claude Code stores the main jsonl as a SIBLING to
+# the session directory, not inside it. The fixture structure (and the real
+# `~/.claude/projects/<encoded>/<sid>.jsonl` next to `<sid>/subagents/`)
+# confirms this. The plan spec says "session_dir / f'{sid}.jsonl'", which
+# would not find the file. We use session_dir.parent instead — this is the
+# only place main() knows about the disk layout, all compute_* helpers are
+# layout-agnostic.
+
+# Fields persisted in agents_<sid>.json cache. agentId is the dict key, so
+# not stored inside each entry. mtime_jsonl/last_uuid drive invalidation;
+# the rest is the render-ready snapshot.
+_AGENT_CACHE_FIELDS = (
+    "last_uuid",
+    "mtime_jsonl",
+    "status",
+    "tokens",
+    "description",
+    "toolUseId",
+    "mtime_meta",
+)
+
+
+def main() -> int:
+    """Entry point: read stdin, compute, print multi-line status.
+
+    Returns the process exit code (0 on success; we never return non-zero
+    because the status line hook should never break the user's session —
+    errors are swallowed and the worst case is a degraded display).
+    """
+    input_str = sys.stdin.read()
+    parsed = parse_stdin(input_str)
+    session_id = parsed.get("session_id", "") or ""
+
+    header = (
+        f"Session: {session_id} | "
+        f"Branch: {parsed.get('branch','') or ''} | "
+        f"Model: {parsed.get('model','') or ''} | "
+        f"User: {parsed.get('user','n/a') or 'n/a'}"
+    )
+
+    if not session_id:
+        # empty session_id → header only, exit 0
+        print(header)
+        return 0
+
+    session_dir = find_session_dir(session_id)
+    if session_dir is None:
+        # no matching session dir on disk → header only
+        print(header)
+        return 0
+
+    # cache lives under ~/.claude/status_line/data/<sid>.json
+    data_dir = Path.home() / ".claude" / "status_line" / "data"
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # If we can't create the data dir, fall through to a no-cache run —
+        # we'll still produce correct output, just slower next time.
+        data_dir = None
+
+    def _cache_path(name: str) -> Path:
+        if data_dir is None:
+            return Path(os.devnull)  # writes go nowhere; reads always miss
+        return data_dir / f"{name}_{session_id}.json"
+
+    # main jsonl lives as a SIBLING of session_dir (see deviation note above)
+    main_jsonl = session_dir.parent / f"{session_id}.jsonl"
+    main_cum = compute_main_cum(main_jsonl, _cache_path("main"))
+
+    agents: list = []
+    subagents_dir = session_dir / "subagents"
+    if subagents_dir.exists():
+        # Load existing per-agent cache (if any) to feed into snapshots.
+        agents_cache: dict = {}
+        agents_cache_path = _cache_path("agents")
+        if agents_cache_path.exists():
+            try:
+                loaded = json.loads(agents_cache_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    agents_cache = loaded
+                else:
+                    try:
+                        agents_cache_path.unlink()
+                    except OSError:
+                        pass
+            except (json.JSONDecodeError, OSError, ValueError):
+                # broken cache → start fresh; will be overwritten below
+                agents_cache = {}
+
+        for jsonl_path in sorted(subagents_dir.glob("agent-*.jsonl")):
+            agent_id = jsonl_path.stem
+            meta_path = jsonl_path.parent / f"{agent_id}.meta.json"
+            cache_entry = agents_cache.get(agent_id)
+            snapshot = compute_agent_snapshot(jsonl_path, meta_path, cache_entry)
+            agents.append(snapshot)
+
+        # Persist per-agent cache atomically. Keep only the fields we need
+        # for invalidation + rendering; drop transient/derivable data.
+        new_cache = {
+            a["agentId"]: {k: a.get(k) for k in _AGENT_CACHE_FIELDS}
+            for a in agents
+            if isinstance(a.get("agentId"), str)
+        }
+        try:
+            _atomic_write_json(agents_cache_path, new_cache)
+        except OSError:
+            # Cache write failure is non-fatal — output is still correct,
+            # just slower next invocation.
+            pass
+
+    agents = sort_agents(agents, main_cum.get("tool_use_positions", {}))
+
+    output = render_output(header, main_cum.get("total", 0), agents)
+    print(output)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
