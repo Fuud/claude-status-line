@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from status_line import (
     _DESC_TOKEN_GAP,
+    _ICON_COL_WIDTH,
     _STATUS_GAP,
     _TOKEN_COLUMN_WIDTH,
     _col_width,
@@ -266,7 +267,7 @@ def test_long_description_truncated() -> None:
     # _DESC_TOKEN_GAP length. Slicing this way avoids splitting on
     # _DESC_TOKEN_GAP, which would mis-split on a description
     # containing internal double-space runs.
-    prefix = "[ok]" + _STATUS_GAP
+    prefix = f"{'[ok]':<{_ICON_COL_WIDTH}}" + _STATUS_GAP
     cell_section_len = _TOKEN_COLUMN_WIDTH * 3 + 2  # 3 cells + 2 separators
     desc_part = agent_line[len(prefix) : -(cell_section_len + len(_DESC_TOKEN_GAP))]
     assert len(desc_part) <= 40, (
@@ -548,16 +549,18 @@ def test_table_header_row() -> None:
 
     # The table header has exactly the three labels separated by single
     # spaces, each right-aligned to the column width, padded on the left
-    # by `w_desc` spaces so the labels line up with the cells in the
-    # rows below. We can verify by reconstructing what the renderer would
+    # by `w_desc + _ICON_COL_WIDTH + 4` spaces (the prefix width that
+    # agent rows also use, after the icon column is padded to a fixed
+    # width). We can verify by reconstructing what the renderer would
     # produce, using the production _col_width helper (so the test tracks
     # the formula rather than recomputing it).
     in_width = _col_width([50000, 1000], "in")
     out_width = _col_width([200, 0], "out")
     cached_width = _col_width([700, 0], "cached")
     w_desc = max(len(a["description"]) for a in agents)
+    header_pad = w_desc + _ICON_COL_WIDTH + 4
     expected_table_header = (
-        f"{' ' * w_desc}{'in':>{in_width}} {'out':>{out_width}} {'cached':>{cached_width}}"
+        f"{' ' * header_pad}{'in':>{in_width}} {'out':>{out_width}} {'cached':>{cached_width}}"
     )
     assert table_header == expected_table_header, (
         f"table header mismatch: got {table_header!r}, expected "

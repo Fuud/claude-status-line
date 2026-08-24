@@ -57,6 +57,63 @@ def format_tokens(n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# context limit / format_context
+# ---------------------------------------------------------------------------
+
+# Fallback context-window limits when CLAUDE_CODE_CONTEXT_LIMIT is unset:
+# "[1m]" models get 1M, everything else 200k (the API default).
+_CONTEXT_LIMIT_1M = 1_000_000
+_CONTEXT_LIMIT_DEFAULT = 200_000
+# Env var that, when set to a positive int, overrides both fallbacks.
+_CONTEXT_LIMIT_ENV = "CLAUDE_CODE_CONTEXT_LIMIT"
+
+
+def resolve_context_limit(model: str) -> int:
+    """Return the context-window limit (tokens) the header percentage is
+    computed against.
+
+    Priority:
+        1. env CLAUDE_CODE_CONTEXT_LIMIT — if set and parses as a positive
+           int, it wins outright (even for "[1m]" models).
+        2. "[1m]" substring in `model` (the display name, e.g.
+           "glm-5.3[1m]") → 1_000_000.
+        3. otherwise → 200_000.
+
+    Malformed (non-int), empty, or non-positive env values are ignored and
+    resolution falls through to the model heuristic — a bad env var must
+    not take the percentage away, only a good one should override it.
+    The "[1m]" check is case-insensitive so "GLM-5.3[1M]" matches too.
+    """
+    raw = os.environ.get(_CONTEXT_LIMIT_ENV, "")
+    if raw:
+        try:
+            limit = int(raw)
+        except ValueError:
+            limit = 0
+        if limit > 0:
+            return limit
+    if "[1m]" in (model or "").lower():
+        return _CONTEXT_LIMIT_1M
+    return _CONTEXT_LIMIT_DEFAULT
+
+
+def format_context(context_tokens: int, limit: int) -> str:
+    """Format the header's Context segment: "<N>K (<P>%)".
+
+    N is context_tokens in whole thousands (round-half-to-even, matching
+    format_tokens' k-branch), P is the share of `limit` rounded to a whole
+    percent. Negative tokens clamp to 0; a non-positive limit (defensive —
+    resolve_context_limit never returns one) yields 0% instead of dividing
+    by zero.
+    """
+    if context_tokens < 0:
+        context_tokens = 0
+    k = round(context_tokens / 1_000)
+    pct = round(context_tokens * 100 / limit) if limit > 0 else 0
+    return f"{k}K ({pct}%)"
+
+
+# ---------------------------------------------------------------------------
 # detect_status
 # ---------------------------------------------------------------------------
 
@@ -160,6 +217,7 @@ _DEFAULTS: dict[str, Any] = {
     "model": "",
     "branch": "",
     "user": "n/a",
+    "context_tokens": 0,
 }
 
 
@@ -215,7 +273,12 @@ def parse_stdin(json_str: str) -> dict:
     module-level TTL cache. Returns "" on any failure (not a git repo, git
     missing, timeout).
 
-    Returns keys: session_id, prompt_id, model, branch, user.
+    Returns keys: session_id, prompt_id, model, branch, user, context_tokens.
+    context_tokens is payload.context_window.total_input_tokens — the
+    context-window occupancy at the most recent API response (input +
+    cache writes + cache reads), per the statusline docs. 0 when absent
+    (pre-first-API-call, older CC versions); the orchestrator then falls
+    back to the jsonl-derived value.
     """
     # defensive copy so we don't mutate the module default dict on error paths
     out = dict(_DEFAULTS)
@@ -245,6 +308,16 @@ def parse_stdin(json_str: str) -> dict:
         name = model.get("display_name", "")
         if isinstance(name, str):
             out["model"] = name
+
+    # context_window.total_input_tokens — int tokens currently in the
+    # context window at the last API response. bool is an int subclass, so
+    # the isinstance check would let True through; the `not bool(...)` guard
+    # keeps that degenerate value at 0.
+    ctx = payload.get("context_window", {})
+    if isinstance(ctx, dict):
+        tokens = ctx.get("total_input_tokens", 0)
+        if isinstance(tokens, int) and not isinstance(tokens, bool):
+            out["context_tokens"] = tokens
 
     # `user` is not derivable from the payload (no host/uid field), so it
     # comes from the AI_USER env var; unset or empty falls back to "n/a".
@@ -344,18 +417,22 @@ def _read_last_event(
     return (last_assistant, last_event)
 
 
-def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, int], str, dict[str, str]]:
+def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, int, dict[str, int], str, dict[str, str]]:
     """Forward-scan a main jsonl summing token usage and extracting tool_use
     positions.
 
     Returns (cum_in, cum_out, cum_cache_create, cum_cache_read,
-             tool_use_positions, last_uuid, task_notifications).
-    last_uuid is "" if no assistant event was found. task_notifications maps
+             context_tokens, tool_use_positions, last_uuid, task_notifications).
+    last_uuid is "" if no assistant event was found. context_tokens is the
+    input + cache_creation + cache_read of the LAST assistant event — i.e.
+    the context-window size at the most recent API call (the header's
+    "Context: NK (P%)" field). task_notifications maps
     `<task-id>` from `<task-notification>` queue-operation content to one of
     the in-vocabulary statuses `{"ok", "kill", "err"}`; unknown statuses
     are omitted. Last-wins on duplicate task-id (resume scenario).
     """
     cum_in = cum_out = cum_cache_create = cum_cache_read = 0
+    context_tokens = 0
     tool_use_positions: dict[str, int] = {}
     task_notifications: dict[str, str] = {}
     last_uuid = ""
@@ -381,10 +458,22 @@ def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, in
                 msg = event.get("message") or {}
                 usage = msg.get("usage") if isinstance(msg, dict) else None
                 if isinstance(usage, dict):
-                    cum_in += int(usage.get("input_tokens", 0) or 0)
+                    in_v = int(usage.get("input_tokens", 0) or 0)
+                    cum_in += in_v
                     cum_out += int(usage.get("output_tokens", 0) or 0)
                     cum_cache_create += int(usage.get("cache_creation_input_tokens", 0) or 0)
-                    cum_cache_read += int(usage.get("cache_read_input_tokens", 0) or 0)
+                    cache_read_v = int(usage.get("cache_read_input_tokens", 0) or 0)
+                    cum_cache_read += cache_read_v
+                    # Context-window occupancy at THIS api call — overwrite on
+                    # every assistant event so the scan ends holding the LAST
+                    # one. Same formula as the payload's
+                    # context_window.total_input_tokens (input + cache writes
+                    # + cache reads; output excluded), so both sources agree.
+                    context_tokens = (
+                        in_v
+                        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                        + cache_read_v
+                    )
                 # tool_use positions
                 content = msg.get("content") if isinstance(msg, dict) else None
                 if isinstance(content, list):
@@ -421,6 +510,7 @@ def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, in
         cum_out,
         cum_cache_create,
         cum_cache_read,
+        context_tokens,
         tool_use_positions,
         last_uuid,
         task_notifications,
@@ -464,6 +554,7 @@ _EMPTY_MAIN_RESULT: dict = {
     "cum_out": 0,
     "cum_cache_create": 0,
     "cum_cache_read": 0,
+    "context_tokens": 0,
     "last_uuid": "",
     "mtime_jsonl": 0.0,
     "tool_use_positions": {},
@@ -485,14 +576,25 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     to `cache_path`.
 
     Returns a dict with keys:
-        cum_in, cum_out, cum_cache_create, cum_cache_read, last_uuid,
-        mtime_jsonl, tool_use_positions, task_notifications
+        cum_in, cum_out, cum_cache_create, cum_cache_read, context_tokens,
+        last_uuid, mtime_jsonl, tool_use_positions, task_notifications
+
+    context_tokens is the context-window occupancy at the LAST assistant
+    event (input + cache_creation + cache_read) — the header's "Context:"
+    field, used as fallback when the stdin payload carries no
+    context_window.total_input_tokens.
 
     [deviation] Cache key includes `mtime_jsonl` so that queue-operation
     events appended to main jsonl without a corresponding new assistant event
     still invalidate the cache (last_uuid alone would miss them). Without
     mtime in the key, newly-fired task-notifications would be invisible
     to the orchestrator override for as long as the main session stays idle.
+
+    [deviation] Cache hit additionally requires `context_tokens` to be
+    present in the cached dict. Pre-upgrade caches that match both key parts
+    but lack the field would otherwise render "0K (0%)" for one cycle after
+    upgrade — same field-presence guard pattern as the agents cache's
+    breakdown fields.
 
     [deviation] The legacy `total` field was removed in Task 2 of the
     breakdown-table plan. The total is now derived by render from the three
@@ -518,17 +620,20 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
 
     # Forward-scan the jsonl — authoritative source for last_uuid,
     # token totals, and task_notifications in a single pass.
-    cum_in, cum_out, cum_cache_create, cum_cache_read, positions, last_uuid, task_notifications = (
+    cum_in, cum_out, cum_cache_create, cum_cache_read, context_tokens, positions, last_uuid, task_notifications = (
         _scan_main_jsonl(jsonl_path)
     )
     mtime_jsonl = _jsonl_mtime(jsonl_path)
 
     # Cache hit? Both last_uuid AND mtime_jsonl must match — otherwise stale.
+    # `context_tokens` presence is part of the hit check (see [deviation]
+    # in the docstring): pre-upgrade caches lack the field.
     if (
         cache is not None
         and last_uuid
         and cache.get("last_uuid") == last_uuid
         and cache.get("mtime_jsonl") == mtime_jsonl
+        and "context_tokens" in cache
     ):
         return cache
 
@@ -537,6 +642,7 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
         "cum_out": cum_out,
         "cum_cache_create": cum_cache_create,
         "cum_cache_read": cum_cache_read,
+        "context_tokens": context_tokens,
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime_jsonl,
         "tool_use_positions": positions,
@@ -830,6 +936,11 @@ _TOKEN_COLUMN_WIDTH = 7
 _STATUS_GAP = "  "
 # Gap between the description column and the token column (2 spaces).
 _DESC_TOKEN_GAP = "  "
+# Width of the status-icon column (e.g. "[stop]") — the longest known
+# status name ("stop"/"kill") is 4 chars, plus 2 brackets = 6. Pad
+# shorter icons ("ok", "err") with trailing spaces so the description
+# column starts at the same x-position regardless of status length.
+_ICON_COL_WIDTH = 6
 # Recognized agent statuses — single source of truth for render_output's
 # validation and the module docstring's promise. The orchestrator override
 # in _compute_agents may set "kill" when a main-log queue-operation
@@ -946,29 +1057,34 @@ def render_output(
 
     # 3. Assemble lines.
     lines: list[str] = [header]
-    # Table header — `w_desc` spaces on the left so the `in/out/cached`
-    # labels land at the same x-position as the cells in the rows below.
+    # Table header — `w_desc + _ICON_COL_WIDTH` spaces on the left so the
+    # `in/out/cached` labels land at the same x-position as the cells in
+    # the rows below. The agent rows use icon (padded to _ICON_COL_WIDTH)
+    # + status_gap (2) + desc (w_desc) + desc_gap (2), so the prefix
+    # before in_cell is consistently w_desc + _ICON_COL_WIDTH + 4.
+    # sum:/main: rows use the same prefix width below.
+    header_pad = w_desc + _ICON_COL_WIDTH + 4
     lines.append(
-        f"{' ' * w_desc}{'in':>{w_in}} {'out':>{w_out}} {'cached':>{w_cached}}"
+        f"{' ' * header_pad}{'in':>{w_in}} {'out':>{w_out}} {'cached':>{w_cached}}"
     )
 
     if agents:
         sum_in = main_in + sum(agent_in)
         sum_out = main_out + sum(agent_out)
         sum_cached = main_cached + sum(agent_cached)
-        # Pad the label column to match `[status]` (6 chars) + desc (w_desc)
-        # + desc_token_gap (2 chars) so the in_cell lands at the same
-        # x-position as in the agent rows below. `sum:` is 4 chars, so the
-        # left-pad width is w_desc + 9 - 4 = w_desc + 5.
+        # Pad the label column to `header_pad` so the in_cell lands at
+        # the same x-position as in the agent rows below. `sum:` is 4
+        # chars, so the left-pad width is `header_pad` directly.
         lines.append(
-            f"{'sum:':<{w_desc + 5}}{format_tokens(sum_in):>{w_in}} "
+            f"{'sum:':<{header_pad}}{format_tokens(sum_in):>{w_in}} "
             f"{format_tokens(sum_out):>{w_out}} "
             f"{format_tokens(sum_cached):>{w_cached}}"
         )
 
-    # `main:` is 5 chars, so the left-pad width is w_desc + 9 - 5 = w_desc + 4.
+    # `main:` is 5 chars, padded to the same `header_pad` width as `sum:`
+    # for the same alignment reason.
     lines.append(
-        f"{'main:':<{w_desc + 4}}{format_tokens(main_in):>{w_in}} "
+        f"{'main:':<{header_pad}}{format_tokens(main_in):>{w_in}} "
         f"{format_tokens(main_out):>{w_out}} "
         f"{format_tokens(main_cached):>{w_cached}}"
     )
@@ -978,8 +1094,12 @@ def render_output(
     ):
         status = agent.get("status", "run")
         icon = f"[{status}]" if status in _STATUSES else "[?]"
+        # Pad icon to _ICON_COL_WIDTH so the description column starts at
+        # the same x-position regardless of status name length ("ok" 4
+        # chars vs "stop"/"kill" 6 chars). Trailing spaces after short
+        # icons are absorbed into the status_gap.
         lines.append(
-            f"{icon}{_STATUS_GAP}{description:<{w_desc}}{_DESC_TOKEN_GAP}"
+            f"{icon:<{_ICON_COL_WIDTH}}{_STATUS_GAP}{description:<{w_desc}}{_DESC_TOKEN_GAP}"
             f"{format_tokens(in_v):>{w_in}} "
             f"{format_tokens(out_v):>{w_out}} "
             f"{format_tokens(cached_v):>{w_cached}}"
@@ -1039,15 +1159,33 @@ def main() -> int:
         return 0
 
 
-def _build_header(parsed: dict) -> str:
-    """Build the single header line from a parsed stdin dict."""
+def _build_header(parsed: dict, context: str) -> str:
+    """Build the single header line from a parsed stdin dict and a
+    pre-formatted Context segment ("NK (P%)")."""
     sid = parsed.get("session_id", "") or ""
     return (
         f"Session: {sid} | "
         f"Branch: {parsed['branch']} | "
         f"Model: {parsed['model']} | "
-        f"User: {parsed['user']}"
+        f"User: {parsed['user']} | "
+        f"Context: {context}"
     )
+
+
+def _context_segment(parsed: dict, main_cum: dict | None) -> str:
+    """Format the header's Context segment from the best available source.
+
+    Priority: payload context_window.total_input_tokens (parsed via
+    parse_stdin as `context_tokens`) when positive — it is the freshest,
+    provided by Claude Code itself, and works even when no local session
+    dir is found. Otherwise the jsonl-derived occupancy from main_cum
+    (context-window size at the last assistant event; 0 when main_cum is
+    None). The percentage divisor comes from resolve_context_limit.
+    """
+    tokens = parsed.get("context_tokens") or 0
+    if tokens <= 0 and main_cum is not None:
+        tokens = main_cum.get("context_tokens") or 0
+    return format_context(tokens, resolve_context_limit(parsed.get("model", "")))
 
 
 def _data_dir() -> Path | None:
@@ -1143,17 +1281,17 @@ def _main_unsafe() -> int:
     See main() docstring for the never-crash contract."""
     parsed = parse_stdin(sys.stdin.read())
     session_id = parsed.get("session_id", "") or ""
-    header = _build_header(parsed)
 
     if not session_id:
-        # empty session_id → header only, exit 0
-        print(header)
+        # empty session_id → header only, exit 0. Context segment still
+        # renders from the payload when CC provided one.
+        print(_build_header(parsed, _context_segment(parsed, None)))
         return 0
 
     session_dir = find_session_dir(session_id)
     if session_dir is None:
-        # no matching session dir on disk → header only
-        print(header)
+        # no matching session dir on disk → header only (payload context)
+        print(_build_header(parsed, _context_segment(parsed, None)))
         return 0
 
     data_dir = _data_dir()
@@ -1163,6 +1301,11 @@ def _main_unsafe() -> int:
     # main jsonl lives as a SIBLING of session_dir (see deviation note above)
     main_jsonl = session_dir.parent / f"{session_id}.jsonl"
     main_cum = compute_main_cum(main_jsonl, main_cache)
+
+    # Header needs main_cum for the jsonl-fallback context occupancy, so it
+    # is built here rather than up top (payload context takes priority —
+    # see _context_segment).
+    header = _build_header(parsed, _context_segment(parsed, main_cum))
 
     # task_notifications extracted from queue-operation events in main jsonl
     # (added per 20260824-subagent-status-via-queue-notifications). May be
