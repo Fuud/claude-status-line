@@ -45,19 +45,25 @@ def _write_main_cache(
     cum_cache_read: int,
     total: int | None = None,
     last_uuid: str = MAIN_NORMAL_LAST_UUID,
+    mtime_jsonl: float | None = None,
 ) -> dict:
     """Write a main-cache payload (the same shape compute_main_cum
     writes to disk) and return the dict.
 
     `total=None` omits the legacy `total` key; pass an int to include it.
+    `mtime_jsonl=None` reads the current MAIN_NORMAL mtime so the cache hit
+    succeeds (compute_main_cum's cache key is `(last_uuid, mtime_jsonl)`).
     Shared by the "no total key" and "legacy total field" tests so the
     cache-payload literal lives in one place."""
+    if mtime_jsonl is None:
+        mtime_jsonl = MAIN_NORMAL.stat().st_mtime
     payload: dict = {
         "cum_in": cum_in,
         "cum_out": cum_out,
         "cum_cache_create": cum_cache_create,
         "cum_cache_read": cum_cache_read,
         "last_uuid": last_uuid,
+        "mtime_jsonl": mtime_jsonl,
         "tool_use_positions": {},
     }
     if total is not None:

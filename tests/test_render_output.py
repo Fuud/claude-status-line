@@ -32,6 +32,7 @@ from status_line import (
     _STATUS_GAP,
     _TOKEN_COLUMN_WIDTH,
     _col_width,
+    format_tokens,
     render_output,
 )
 
