@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -337,8 +338,6 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
         "model": {"display_name": "MiniMax-M3"},
         "context_window": {"used_percentage": 0, "total_input_tokens": 0},
     })
-
-    # 1st call — populates cache.
     first = _run_main(stdin, tmp_path)
     assert first.returncode == 0, (
         f"first call failed; stderr={first.stderr.decode('utf-8', 'replace')}"
@@ -382,3 +381,258 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
         f"first:  {first_output[:200]!r}\n"
         f"second: {second_output[:200]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. Subagent status via main-log task-notifications (added per
+#    20260824-subagent-status-via-queue-notifications). These tests build a
+#    SYNTHETIC session in tmp_path and run main() against it — they do NOT
+#    depend on the gitignored real_session fixture.
+# ---------------------------------------------------------------------------
+
+SYNTH_SID = "11111111-2222-3333-4444-555555555555"
+
+
+def _build_synth_session(
+    tmp_path: Path,
+    sid: str,
+    main_jsonl_lines: list[str],
+    agent_files: list[tuple[str, str, str]],
+) -> None:
+    """Populate a synthetic session under tmp_path/.claude/projects/<encoded>/.
+
+    Args:
+        sid: session id used for the directory name and main jsonl filename.
+        main_jsonl_lines: list of JSON lines for the main jsonl.
+        agent_files: list of (agent_id, jsonl_content, meta_content) tuples;
+            each is written into session_dir/subagents/.
+    """
+    encoded = "synthetic-project"
+    session_dir = (tmp_path / ".claude" / "projects" / encoded / sid)
+    subagents = session_dir / "subagents"
+    subagents.mkdir(parents=True)
+    main_jsonl = session_dir.parent / f"{sid}.jsonl"
+    main_jsonl.write_text("\n".join(main_jsonl_lines) + "\n")
+    for agent_id, jsonl_content, meta_content in agent_files:
+        (subagents / f"{agent_id}.jsonl").write_text(jsonl_content)
+        (subagents / f"{agent_id}.meta.json").write_text(meta_content)
+
+
+def test_real_session_fixture_has_no_subagent_queue_notifications() -> None:
+    """Inspection guard: if the real_session fixture is present, assert that
+    its main jsonl has NO queue-operation events whose <task-id> matches any
+    agent-* filename stem. This is the precondition for existing assertions
+    (e.g. exact `[err]` count in test_status_tag_counts) to remain valid —
+    if the fixture ever grows subagent task-notifications, those tests
+    would silently start producing [kill] tags.
+
+    The test is a no-op (skip) when the fixture is absent — gitignored."""
+    real_session_root = FIXTURES / "real_session"
+    if not real_session_root.exists():
+        pytest.skip("real_session fixture not populated; see fixtures/real_session/README.md")
+
+    main_jsonl_path = real_session_root / f"{REAL_SESSION_SID}.jsonl"
+    if not main_jsonl_path.exists():
+        pytest.skip("real_session main jsonl missing")
+
+    # Collect all agent-* stems (minus "agent-" prefix)
+    subagents_dir = real_session_root / REAL_SESSION_SID / "subagents"
+    agent_stems: set[str] = set()
+    if subagents_dir.exists():
+        for p in subagents_dir.glob("agent-*.jsonl"):
+            agent_stems.add(p.stem.removeprefix("agent-"))
+
+    assert agent_stems, "no subagent fixtures found"
+
+    # Scan main jsonl for queue-operation events with <task-id> matching an
+    # agent stem. There should be zero — the existing fixture has only
+    # background-bash task-notifications.
+    matching_count = 0
+    for raw_line in main_jsonl_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "queue-operation":
+            continue
+        if event.get("operation") != "enqueue":
+            continue
+        content = event.get("content")
+        if not isinstance(content, str):
+            continue
+        # cheap substring check before regex
+        if "<task-id>" not in content:
+            continue
+        m = re.search(r"<task-id>([^<]+)</task-id>", content)
+        if m and m.group(1) in agent_stems:
+            matching_count += 1
+
+    assert matching_count == 0, (
+        f"real_session fixture has {matching_count} subagent queue-events — "
+        "would silently change [err]/[stop]/[kill] counts in "
+        "test_status_tag_counts. Regenerate fixture or update assertions."
+    )
+
+
+def test_synth_killed_in_tool_use_renders_as_kill(tmp_path: Path) -> None:
+    """End-to-end: agent jsonl ends with tool_use (no end_turn); main jsonl
+    has queue-operation <status>killed</status> with task-id matching the
+    agent stem. Output must contain [kill] tag for that agent."""
+    agent_id = "agent-aaa111"
+    task_id = agent_id.removeprefix("agent-")
+    main_lines = [
+        '{"type":"assistant","message":{"role":"assistant","content":[],"model":"x","stop_reason":"end_turn","usage":{}},"uuid":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","sessionId":"x","timestamp":"2026-08-24T20:00:00.000Z"}',
+        f'{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-24T20:00:01.000Z","sessionId":"x","content":"<task-notification>\\n<task-id>{task_id}</task-id>\\n<status>killed</status>\\n</task-notification>"}}',
+    ]
+    agent_jsonl = (
+        '{"type":"user","message":{"role":"user","content":"x"},"uuid":"u1","sessionId":"x","timestamp":"2026-08-24T20:00:00.000Z"}\n'
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}],"model":"x","stop_reason":"tool_use","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}},"uuid":"a1","sessionId":"x","timestamp":"2026-08-24T20:00:00.500Z"}'
+    )
+    agent_meta = json.dumps({
+        "agentType": "general-purpose",
+        "description": "Task 1: synth",
+        "toolUseId": "t1",
+        "spawnDepth": 1,
+    })
+    _build_synth_session(
+        tmp_path, SYNTH_SID, main_lines, [(agent_id, agent_jsonl, agent_meta)]
+    )
+
+    stdin = json.dumps({"session_id": SYNTH_SID, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    output = result.stdout.decode("utf-8")
+    # The agent line must carry [kill], NOT [run].
+    assert "[kill]" in output, f"expected [kill] in output, got:\n{output!r}"
+    assert "[run]" not in output, f"agent should NOT show [run]; got:\n{output!r}"
+    assert "Task 1: synth" in output
+
+
+def test_synth_completed_after_tool_use_renders_as_ok(tmp_path: Path) -> None:
+    """End-to-end: agent jsonl ends with end_turn; queue says completed.
+    Output renders [ok]."""
+    agent_id = "agent-bbb222"
+    task_id = agent_id.removeprefix("agent-")
+    main_lines = [
+        '{"type":"assistant","message":{"role":"assistant","content":[],"model":"x","stop_reason":"end_turn","usage":{}},"uuid":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","sessionId":"x","timestamp":"2026-08-24T20:01:00.000Z"}',
+        f'{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-24T20:01:01.000Z","sessionId":"x","content":"<task-notification>\\n<task-id>{task_id}</task-id>\\n<status>completed</status>\\n</task-notification>"}}',
+    ]
+    agent_jsonl = (
+        '{"type":"user","message":{"role":"user","content":"x"},"uuid":"u1","sessionId":"x","timestamp":"2026-08-24T20:01:00.000Z"}\n'
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"model":"x","stop_reason":"end_turn","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}},"uuid":"a1","sessionId":"x","timestamp":"2026-08-24T20:01:00.500Z"}'
+    )
+    agent_meta = json.dumps({
+        "agentType": "general-purpose",
+        "description": "Task 2: review",
+        "toolUseId": "t2",
+        "spawnDepth": 1,
+    })
+    _build_synth_session(
+        tmp_path, SYNTH_SID, main_lines, [(agent_id, agent_jsonl, agent_meta)]
+    )
+
+    stdin = json.dumps({"session_id": SYNTH_SID, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    output = result.stdout.decode("utf-8")
+    assert "[ok]" in output, f"expected [ok] in output, got:\n{output!r}"
+    assert "Task 2: review" in output
+
+
+def test_synth_no_queue_event_behaves_as_before(tmp_path: Path) -> None:
+    """Regression: agent without queue-event (or no matching <task-id>) →
+    falls through to jsonl-based detection. agent jsonl ends with tool_use
+    (mid-flight) → [run]."""
+    agent_id = "agent-ccc333"
+    # main_jsonl has NO queue-operation events at all
+    main_lines = [
+        '{"type":"assistant","message":{"role":"assistant","content":[],"model":"x","stop_reason":"end_turn","usage":{}},"uuid":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","sessionId":"x","timestamp":"2026-08-24T20:02:00.000Z"}',
+    ]
+    agent_jsonl = (
+        '{"type":"user","message":{"role":"user","content":"x"},"uuid":"u1","sessionId":"x","timestamp":"2026-08-24T20:02:00.000Z"}\n'
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{}}],"model":"x","stop_reason":"tool_use","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}},"uuid":"a1","sessionId":"x","timestamp":"2026-08-24T20:02:00.500Z"}'
+    )
+    agent_meta = json.dumps({
+        "agentType": "general-purpose",
+        "description": "Task 3: in-flight",
+        "toolUseId": "t3",
+        "spawnDepth": 1,
+    })
+    _build_synth_session(
+        tmp_path, SYNTH_SID, main_lines, [(agent_id, agent_jsonl, agent_meta)]
+    )
+
+    stdin = json.dumps({"session_id": SYNTH_SID, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    output = result.stdout.decode("utf-8")
+    # No queue-event → falls back to jsonl → tool_use as last event → run.
+    assert "[run]" in output, f"expected [run] in output, got:\n{output!r}"
+    assert "[kill]" not in output
+
+
+def test_synth_queue_event_after_assistant_rerun_uses_cached_data(
+    tmp_path: Path,
+) -> None:
+    """End-to-end cache behavior: first call populates main_<sid>.json with
+    an empty task_notifications (queue event hasn't fired yet). Then we
+    APPEND a queue event to main jsonl (which bumps mtime but NOT last_uuid
+    — we keep the assistant event the same). The second call must:
+      - see the new mtime, invalidate the cache
+      - pick up the new queue-event → override agent status to [kill]
+    """
+    agent_id = "agent-ddd444"
+    task_id = agent_id.removeprefix("agent-")
+    main_lines_v1 = [
+        '{"type":"assistant","message":{"role":"assistant","content":[],"model":"x","stop_reason":"end_turn","usage":{}},"uuid":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","sessionId":"x","timestamp":"2026-08-24T20:03:00.000Z"}',
+    ]
+    agent_jsonl = (
+        '{"type":"user","message":{"role":"user","content":"x"},"uuid":"u1","sessionId":"x","timestamp":"2026-08-24T20:03:00.000Z"}\n'
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t4","name":"Bash","input":{}}],"model":"x","stop_reason":"tool_use","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}},"uuid":"a1","sessionId":"x","timestamp":"2026-08-24T20:03:00.500Z"}'
+    )
+    agent_meta = json.dumps({
+        "agentType": "general-purpose",
+        "description": "Task 4: mid-flight",
+        "toolUseId": "t4",
+        "spawnDepth": 1,
+    })
+    _build_synth_session(
+        tmp_path, SYNTH_SID, main_lines_v1, [(agent_id, agent_jsonl, agent_meta)]
+    )
+
+    stdin = json.dumps({"session_id": SYNTH_SID, "model": {"display_name": "X"}})
+
+    # 1st call — no queue-event yet → [run].
+    r1 = _run_main(stdin, tmp_path)
+    assert r1.returncode == 0, r1.stderr.decode("utf-8", "replace")
+    out1 = r1.stdout.decode("utf-8")
+    assert "[run]" in out1, f"1st call expected [run]; got:\n{out1!r}"
+
+    # Append a queue-event with the new (post-completion) status.
+    main_jsonl = (
+        tmp_path / ".claude" / "projects" / "synthetic-project" / f"{SYNTH_SID}.jsonl"
+    )
+    queue_line = json.dumps({
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "timestamp": "2026-08-24T20:03:01.000Z",
+        "sessionId": "x",
+        "content": (
+            "<task-notification>\n"
+            f"<task-id>{task_id}</task-id>\n"
+            "<status>killed</status>\n"
+            "</task-notification>"
+        ),
+    })
+    with main_jsonl.open("a") as f:
+        f.write(queue_line + "\n")
+
+    # 2nd call — must detect the queue-event via mtime bump, override to [kill].
+    r2 = _run_main(stdin, tmp_path)
+    assert r2.returncode == 0, r2.stderr.decode("utf-8", "replace")
+    out2 = r2.stdout.decode("utf-8")
+    assert "[kill]" in out2, f"2nd call expected [kill]; got:\n{out2!r}"
+    assert "[run]" not in out2, f"2nd call should NOT have [run]; got:\n{out2!r}"

@@ -222,3 +222,69 @@ def test_sum_calculation() -> None:
 
     # 50 + 100 + 200 = 350 → "350"
     assert sum_line == "sum: 350"
+
+
+# ---------------------------------------------------------------------------
+# [kill] status rendering (added per 20260824-subagent-status-via-queue-notifications)
+# ---------------------------------------------------------------------------
+
+def test_kill_status_renders_as_kill_tag() -> None:
+    """Agent with status='kill' → line starts with '[kill]' tag, identical
+    shape to [ok]/[err]/[stop]/[run] lines."""
+    header = "Session: x"
+    agents = [
+        {"status": "kill", "tokens": 100, "description": "agent killed mid-flight"},
+    ]
+
+    out = render_output(header, 0, agents)
+    lines = out.split("\n")
+    agent_line = lines[3]
+
+    assert agent_line.startswith("[kill]")
+    assert "agent killed mid-flight" in agent_line
+    assert "100" in agent_line
+
+
+def test_kill_status_with_no_tokens_omits_token_column() -> None:
+    """Agent with status='kill' and tokens=None → no token column, just the
+    status tag and description. Consistent with [err] (also has tokens=None
+    path)."""
+    header = "Session: x"
+    agents = [
+        {"status": "kill", "tokens": None, "description": "killed before tokens"},
+    ]
+
+    out = render_output(header, 0, agents)
+    lines = out.split("\n")
+    agent_line = lines[3]
+
+    assert agent_line.startswith("[kill]")
+    idx = agent_line.find("killed before tokens")
+    after = agent_line[idx + len("killed before tokens"):]
+    assert after.strip() == "", (
+        f"unexpected content after description: {after!r}"
+    )
+
+
+def test_unknown_status_renders_as_question_mark() -> None:
+    """Defensive: an unknown status value (not in _STATUSES tuple) surfaces
+    as '[?]' rather than failing. Pre-existing behavior, regression check."""
+    from status_line import _STATUSES
+
+    assert "kill" in _STATUSES, (
+        f"kill must be in _STATUSES; got {_STATUSES}"
+    )
+    assert set(_STATUSES) == {"ok", "run", "err", "stop", "kill"}, (
+        f"_STATUSES unexpected: {_STATUSES}"
+    )
+
+    header = "Session: x"
+    agents = [
+        {"status": "weird-state", "tokens": 100, "description": "x"},
+    ]
+
+    out = render_output(header, 0, agents)
+    lines = out.split("\n")
+    agent_line = lines[3]
+
+    assert agent_line.startswith("[?]")

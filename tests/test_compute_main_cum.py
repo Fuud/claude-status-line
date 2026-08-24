@@ -25,6 +25,9 @@ from status_line import compute_main_cum
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 MAIN_NORMAL = FIXTURES_DIR / "main_normal.jsonl"
 MAIN_TOOL_USE = FIXTURES_DIR / "main_with_tool_use.jsonl"
+MAIN_QUEUE_OPS = FIXTURES_DIR / "main_with_queue_ops.jsonl"
+MAIN_DUP_TASK = FIXTURES_DIR / "main_with_duplicate_task_id.jsonl"
+MAIN_MISSING_TAGS = FIXTURES_DIR / "main_with_missing_tags.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +144,10 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
     Verification: write a sentinel value for `total` (999_999_999) that the
     real jsonl could never produce. If the result equals the sentinel, the
     cache was used.
+
+    Cache key is now (last_uuid, mtime_jsonl) — the cached entry must include
+    both for a hit. mtime_jsonl is read from the jsonl on disk; we use its
+    current value here so the cache hit succeeds.
     """
     cache = tmp_path / "main_hit.json"
     sentinel_total = 999_999_999
@@ -152,6 +159,7 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
         "cum_cache_read": 4,
         "total": sentinel_total,
         "last_uuid": "66666666-6666-6666-6666-666666666666",  # matches main_with_tool_use tail
+        "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
         "tool_use_positions": sentinel_positions,
     }
     cache.write_text(json.dumps(cached))
@@ -262,6 +270,201 @@ def test_missing_jsonl_returns_zeros(tmp_path: Path) -> None:
     assert result["cum_cache_read"] == 0
     assert result["tool_use_positions"] == {}
     assert result["last_uuid"] == ""
+    # task_notifications should be present (empty dict) and mtime_jsonl == 0.0
+    # when the jsonl doesn't exist.
+    assert result["task_notifications"] == {}
+    assert result["mtime_jsonl"] == 0.0
     # No jsonl → no cache file written (per spec: "Skip the write if jsonl_path
     # doesn't exist").
     assert not cache.exists()
+
+
+# ---------------------------------------------------------------------------
+# task_notifications extraction (queue-operation events)
+# ---------------------------------------------------------------------------
+
+def test_task_notifications_mapping(tmp_path: Path) -> None:
+    """main_with_queue_ops.jsonl has 4 enqueue events with known statuses
+    (completed/killed/failed/running) and one dequeue. The extractor should
+    keep only the three with known statuses, mapping completed→"ok",
+    killed→"kill", failed→"err". The unknown "running" is excluded; dequeue
+    has no content and contributes nothing."""
+    cache = tmp_path / "main_q.json"
+    result = compute_main_cum(MAIN_QUEUE_OPS, cache)
+
+    tn = result["task_notifications"]
+    assert isinstance(tn, dict)
+    assert tn == {
+        "agent-aaa111": "ok",
+        "agent-bbb222": "kill",
+        "agent-ccc333": "err",
+    }
+
+
+def test_task_notifications_last_wins(tmp_path: Path) -> None:
+    """main_with_duplicate_task_id.jsonl has TWO notifications for the same
+    task-id (agent-eee555): first completed, then killed. Last-wins: the
+    final dict must show "kill" for that key."""
+    cache = tmp_path / "main_dup.json"
+    result = compute_main_cum(MAIN_DUP_TASK, cache)
+
+    tn = result["task_notifications"]
+    assert tn == {"agent-eee555": "kill"}
+
+
+def test_task_notifications_unknown_status_skipped(tmp_path: Path) -> None:
+    """main_with_queue_ops.jsonl has one enqueue with status="running" —
+    an unknown value not in the map. It must NOT be added to the dict."""
+    cache = tmp_path / "main_q2.json"
+    result = compute_main_cum(MAIN_QUEUE_OPS, cache)
+
+    tn = result["task_notifications"]
+    assert "agent-ddd444" not in tn
+
+
+def test_task_notifications_missing_tags_skipped(tmp_path: Path) -> None:
+    """main_with_missing_tags.jsonl has three enqueue events: one with
+    task-id but no status, one with status but no task-id, one with no
+    task-notification tags at all. None of them should produce a dict entry."""
+    cache = tmp_path / "main_mt.json"
+    result = compute_main_cum(MAIN_MISSING_TAGS, cache)
+
+    tn = result["task_notifications"]
+    assert tn == {}
+
+
+def test_task_notifications_dequeue_no_content(tmp_path: Path) -> None:
+    """The dequeue/remove operations in main_with_queue_ops.jsonl have no
+    `content` field — they must be skipped silently."""
+    cache = tmp_path / "main_q3.json"
+    result = compute_main_cum(MAIN_QUEUE_OPS, cache)
+
+    # Only the 3 enqueue-with-known-status should be in the dict; dequeue
+    # and remove contribute nothing.
+    assert len(result["task_notifications"]) == 3
+
+
+def test_task_notifications_empty_when_no_jsonl(tmp_path: Path) -> None:
+    """Empty main jsonl → task_notifications is empty dict, NOT a KeyError."""
+    jsonl = tmp_path / "empty.jsonl"
+    jsonl.write_text("")
+    cache = tmp_path / "main_empty.json"
+
+    result = compute_main_cum(jsonl, cache)
+
+    assert result["task_notifications"] == {}
+    assert isinstance(result["task_notifications"], dict)
+
+
+# ---------------------------------------------------------------------------
+# mtime_jsonl in cache key
+# ---------------------------------------------------------------------------
+
+def test_cache_hit_preserves_task_notifications(tmp_path: Path) -> None:
+    """Pre-write a cache whose task_notifications field has a sentinel value
+    ({"sentinel-agent": "ok"}). After compute_main_cum is called on a jsonl
+    that does NOT contain such a task-id, the cache hit should preserve the
+    sentinel — proving the cache-hit branch returns task_notifications
+    correctly."""
+    cache = tmp_path / "main_hit_tn.json"
+    cached = {
+        "cum_in": 1,
+        "cum_out": 2,
+        "cum_cache_create": 3,
+        "cum_cache_read": 4,
+        "total": 999_999_999,
+        "last_uuid": "66666666-6666-6666-6666-666666666666",  # matches MAIN_TOOL_USE tail
+        "tool_use_positions": {},
+        "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
+        "task_notifications": {"sentinel-agent": "ok"},
+    }
+    cache.write_text(json.dumps(cached))
+
+    result = compute_main_cum(MAIN_TOOL_USE, cache)
+
+    # Cache hit: sentinel values survive.
+    assert result["total"] == 999_999_999
+    assert result["task_notifications"] == {"sentinel-agent": "ok"}
+    assert result["mtime_jsonl"] == MAIN_TOOL_USE.stat().st_mtime
+
+
+def test_cache_invalidates_on_mtime_change(tmp_path: Path) -> None:
+    """Pre-write cache with stale mtime_jsonl (an obviously OLD value).
+    When the jsonl's current mtime is newer, the cache must be treated as
+    stale → recompute → fresh task_notifications picked up.
+
+    This is the bug the mtime-in-key change is designed to prevent:
+    queue-events appended without new assistant-events would leave
+    last_uuid unchanged but bump mtime_jsonl; without the mtime in the
+    key, the cache would keep returning a stale task_notifications dict.
+    """
+    # Copy fixture into tmp_path so we control its mtime
+    src = MAIN_QUEUE_OPS
+    jsonl = tmp_path / "main_for_mtime.jsonl"
+    jsonl.write_text(src.read_text())
+
+    # Pre-write cache with an obviously STALE mtime (1.0 — Jan 1970).
+    cache = tmp_path / "main_mtime.json"
+    stale_cached = {
+        "cum_in": 0,
+        "cum_out": 0,
+        "cum_cache_create": 0,
+        "cum_cache_read": 0,
+        "total": 0,
+        "last_uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",  # matches fixture tail
+        "tool_use_positions": {},
+        "mtime_jsonl": 1.0,  # intentionally stale
+        "task_notifications": {"stale-agent": "ok"},  # stale sentinel
+    }
+    cache.write_text(json.dumps(stale_cached))
+
+    result = compute_main_cum(jsonl, cache)
+
+    # Cache must have been invalidated by the mtime mismatch.
+    # Fresh task_notifications (3 entries from fixture) should be present,
+    # NOT the stale sentinel.
+    assert "stale-agent" not in result["task_notifications"]
+    assert "agent-aaa111" in result["task_notifications"]
+    assert result["task_notifications"]["agent-aaa111"] == "ok"
+
+
+def test_cache_hit_preserves_mtime_jsonl_field(tmp_path: Path) -> None:
+    """On a cache hit, the returned dict must include mtime_jsonl matching
+    the on-disk file. Downstream consumers (and the cache-hit code itself)
+    rely on this being populated."""
+    cache = tmp_path / "main_mt2.json"
+    cached = {
+        "cum_in": 0,
+        "cum_out": 0,
+        "cum_cache_create": 0,
+        "cum_cache_read": 0,
+        "total": 0,
+        "last_uuid": "66666666-6666-6666-6666-666666666666",
+        "tool_use_positions": {},
+        "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
+        "task_notifications": {},
+    }
+    cache.write_text(json.dumps(cached))
+
+    result = compute_main_cum(MAIN_TOOL_USE, cache)
+
+    assert "mtime_jsonl" in result
+    assert result["mtime_jsonl"] == MAIN_TOOL_USE.stat().st_mtime
+
+
+def test_atomic_write_contains_new_fields(tmp_path: Path) -> None:
+    """After a fresh compute, the cached file must include both new fields
+    (mtime_jsonl, task_notifications) so that a subsequent cache hit can
+    verify the key."""
+    cache = tmp_path / "main_full.json"
+    compute_main_cum(MAIN_QUEUE_OPS, cache)
+
+    on_disk = json.loads(cache.read_text())
+    assert "mtime_jsonl" in on_disk
+    assert "task_notifications" in on_disk
+    assert on_disk["task_notifications"] == {
+        "agent-aaa111": "ok",
+        "agent-bbb222": "kill",
+        "agent-ccc333": "err",
+    }
+    assert on_disk["mtime_jsonl"] == MAIN_QUEUE_OPS.stat().st_mtime

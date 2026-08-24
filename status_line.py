@@ -6,12 +6,17 @@ Module-level invariants:
 - parse_stdin never raises; it returns a dict with all keys present.
 - compute_main_cum / compute_agent_snapshot never raise; OSError is
   swallowed so the hook cannot crash the parent session.
+- The orchestrator override in _compute_agents may additionally set
+  agent.status="kill" when a main-log queue-operation task-notification with
+  <status>killed</status> is present and the compute_agent_snapshot verdict
+  is not "err" or "stop" (see plan 20260824-subagent-status-via-queue-notifications).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -251,6 +256,19 @@ def parse_stdin(json_str: str) -> dict:
 # compute_main_cum
 # ---------------------------------------------------------------------------
 
+# [deviation] Extracted from queue-operation events in the main jsonl (added
+# per plan 20260824-subagent-status-via-queue-notifications.md). Maps the
+# `<status>` value inside `<task-notification>` content to the in-vocabulary
+# status used by render_output. Unknown statuses are dropped — they fall
+# through to the jsonl-based detection in compute_agent_snapshot.
+_TASK_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
+_STATUS_RE = re.compile(r"<status>([^<]+)</status>")
+_QUEUE_STATUS_MAP: dict[str, str] = {
+    "completed": "ok",
+    "killed": "kill",
+    "failed": "err",
+}
+
 # [decision] compute_main_cum performs a SINGLE forward scan of the jsonl
 # per cache miss. Previously we tail-scanned first (to short-circuit on
 # cache hits cheaply) and then scanned forward for totals — that was a
@@ -339,16 +357,20 @@ def _sum_usage(usage: dict) -> int:
     )
 
 
-def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, int], str]:
+def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, int], str, dict[str, str]]:
     """Forward-scan a main jsonl summing token usage and extracting tool_use
     positions.
 
     Returns (cum_in, cum_out, cum_cache_create, cum_cache_read,
-             tool_use_positions, last_uuid). last_uuid is "" if no assistant
-    event was found.
+             tool_use_positions, last_uuid, task_notifications).
+    last_uuid is "" if no assistant event was found. task_notifications maps
+    `<task-id>` from `<task-notification>` queue-operation content to one of
+    the in-vocabulary statuses `{"ok", "kill", "err"}`; unknown statuses
+    are omitted. Last-wins on duplicate task-id (resume scenario).
     """
     cum_in = cum_out = cum_cache_create = cum_cache_read = 0
     tool_use_positions: dict[str, int] = {}
+    task_notifications: dict[str, str] = {}
     last_uuid = ""
 
     with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
@@ -363,33 +385,49 @@ def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, in
                 continue
             if not isinstance(event, dict):
                 continue
-            if event.get("type") != "assistant":
-                continue
-            # record uuid for this assistant event
-            uuid = event.get("uuid")
-            if isinstance(uuid, str) and uuid:
-                last_uuid = uuid
-            # usage
-            msg = event.get("message") or {}
-            usage = msg.get("usage") if isinstance(msg, dict) else None
-            if isinstance(usage, dict):
-                cum_in += int(usage.get("input_tokens", 0) or 0)
-                cum_out += int(usage.get("output_tokens", 0) or 0)
-                cum_cache_create += int(usage.get("cache_creation_input_tokens", 0) or 0)
-                cum_cache_read += int(usage.get("cache_read_input_tokens", 0) or 0)
-            # tool_use positions
-            content = msg.get("content") if isinstance(msg, dict) else None
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") != "tool_use":
-                        continue
-                    block_id = block.get("id")
-                    if isinstance(block_id, str) and block_id:
-                        # keep first occurrence only
-                        if block_id not in tool_use_positions:
-                            tool_use_positions[block_id] = index
+            if event.get("type") == "assistant":
+                # record uuid for this assistant event
+                uuid = event.get("uuid")
+                if isinstance(uuid, str) and uuid:
+                    last_uuid = uuid
+                # usage
+                msg = event.get("message") or {}
+                usage = msg.get("usage") if isinstance(msg, dict) else None
+                if isinstance(usage, dict):
+                    cum_in += int(usage.get("input_tokens", 0) or 0)
+                    cum_out += int(usage.get("output_tokens", 0) or 0)
+                    cum_cache_create += int(usage.get("cache_creation_input_tokens", 0) or 0)
+                    cum_cache_read += int(usage.get("cache_read_input_tokens", 0) or 0)
+                # tool_use positions
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") != "tool_use":
+                            continue
+                        block_id = block.get("id")
+                        if isinstance(block_id, str) and block_id:
+                            # keep first occurrence only
+                            if block_id not in tool_use_positions:
+                                tool_use_positions[block_id] = index
+            elif event.get("type") == "queue-operation":
+                # Extract <task-id> / <status> from <task-notification> content.
+                # Only "enqueue" operations carry content; "dequeue"/"remove"
+                # are no-ops here. Unknown <status> values are silently dropped.
+                if event.get("operation") != "enqueue":
+                    continue
+                content = event.get("content")
+                if not isinstance(content, str):
+                    continue
+                m_id = _TASK_ID_RE.search(content)
+                m_status = _STATUS_RE.search(content)
+                if not (m_id and m_status):
+                    continue
+                mapped = _QUEUE_STATUS_MAP.get(m_status.group(1))
+                if mapped:
+                    # last-wins on duplicate task-id (resume scenario)
+                    task_notifications[m_id.group(1)] = mapped
 
     return (
         cum_in,
@@ -398,6 +436,7 @@ def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, in
         cum_cache_read,
         tool_use_positions,
         last_uuid,
+        task_notifications,
     )
 
 
@@ -440,7 +479,9 @@ _EMPTY_MAIN_RESULT: dict = {
     "cum_cache_read": 0,
     "total": 0,
     "last_uuid": "",
+    "mtime_jsonl": 0.0,
     "tool_use_positions": {},
+    "task_notifications": {},
 }
 
 
@@ -448,16 +489,24 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     """Compute cumulative tokens from a main session jsonl, with cache by
     last_uuid.
 
-    On cache hit (cache.last_uuid == current jsonl tail uuid), returns the
-    cached dict without re-scanning. On cache miss (uuid changed, cache
+    On cache hit (cache.last_uuid == current jsonl tail uuid AND
+    cache.mtime_jsonl == current jsonl st_mtime), returns the cached dict
+    without re-scanning. On cache miss (uuid changed, mtime changed, cache
     missing, or cache malformed), re-scans the jsonl forward, sums
     input/output/cache_creation/cache_read across all assistant events,
-    collects tool_use id → event-index positions, and atomically writes the
-    result to `cache_path`.
+    collects tool_use id → event-index positions, extracts task-notification
+    statuses from queue-operation events, and atomically writes the result
+    to `cache_path`.
 
     Returns a dict with keys:
         cum_in, cum_out, cum_cache_create, cum_cache_read, total, last_uuid,
-        tool_use_positions
+        mtime_jsonl, tool_use_positions, task_notifications
+
+    [deviation] Cache key includes `mtime_jsonl` so that queue-operation
+    events appended to main jsonl without a corresponding new assistant event
+    still invalidate the cache (last_uuid alone would miss them). Without
+    mtime in the key, newly-fired task-notifications would be invisible
+    to the orchestrator override for as long as the main session stays idle.
 
     If `jsonl_path` does not exist, returns a zero-valued result without
     writing the cache.
@@ -474,17 +523,19 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     # result is always either a valid dict or {} (never a malformed file).
     cache = _load_dict_cache(cache_path)
 
-    # Forward-scan the jsonl — authoritative source for last_uuid and
-    # totals in a single pass.
-    cum_in, cum_out, cum_cache_create, cum_cache_read, positions, last_uuid = (
+    # Forward-scan the jsonl — authoritative source for last_uuid,
+    # token totals, and task_notifications in a single pass.
+    cum_in, cum_out, cum_cache_create, cum_cache_read, positions, last_uuid, task_notifications = (
         _scan_main_jsonl(jsonl_path)
     )
+    mtime_jsonl = _jsonl_mtime(jsonl_path)
 
-    # Cache hit?
+    # Cache hit? Both last_uuid AND mtime_jsonl must match — otherwise stale.
     if (
         cache is not None
         and last_uuid
         and cache.get("last_uuid") == last_uuid
+        and cache.get("mtime_jsonl") == mtime_jsonl
     ):
         return cache
 
@@ -495,7 +546,9 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
         "cum_cache_read": cum_cache_read,
         "total": cum_in + cum_out + cum_cache_create + cum_cache_read,
         "last_uuid": last_uuid,
+        "mtime_jsonl": mtime_jsonl,
         "tool_use_positions": positions,
+        "task_notifications": task_notifications,
     }
 
     # Atomic write to cache. If write fails (disk full, read-only dir),
@@ -758,8 +811,13 @@ _STATUS_GAP = "  "
 # Gap between the description column and the token column (2 spaces).
 _DESC_TOKEN_GAP = "  "
 # Recognized agent statuses — single source of truth for render_output's
-# validation and the module docstring's promise.
-_STATUSES = ("ok", "run", "err", "stop")
+# validation and the module docstring's promise. The orchestrator override
+# in _compute_agents may set "kill" when a main-log queue-operation
+# task-notification with <status>killed</status> is present and the
+# compute_agent_snapshot verdict is not "err" or "stop" (see plan
+# 20260824-subagent-status-via-queue-notifications). detect_status itself
+# still returns only {ok, err, stop, run}.
+_STATUSES = ("ok", "run", "err", "stop", "kill")
 
 
 def render_output(header: str, main_total: int, agents: list) -> str:
@@ -895,9 +953,36 @@ def _cache_path(data_dir: Path | None, name: str, session_id: str) -> Path:
     return data_dir / f"{name}_{session_id}.json"
 
 
-def _compute_agents(session_dir: Path, agents_cache_path: Path) -> list:
+def _compute_agents(
+    session_dir: Path,
+    agents_cache_path: Path,
+    task_notifications: dict[str, str] | None = None,
+) -> list:
     """Build per-agent snapshots for every agent-*.jsonl under session_dir,
-    using agents_cache_path as the source of stale cache entries."""
+    using agents_cache_path as the source of stale cache entries.
+
+    After building all snapshots, apply the orchestrator-level queue override:
+    for each agent whose `agentId` (with the `agent-` prefix stripped)
+    appears in `task_notifications` (extracted from the main jsonl's
+    queue-operation events), set `status` to the notification value — BUT
+    only when the current status is not already `err` or `stop` (those win
+    by priority; see module docstring + CLAUDE.md "Status priority and overrides").
+
+    [deviation] The override lives here rather than inside
+    compute_agent_snapshot because the queue signal originates in the main
+    jsonl (different file), not the agent's jsonl + meta. Keeping
+    compute_agent_snapshot a pure function of one agent's own data preserves
+    its narrow contract and makes it easy to cache.
+
+    Args:
+        session_dir: session directory; `<sid>/subagents/agent-*.jsonl` files
+            live under it.
+        agents_cache_path: cache file holding previous per-agent snapshots,
+            used to short-circuit re-parse when file mtimes haven't changed.
+        task_notifications: dict mapping `<task-id>` → one of {"ok","kill","err"}
+            (extracted from `<task-notification>` queue-operation events in the
+            main jsonl by compute_main_cum). May be empty or None.
+    """
     agents: list = []
     agents_cache = _load_dict_cache(agents_cache_path)
     subagents_dir = session_dir / "subagents"
@@ -909,6 +994,17 @@ def _compute_agents(session_dir: Path, agents_cache_path: Path) -> list:
         cache_entry = agents_cache.get(agent_id)
         snapshot = compute_agent_snapshot(jsonl_path, meta_path, cache_entry)
         agents.append(snapshot)
+
+    # Orchestrator-level queue override (with err/stop guard). See [deviation]
+    # note above for why this lives here, not in compute_agent_snapshot.
+    if task_notifications:
+        for agent in agents:
+            aid = agent["agentId"]
+            # Strip "agent-" prefix to get the join key (matches <task-id>).
+            key = aid[len("agent-"):] if aid.startswith("agent-") else aid
+            if key in task_notifications and agent["status"] not in ("err", "stop"):
+                agent["status"] = task_notifications[key]
+
     return agents
 
 
@@ -953,7 +1049,13 @@ def _main_unsafe() -> int:
     main_jsonl = session_dir.parent / f"{session_id}.jsonl"
     main_cum = compute_main_cum(main_jsonl, main_cache)
 
-    agents = _compute_agents(session_dir, agents_cache)
+    # task_notifications extracted from queue-operation events in main jsonl
+    # (added per 20260824-subagent-status-via-queue-notifications). May be
+    # empty dict; the orchestrator override in _compute_agents is a no-op
+    # in that case.
+    task_notifications = main_cum.get("task_notifications", {})
+
+    agents = _compute_agents(session_dir, agents_cache, task_notifications)
     _write_agents_cache(agents_cache, agents)
 
     # sort_agents calls .get(...) on the second argument, so it MUST be a

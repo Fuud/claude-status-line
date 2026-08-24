@@ -22,17 +22,29 @@ exercised through fixtures under `tests/fixtures/`. The orchestrator
 has both unit coverage (via subprocess in `test_main_integration.py`)
 and an end-to-end run on a real session.
 
+`render_output` recognizes the status tags `("ok", "run", "err", "stop",
+"kill")` via the `_STATUSES` tuple. `kill` is **not** produced by
+`detect_status` (which returns only the first four) — it originates in
+the orchestrator override in `_compute_agents` when a main-log
+`<task-notification>` carries `<status>killed</status>` for the agent.
+
 ## Cache invalidation strategy
 
 ### `data/main_<sid>.json`
 
-- **Key:** `last_uuid` of the most recent assistant event in the main
-  jsonl.
-- **Read:** compute_main_cum does a single forward scan to extract
-  `last_uuid`; if it matches the cached value, return the cached
-  payload (skipping the cache write).
+- **Key:** tuple `(last_uuid, mtime_jsonl)`. `last_uuid` catches new
+  assistant events; `mtime_jsonl` catches new queue-operation events
+  (e.g. `<task-notification>` for subagent completion) appended without
+  a new assistant event.
+- **Read:** `compute_main_cum` does a single forward scan to extract
+  `last_uuid` AND stat the file for `mtime_jsonl`; if both match the
+  cached values, return the cached payload (skipping the cache write).
 - **Write:** on cache miss, recompute totals and atomically write
-  via `.tmp` + `os.replace`.
+  via `.tmp` + `os.replace`. The cached payload also includes a
+  `task_notifications: dict[<task-id>, {ok,kill,err}]` field extracted
+  from `<task-notification>` queue-operation events during the same
+  forward scan — consumed by the orchestrator override in
+  `_compute_agents`.
 
 [deviation] The previous implementation tail-scanned the jsonl first
 (to detect cache hits cheaply) and then forward-scanned on miss. That
@@ -41,6 +53,12 @@ hits no longer avoid the forward scan. For sub-MB session jsonl the
 cost difference is negligible (microseconds), and the simpler design
 is easier to reason about. If profiling later shows the forward scan
 on cache hit as hot, we can reintroduce the tail-read optimization.
+
+[deviation] `mtime_jsonl` was added to the cache key as part of the
+subagent-status-via-queue-notifications plan. Without it, queue-events
+appended to main jsonl while the main session stays idle would be
+invisible to the orchestrator override (last_uuid unchanged → cache
+hit → stale task_notifications returned).
 
 ### `data/agents_<sid>.json`
 
@@ -76,6 +94,15 @@ contains **zero assistant events at all**: status is forced to `err`
 `detect_status` would return. The plan spec called for this signal —
 "the agent never produced output" should be visually distinct from
 "the agent is mid-flow".
+
+[deviation] The orchestrator override in `_compute_agents` may additionally
+set `status="kill"` when a main-log `<task-notification>` event has
+`<status>killed</status>` AND the agent's `<task-id>` matches the agent's
+filename stem (with `agent-` prefix stripped). See
+`docs/plans/completed/20260824-subagent-status-via-queue-notifications.md`
+for the full design. The override sits **below** the priority chain above:
+queue cannot downgrade `err` or `stop` (guard), but overrides both `run`
+(the bug fix) and `ok` (queue is more recent than end_turn).
 
 ## Disk-layout deviation
 

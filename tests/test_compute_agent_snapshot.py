@@ -21,7 +21,7 @@ import json
 import os
 from pathlib import Path
 
-from status_line import compute_agent_snapshot
+from status_line import compute_agent_snapshot, _compute_agents
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -31,6 +31,12 @@ AGENT_OK = FIXTURES_DIR / "agent_ok.jsonl"
 AGENT_ERR_RATE_LIMIT = FIXTURES_DIR / "agent_err_rate_limit.jsonl"
 AGENT_STOPPED_USER = FIXTURES_DIR / "agent_stopped_user.jsonl"
 AGENT_RUNNING = FIXTURES_DIR / "agent_running.jsonl"
+AGENT_KILLED = FIXTURES_DIR / "agent-killed-in-tool-use.jsonl"
+AGENT_KILLED_META = FIXTURES_DIR / "agent-killed-in-tool-use.meta.json"
+AGENT_COMPLETED = FIXTURES_DIR / "agent-completed-after-tool-use.jsonl"
+AGENT_COMPLETED_META = FIXTURES_DIR / "agent-completed-after-tool-use.meta.json"
+AGENT_ERR_API = FIXTURES_DIR / "agent-err-in-tool-use.jsonl"
+AGENT_ERR_API_META = FIXTURES_DIR / "agent-err-in-tool-use.meta.json"
 
 META_NORMAL = FIXTURES_DIR / "meta_normal.json"
 META_STOPPED_BY_USER = FIXTURES_DIR / "meta_stopped_by_user.json"
@@ -351,3 +357,163 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
     )
     assert r2["description"] == "edited description"
     assert r2["toolUseId"] == "toolu_v2"
+
+
+# ---------------------------------------------------------------------------
+# _compute_agents orchestrator override (added per 20260824-subagent-status-via-queue-notifications)
+# ---------------------------------------------------------------------------
+
+def _make_session_with_agent(
+    tmp_path: Path, src_jsonl: Path, src_meta: Path
+) -> tuple[Path, Path, str]:
+    """Create session_dir/subagents/agent-XXX.{jsonl,meta.json} by copying the
+    given fixture pair. The destination filename is always `agent-test`
+    (matches the production `agent-*.jsonl` glob); contents come from
+    `src_jsonl`/`src_meta`.
+
+    Returns (session_dir, agents_cache_path, agent_id) where agent_id is the
+    canonical stem ("agent-test") — callers use it to derive the join key.
+    """
+    session_dir = tmp_path / "session-abc"
+    subagents_dir = session_dir / "subagents"
+    subagents_dir.mkdir(parents=True)
+    agent_id = "agent-test"
+    dst_jsonl = subagents_dir / f"{agent_id}.jsonl"
+    dst_meta = subagents_dir / f"{agent_id}.meta.json"
+    dst_jsonl.write_bytes(src_jsonl.read_bytes())
+    dst_meta.write_bytes(src_meta.read_bytes())
+    agents_cache = tmp_path / "agents_cache.json"
+    return session_dir, agents_cache, agent_id
+
+
+def test_compute_agents_no_task_notifications_backwards_compat(
+    tmp_path: Path,
+) -> None:
+    """Empty task_notifications dict → _compute_agents behaves as before.
+    Pre-existing behavior for agents without queue signal must be preserved."""
+    session_dir, agents_cache, _ = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+
+    agents = _compute_agents(session_dir, agents_cache, task_notifications={})
+
+    assert len(agents) == 1
+    # agent_running.jsonl ends with tool_use (no end_turn) → status="run"
+    assert agents[0]["status"] == "run"
+
+
+def test_compute_agents_killed_in_tool_use_with_queue_signal(
+    tmp_path: Path,
+) -> None:
+    """Agent jsonl ends with tool_use (mid-flight); queue-notification says
+    killed → orchestrator overrides to 'kill'."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_KILLED, AGENT_KILLED_META
+    )
+    task_key = agent_id[len("agent-"):]  # "test" (canonical stem-minus-prefix)
+
+    agents = _compute_agents(
+        session_dir, agents_cache, task_notifications={task_key: "kill"}
+    )
+
+    assert len(agents) == 1
+    assert agents[0]["status"] == "kill"
+
+
+def test_compute_agents_completed_after_tool_use_with_queue_signal(
+    tmp_path: Path,
+) -> None:
+    """Agent jsonl ends with end_turn; queue-notification says completed.
+    Orchestrator overrides 'ok' → 'ok' (no change — queue signal is consistent
+    with clean end_turn)."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_COMPLETED, AGENT_COMPLETED_META
+    )
+    task_key = agent_id[len("agent-"):]
+
+    agents = _compute_agents(
+        session_dir, agents_cache, task_notifications={task_key: "ok"}
+    )
+
+    assert len(agents) == 1
+    # Compute_agent_snapshot returns "ok" (end_turn); queue says "ok" — same.
+    assert agents[0]["status"] == "ok"
+
+
+def test_compute_agents_api_error_with_queue_signal_guard(
+    tmp_path: Path,
+) -> None:
+    """[guard] Agent jsonl ends with assistant event with apiErrorStatus=429
+    → compute_agent_snapshot returns 'err'. Queue-notification says
+    'completed'. The guard 'status not in (err, stop)' MUST prevent the
+    override from downgrading 'err' to 'ok'."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_ERR_API, AGENT_ERR_API_META
+    )
+    task_key = agent_id[len("agent-"):]
+
+    agents = _compute_agents(
+        session_dir, agents_cache, task_notifications={task_key: "ok"}
+    )
+
+    assert len(agents) == 1
+    assert agents[0]["status"] == "err", (
+        f"err must be preserved (guard); got {agents[0]['status']!r}"
+    )
+
+
+def test_compute_agents_stopped_by_user_with_queue_signal_guard(
+    tmp_path: Path,
+) -> None:
+    """[guard] Agent meta.stoppedByUser=true → compute_agent_snapshot returns
+    'stop'. Queue-notification says 'completed'. Guard must prevent the
+    override from downgrading 'stop' to 'ok'."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_OK, META_STOPPED_BY_USER
+    )
+    task_key = agent_id[len("agent-"):]
+
+    agents = _compute_agents(
+        session_dir, agents_cache, task_notifications={task_key: "ok"}
+    )
+
+    assert len(agents) == 1
+    assert agents[0]["status"] == "stop", (
+        f"stop must be preserved (guard); got {agents[0]['status']!r}"
+    )
+
+
+def test_compute_agents_prefix_strip_join(tmp_path: Path) -> None:
+    """The queue notification key is the agent's filename stem WITHOUT the
+    'agent-' prefix. The orchestrator strips the prefix when looking up
+    agents. Verifies with a non-prefixed task key in the dict."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_KILLED, AGENT_KILLED_META
+    )
+    task_key = agent_id[len("agent-"):]  # "test"
+
+    agents = _compute_agents(
+        session_dir, agents_cache, task_notifications={task_key: "kill"}
+    )
+
+    assert len(agents) == 1
+    assert agents[0]["status"] == "kill"
+
+
+def test_compute_agents_no_match_no_override(tmp_path: Path) -> None:
+    """Queue-notification present but with a task-id NOT matching any agent →
+    orchestrator ignores it. Agent status reflects compute_agent_snapshot
+    alone."""
+    session_dir, agents_cache, _ = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+
+    agents = _compute_agents(
+        session_dir,
+        agents_cache,
+        task_notifications={"some-other-agent": "kill"},
+    )
+
+    assert len(agents) == 1
+    # agent_running.jsonl → "run"; unmatched queue key has no effect.
+    assert agents[0]["status"] == "run"
