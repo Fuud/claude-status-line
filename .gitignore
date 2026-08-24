@@ -1,0 +1,4 @@
+data/
+tests/fixtures/real_session/
+__pycache__/
+*.pyc
