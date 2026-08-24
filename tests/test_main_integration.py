@@ -29,8 +29,13 @@ ENCODED_PROJECT = "C--Users-f-bobin-IdeaProjects-agentic-terminal"
 STATUS_LINE_PY = Path(__file__).parent.parent / "status_line.py"
 
 
-def _run_main(stdin: str, home: Path) -> subprocess.CompletedProcess:
-    """Spawn status_line.py with HOME=<home> and feed stdin (str)."""
+def _run_main(
+    stdin: str, home: Path, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    """Spawn status_line.py with HOME=<home> and feed stdin (str).
+
+    CLAUDE_CODE_CONTEXT_LIMIT is always popped so context-limit resolution
+    is deterministic; pass an override via extra_env."""
     env = os.environ.copy()
     # Path.home() on Windows Python consults USERPROFILE first, then HOME.
     # Override both so the child process sees a deterministic home.
@@ -38,6 +43,9 @@ def _run_main(stdin: str, home: Path) -> subprocess.CompletedProcess:
     env["USERPROFILE"] = str(home)
     env.pop("HOMEDRIVE", None)
     env.pop("HOMEPATH", None)
+    env.pop("CLAUDE_CODE_CONTEXT_LIMIT", None)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, str(STATUS_LINE_PY)],
         input=stdin.encode("utf-8"),
@@ -660,3 +668,120 @@ def test_synth_queue_event_after_assistant_rerun_uses_cached_data(
     out2 = r2.stdout.decode("utf-8")
     assert "[kill]" in out2, f"2nd call expected [kill]; got:\n{out2!r}"
     assert "[run]" not in out2, f"2nd call should NOT have [run]; got:\n{out2!r}"
+
+
+# ---------------------------------------------------------------------------
+# 9. Header "Context: NK (P%)" field (2026-08-24). Sources: payload
+#    context_window.total_input_tokens first, jsonl last-assistant occupancy
+#    as fallback; divisor: env CLAUDE_CODE_CONTEXT_LIMIT, else "[1m]" model
+#    → 1M, else 200k.
+# ---------------------------------------------------------------------------
+
+# Payload context value used across these tests: 15500 tokens.
+# Against 200k → "16K (8%)" (round(15.5)=16, round(7.75)=8).
+# Against 1M   → "16K (2%)"  (round(1.55)=2).
+# Against 500k → "16K (3%)"  (round(3.1)=3).
+CTX_TOKENS = 15_500
+
+
+def test_header_context_from_payload(fake_home_with_real_session) -> None:
+    """Payload carries context_window.total_input_tokens → header shows it
+    after User, percent vs the 200k default (plain model, no env)."""
+    tmp_path, sid = fake_home_with_real_session
+    stdin = json.dumps({
+        "session_id": sid,
+        "model": {"display_name": "X"},
+        "context_window": {"used_percentage": 8, "total_input_tokens": CTX_TOKENS},
+    })
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    header = result.stdout.decode("utf-8").splitlines()[0]
+    assert "| Context: 16K (8%)" in header, f"header: {header!r}"
+    # Segment order: Context AFTER User.
+    assert header.index("User:") < header.index("Context:")
+
+
+def test_header_context_env_limit_override(fake_home_with_real_session) -> None:
+    """env CLAUDE_CODE_CONTEXT_LIMIT=1000000 → same tokens, percent vs 1M."""
+    tmp_path, sid = fake_home_with_real_session
+    stdin = json.dumps({
+        "session_id": sid,
+        "model": {"display_name": "X"},
+        "context_window": {"total_input_tokens": CTX_TOKENS},
+    })
+    result = _run_main(stdin, tmp_path, extra_env={"CLAUDE_CODE_CONTEXT_LIMIT": "1000000"})
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    header = result.stdout.decode("utf-8").splitlines()[0]
+    assert "| Context: 16K (2%)" in header, f"header: {header!r}"
+
+
+def test_header_context_1m_model(fake_home_with_real_session) -> None:
+    """No env; model display_name contains "[1m]" → divisor 1M."""
+    tmp_path, sid = fake_home_with_real_session
+    stdin = json.dumps({
+        "session_id": sid,
+        "model": {"display_name": "glm-5.3[1m]"},
+        "context_window": {"total_input_tokens": CTX_TOKENS},
+    })
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    header = result.stdout.decode("utf-8").splitlines()[0]
+    assert "| Context: 16K (2%)" in header, f"header: {header!r}"
+
+
+def test_header_context_env_beats_1m_model(fake_home_with_real_session) -> None:
+    """env=500000 + "[1m]" model → env wins → "16K (3%)"."""
+    tmp_path, sid = fake_home_with_real_session
+    stdin = json.dumps({
+        "session_id": sid,
+        "model": {"display_name": "glm-5.3[1m]"},
+        "context_window": {"total_input_tokens": CTX_TOKENS},
+    })
+    result = _run_main(stdin, tmp_path, extra_env={"CLAUDE_CODE_CONTEXT_LIMIT": "500000"})
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    header = result.stdout.decode("utf-8").splitlines()[0]
+    assert "| Context: 16K (3%)" in header, f"header: {header!r}"
+
+
+def test_header_context_jsonl_fallback(fake_home_with_real_session) -> None:
+    """No context_window in payload (older CC) → jsonl-derived occupancy of
+    the real session's last assistant event. Values are fixture-dependent,
+    so assert the segment's shape and position, not exact numbers."""
+    tmp_path, sid = fake_home_with_real_session
+    stdin = json.dumps({
+        "session_id": sid,
+        "model": {"display_name": "MiniMax-M3"},
+    })
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    header = result.stdout.decode("utf-8").splitlines()[0]
+    m = re.search(r"\| Context: (\d+)K \((\d+)%\)$", header)
+    assert m, f"header lacks a Context segment: {header!r}"
+    # The real session's last assistant event has non-trivial usage.
+    assert int(m.group(1)) > 0, f"context K should be positive: {header!r}"
+
+
+def test_header_context_payload_wins_over_jsonl(fake_home_with_real_session) -> None:
+    """Both sources available → payload wins (fresher; provided by CC)."""
+    tmp_path, sid = fake_home_with_real_session
+    # A distinct payload value (30000 → "30K (15%)" vs 200k) that the jsonl
+    # fallback would never produce for this fixture.
+    stdin = json.dumps({
+        "session_id": sid,
+        "model": {"display_name": "X"},
+        "context_window": {"total_input_tokens": 30_000},
+    })
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    header = result.stdout.decode("utf-8").splitlines()[0]
+    assert "| Context: 30K (15%)" in header, f"header: {header!r}"
+
+
+def test_header_context_zero_without_session(fake_home_with_real_session) -> None:
+    """Empty stdin → no session, no payload context → "Context: 0K (0%)"
+    still renders (the field is unconditional in the header)."""
+    tmp_path, _ = fake_home_with_real_session
+    result = _run_main("", tmp_path)
+    assert result.returncode == 0
+    header = result.stdout.decode("utf-8").splitlines()[0]
+    assert header.endswith("| Context: 0K (0%)"), f"header: {header!r}"

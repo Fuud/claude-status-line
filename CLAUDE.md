@@ -9,13 +9,18 @@ the public surface one function per test module.
 
 | Layer             | Functions                                              | Pure? |
 | ----------------- | ------------------------------------------------------ | ----- |
-| format / parse    | `format_tokens`, `detect_status`, `parse_stdin`        | yes   |
+| format / parse    | `format_tokens`, `format_context`,                     | yes*  |
+|                   | `resolve_context_limit`, `detect_status`,              |       |
+|                   | `parse_stdin`                                          |       |
 | read / compute    | `_read_last_event`, `_scan_main_jsonl`,                | no    |
 |                   | `_atomic_write_json`, `_load_meta_dict`, `_meta_mtime` |       |
 | cache / aggregate | `compute_main_cum`, `compute_agent_snapshot`,          | no    |
 |                   | `find_session_dir`, `sort_agents`                      |       |
 | render            | `render_output`                                        | yes   |
 | orchestrator      | `main()`                                               | no    |
+
+\* `resolve_context_limit` reads env `CLAUDE_CODE_CONTEXT_LIMIT` (like
+`parse_stdin` reads `AI_USER`); `format_context` is fully pure.
 
 Pure helpers (no I/O) are exercised directly in tests; the rest are
 exercised through fixtures under `tests/fixtures/`. The orchestrator
@@ -45,7 +50,14 @@ the orchestrator override in `_compute_agents` when a main-log
   `task_notifications: dict[<task-id>, {ok,kill,err}]` field extracted
   from `<task-notification>` queue-operation events during the same
   forward scan — consumed by the orchestrator override in
-  `_compute_agents`.
+  `_compute_agents` — and a `context_tokens: int` field: the
+  input + cache_creation + cache_read of the LAST assistant event
+  (context-window occupancy), extracted in the same pass.
+
+[deviation] Cache hit additionally requires `context_tokens` to be
+present in the cached dict (same field-presence-guard pattern as the
+agents cache's breakdown fields) — otherwise a pre-upgrade cache would
+render `Context: 0K (0%)` for one cycle after upgrade.
 
 [deviation] The previous implementation tail-scanned the jsonl first
 (to detect cache hits cheaply) and then forward-scanned on miss. That
@@ -112,6 +124,25 @@ for the full design. The override sits **below** the priority chain above:
 queue cannot downgrade `err` or `stop` (guard), but overrides both `run`
 (the bug fix) and `ok` (queue is more recent than end_turn).
 
+## Header `Context:` field
+
+The header line ends with `| Context: <N>K (<P>%)` after `User:`.
+
+- **N (absolute):** context-window occupancy in whole thousands.
+  Source priority in `_context_segment`:
+  1. payload `context_window.total_input_tokens` (extracted by
+     `parse_stdin` into `context_tokens`) when positive — the freshest
+     value, provided by Claude Code itself ("live context window from the
+     most recent API response", input + cache writes + cache reads per the
+     statusline docs), and available even when no local session dir exists;
+  2. otherwise the jsonl-derived `context_tokens` from
+     `compute_main_cum` (occupancy at the last assistant event — same
+     formula), 0 when neither source has data.
+- **P (percent divisor):** `resolve_context_limit(model)` —
+  env `CLAUDE_CODE_CONTEXT_LIMIT` (positive int) wins outright; else
+  `"[1m]"` in the model display name (case-insensitive) → 1e6; else 2e5.
+  Malformed/non-positive env values are ignored, not fatal.
+
 ## Disk-layout deviation
 
 The plan spec describes the main jsonl path as
@@ -176,3 +207,8 @@ point to the relevant explanation.
   `compute_main_cum` no longer exposes `total`. Render is now a table
   with header labels and per-column right-alignment. See plan
   `docs/plans/20260824-token-breakdown-table.md`.
+- **2026-08-24** — added the header `Context: <N>K (<P>%)` field (see
+  "Header `Context:` field" above). New pure helpers
+  `resolve_context_limit` / `format_context`; `parse_stdin` grew a
+  `context_tokens` key; `compute_main_cum` persists `context_tokens`
+  with a field-presence guard on cache hit.

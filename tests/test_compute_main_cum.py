@@ -43,6 +43,7 @@ def _write_main_cache(
     cum_out: int,
     cum_cache_create: int,
     cum_cache_read: int,
+    context_tokens: int = 0,
     total: int | None = None,
     last_uuid: str = MAIN_NORMAL_LAST_UUID,
     mtime_jsonl: float | None = None,
@@ -51,6 +52,8 @@ def _write_main_cache(
     writes to disk) and return the dict.
 
     `total=None` omits the legacy `total` key; pass an int to include it.
+    `context_tokens` defaults to 0 — a PRESENT (possibly zero) field; the
+    cache-hit guard checks presence, not value.
     `mtime_jsonl=None` reads the current MAIN_NORMAL mtime so the cache hit
     succeeds (compute_main_cum's cache key is `(last_uuid, mtime_jsonl)`).
     Shared by the "no total key" and "legacy total field" tests so the
@@ -62,6 +65,7 @@ def _write_main_cache(
         "cum_out": cum_out,
         "cum_cache_create": cum_cache_create,
         "cum_cache_read": cum_cache_read,
+        "context_tokens": context_tokens,
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime_jsonl,
         "tool_use_positions": {},
@@ -91,6 +95,8 @@ def test_empty_jsonl_returns_zeros(tmp_path: Path) -> None:
     assert result["tool_use_positions"] == {}
     # last_uuid is "" (empty string) per spec — code never returns None.
     assert result["last_uuid"] == ""
+    # No assistant events → no context occupancy.
+    assert result["context_tokens"] == 0
     # fresh compute → cache file should exist and be valid JSON
     assert cache.exists()
     on_disk = json.loads(cache.read_text())
@@ -110,6 +116,7 @@ def test_no_assistant_events_returns_empty(tmp_path: Path) -> None:
     assert result["tool_use_positions"] == {}
     # No assistant event exists → last_uuid is "" (empty string).
     assert result["last_uuid"] == ""
+    assert result["context_tokens"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +146,9 @@ def test_main_normal_sums_usage(tmp_path: Path) -> None:
     assert result["last_uuid"] == "77777777-7777-7777-7777-777777777777"
     # No tool_use blocks in main_normal → empty positions.
     assert result["tool_use_positions"] == {}
+    # Context occupancy at the LAST assistant event (200+150+700), not a
+    # cumulative sum — feeds the header's "Context: NK (P%)" field.
+    assert result["context_tokens"] == 1050
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +202,13 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
     cache = tmp_path / "main_hit.json"
     sentinel_cum_in = 999_999_999
     sentinel_positions = {"sentinel_tool_id": 0}
+    sentinel_context = 424_242
     cached = {
         "cum_in": sentinel_cum_in,
         "cum_out": 2,
         "cum_cache_create": 3,
         "cum_cache_read": 4,
+        "context_tokens": sentinel_context,
         "last_uuid": "66666666-6666-6666-6666-666666666666",  # matches main_with_tool_use tail
         "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
         "tool_use_positions": sentinel_positions,
@@ -208,6 +220,7 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
     # If cache was used, these values must match the sentinel.
     assert result["cum_in"] == sentinel_cum_in
     assert result["tool_use_positions"] == sentinel_positions
+    assert result["context_tokens"] == sentinel_context
     assert result["last_uuid"] == "66666666-6666-6666-6666-666666666666"
 
 
@@ -311,6 +324,7 @@ def test_missing_jsonl_returns_zeros(tmp_path: Path) -> None:
     # when the jsonl doesn't exist.
     assert result["task_notifications"] == {}
     assert result["mtime_jsonl"] == 0.0
+    assert result["context_tokens"] == 0
     # No jsonl → no cache file written (per spec: "Skip the write if jsonl_path
     # doesn't exist").
     assert not cache.exists()
@@ -409,6 +423,7 @@ def test_cache_hit_preserves_task_notifications(tmp_path: Path) -> None:
         "cum_out": 2,
         "cum_cache_create": 3,
         "cum_cache_read": 4,
+        "context_tokens": 0,
         "total": 999_999_999,
         "last_uuid": "66666666-6666-6666-6666-666666666666",  # matches MAIN_TOOL_USE tail
         "tool_use_positions": {},
@@ -475,6 +490,7 @@ def test_cache_hit_preserves_mtime_jsonl_field(tmp_path: Path) -> None:
         "cum_out": 0,
         "cum_cache_create": 0,
         "cum_cache_read": 0,
+        "context_tokens": 0,
         "total": 0,
         "last_uuid": "66666666-6666-6666-6666-666666666666",
         "tool_use_positions": {},
@@ -609,3 +625,71 @@ def test_cache_hit_accepts_legacy_total_field(tmp_path: Path) -> None:
     # strip it — render doesn't read it, and stripping would invalidate
     # every existing live cache on first run after upgrade).
     assert result.get("total") == cached["total"]
+
+
+# ---------------------------------------------------------------------------
+# context_tokens (header "Context:" field source, jsonl fallback)
+# ---------------------------------------------------------------------------
+
+def test_context_tokens_is_last_assistant_not_cumulative(tmp_path: Path) -> None:
+    """context_tokens must reflect the LAST assistant event's occupancy,
+    not the cumulative sums. main_normal's 3rd event: 200+150+700 = 1050
+    (while cum_in+cum_create+cum_read would be 450+300+1400 = 2150)."""
+    cache = tmp_path / "main_ctx.json"
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    assert result["context_tokens"] == 1050
+    assert result["context_tokens"] != (
+        result["cum_in"] + result["cum_cache_create"] + result["cum_cache_read"]
+    )
+    # Persisted to the cache file too.
+    on_disk = json.loads(cache.read_text())
+    assert on_disk["context_tokens"] == 1050
+
+
+def test_context_tokens_assistant_without_usage(tmp_path: Path) -> None:
+    """An assistant event with NO usage block contributes nothing — the
+    running context value stays at the previous event's occupancy."""
+    jsonl = tmp_path / "no_usage.jsonl"
+    jsonl.write_text(
+        '{"type":"assistant","message":{"content":[],"usage":{"input_tokens":100,'
+        '"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":1}},'
+        '"uuid":"u1"}\n'
+        '{"type":"assistant","message":{"content":[]},"uuid":"u2"}\n'
+    )
+    cache = tmp_path / "main_no_usage.json"
+    result = compute_main_cum(jsonl, cache)
+
+    # Last assistant event has no usage → context stays at the earlier
+    # event's 150 (100+20+30); uuid tracks u2.
+    assert result["context_tokens"] == 150
+    assert result["last_uuid"] == "u2"
+
+
+def test_cache_hit_requires_context_tokens_field(tmp_path: Path) -> None:
+    """Pre-upgrade cache shape: both key parts match but the dict LACKS
+    context_tokens. The field-presence guard must treat it as a MISS and
+    recompute (else the header would render "0K (0%)" for one cycle after
+    upgrade). Mirrors the agents-cache breakdown-fields guard."""
+    cache = tmp_path / "main_old_schema.json"
+    # Intentionally WITHOUT "context_tokens".
+    cached = {
+        "cum_in": 111,
+        "cum_out": 222,
+        "cum_cache_create": 333,
+        "cum_cache_read": 444,
+        "last_uuid": MAIN_NORMAL_LAST_UUID,
+        "mtime_jsonl": MAIN_NORMAL.stat().st_mtime,
+        "tool_use_positions": {},
+        "task_notifications": {},
+    }
+    cache.write_text(json.dumps(cached))
+
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    # Recomputed, not the stale sentinels.
+    assert result["cum_in"] == 450
+    assert result["context_tokens"] == 1050
+    # Cache rewritten in the new shape.
+    on_disk = json.loads(cache.read_text())
+    assert on_disk["context_tokens"] == 1050

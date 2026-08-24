@@ -4,11 +4,12 @@ parse_stdin reads the JSON payload that Claude Code sends to the status line
 hook via stdin and returns a dict with:
 
     {
-        "session_id": str,
-        "prompt_id":  str,
-        "model":      str,
-        "branch":     str,        # `git branch --show-current` or ""
-        "user":       str,        # AI_USER env var, or "n/a"
+        "session_id":     str,
+        "prompt_id":      str,
+        "model":          str,
+        "branch":         str,   # `git branch --show-current` or ""
+        "user":           str,   # AI_USER env var, or "n/a"
+        "context_tokens": int,   # payload.context_window.total_input_tokens or 0
     }
 
 Behaviour:
@@ -65,6 +66,8 @@ def test_valid_json_extracts_all_fields(tmp_path: Path, monkeypatch: pytest.Monk
     assert result["user"] == "n/a"
     # branch from git, in a non-git cwd → ""
     assert result["branch"] == ""
+    # context_window.total_input_tokens from the payload (int)
+    assert result["context_tokens"] == 1234
 
 
 def test_user_taken_from_ai_user_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -94,6 +97,7 @@ def test_empty_string_returns_defaults(tmp_path: Path, monkeypatch: pytest.Monke
         "model": "",
         "branch": "",
         "user": "n/a",
+        "context_tokens": 0,
     }
 
 
@@ -107,6 +111,7 @@ def test_whitespace_only_returns_defaults(tmp_path: Path, monkeypatch: pytest.Mo
         "model": "",
         "branch": "",
         "user": "n/a",
+        "context_tokens": 0,
     }
 
 
@@ -120,6 +125,7 @@ def test_invalid_json_returns_defaults(tmp_path: Path, monkeypatch: pytest.Monke
         "model": "",
         "branch": "",
         "user": "n/a",
+        "context_tokens": 0,
     }
 
 
@@ -134,6 +140,7 @@ def test_missing_fields_use_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyP
         "model": "",
         "branch": "",
         "user": "n/a",
+        "context_tokens": 0,
     }
 
 
@@ -147,6 +154,7 @@ def test_empty_object_uses_all_defaults(tmp_path: Path, monkeypatch: pytest.Monk
         "model": "",
         "branch": "",
         "user": "n/a",
+        "context_tokens": 0,
     }
 
 
@@ -173,6 +181,61 @@ def test_non_string_fields_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert result["session_id"] == ""
     assert result["prompt_id"] == ""
     assert result["model"] == ""
+
+
+# ---------------------------------------------------------------------------
+# context_tokens extraction (payload.context_window.total_input_tokens)
+# ---------------------------------------------------------------------------
+
+def test_context_tokens_extracted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """context_window.total_input_tokens (int) lands in context_tokens."""
+    monkeypatch.chdir(tmp_path)
+    payload = json.dumps({
+        "session_id": "s1",
+        "context_window": {"used_percentage": 8, "total_input_tokens": 15500},
+    })
+    result = parse_stdin(payload)
+    assert result["context_tokens"] == 15500
+
+
+def test_context_tokens_missing_context_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No context_window object at all → default 0 (older CC versions)."""
+    monkeypatch.chdir(tmp_path)
+    result = parse_stdin(json.dumps({"session_id": "s1"}))
+    assert result["context_tokens"] == 0
+
+
+def test_context_tokens_non_int_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defensive: non-int total_input_tokens (str / list) → 0, not a crash."""
+    monkeypatch.chdir(tmp_path)
+    payload = json.dumps({
+        "session_id": "s1",
+        "context_window": {"total_input_tokens": "15500"},
+    })
+    assert parse_stdin(payload)["context_tokens"] == 0
+    payload2 = json.dumps({
+        "session_id": "s1",
+        "context_window": {"total_input_tokens": [1, 2]},
+    })
+    assert parse_stdin(payload2)["context_tokens"] == 0
+
+
+def test_context_tokens_bool_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defensive: True is an int subclass in Python but must NOT pass the
+    isinstance gate — a boolean in the token slot is corrupt data."""
+    monkeypatch.chdir(tmp_path)
+    payload = json.dumps({
+        "session_id": "s1",
+        "context_window": {"total_input_tokens": True},
+    })
+    assert parse_stdin(payload)["context_tokens"] == 0
+
+
+def test_context_tokens_non_dict_context_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defensive: context_window as a non-dict (str) → 0."""
+    monkeypatch.chdir(tmp_path)
+    payload = json.dumps({"session_id": "s1", "context_window": "big"})
+    assert parse_stdin(payload)["context_tokens"] == 0
 
 
 def test_get_branch_caches_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
