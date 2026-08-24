@@ -213,15 +213,15 @@ main: 78k
 - Modify: `~/.claude/status_line/status_line.py`
 - Create: `~/.claude/status_line/tests/test_compute_main_cum.py`
 
-- [ ] написать тесты: пустой jsonl → нули; main_normal (3 assistant events) → сумма usage; cache hit (last_uuid совпал) → не пересчитывает (мокать os.stat или использовать frozen mtime); cache повреждён (битый JSON в cache-файле) → удаляется, пересчитывается; tool_use_positions правильно строится (извлекает id из `tool_use` блоков в assistant content)
-- [ ] реализовать `compute_main_cum(jsonl_path, cache_path) -> dict`:
+- [x] написать тесты: пустой jsonl → нули; main_normal (3 assistant events) → сумма usage; cache hit (last_uuid совпал) → не пересчитывает (мокать os.stat или использовать frozen mtime); cache повреждён (битый JSON в cache-файле) → удаляется, пересчитывается; tool_use_positions правильно строится (извлекает id из `tool_use` блоков в assistant content)
+- [x] реализовать `compute_main_cum(jsonl_path, cache_path) -> dict`:
   - load cache (try/except JSONDecodeError → удалить файл, fallback на пустой)
   - `last_event_uuid = read_last_assistant_uuid(jsonl_path)` (читает с конца, первый assistant)
   - если `last_event_uuid == cache.last_uuid` → return cache
   - иначе: scan jsonl с начала, для каждого event с `type=assistant` и `usage` суммировать in/out/cache_create/cache_read; параллельно собрать `tool_use_positions` (для каждого блока `type=tool_use` в content — `tool_use.id → index`)
   - atomic write: `Path(cache_path + ".tmp").write_text(json.dumps(...))` → `os.replace()`
-- [ ] тест: `tool_use_positions` содержит `Agent_107`, `call_xxx` id
-- [ ] прогнать `python3 -m pytest tests/test_compute_main_cum.py -v` — все PASS
+- [x] тест: `tool_use_positions` содержит `Agent_107`, `call_xxx` id
+- [x] прогнать `python3 -m pytest tests/test_compute_main_cum.py -v` — все PASS
 
 ### Task 4: compute_agent_snapshot с кешем по (mtime, last_uuid) (TDD)
 

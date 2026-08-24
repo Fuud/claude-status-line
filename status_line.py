@@ -225,3 +225,199 @@ def parse_stdin(json_str: str) -> dict:
     # so we keep the default "n/a". Field is present so downstream renderers
     # don't have to check for it.
     return out
+
+
+# ---------------------------------------------------------------------------
+# compute_main_cum
+# ---------------------------------------------------------------------------
+
+# [decision] We scan the jsonl twice on a cache miss: once from the end to
+# locate the last assistant uuid (cheap — typically a few hundred KB tail),
+# then once from the start to sum usage and extract tool_use positions. A
+# single forward pass would be cleaner, but tail-scanning the uuid first lets
+# us short-circuit on cache hits before doing the expensive forward scan.
+
+def _read_last_assistant_uuid(jsonl_path: Path) -> str:
+    """Return the uuid of the LAST assistant event in jsonl_path, or "" if
+    none. Reads the file in reverse line-by-line for efficiency."""
+    if not jsonl_path.exists():
+        return ""
+    try:
+        # readlines() is fine for our jsonl sizes (sub-MB per session).
+        with jsonl_path.open("rb") as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines):
+        try:
+            line = raw.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            # partial line — race with subagent writing; skip
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "assistant":
+            return event.get("uuid", "") or ""
+    return ""
+
+
+def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, int], str]:
+    """Forward-scan a main jsonl summing token usage and extracting tool_use
+    positions.
+
+    Returns (cum_in, cum_out, cum_cache_create, cum_cache_read,
+             tool_use_positions, last_uuid). last_uuid is "" if no assistant
+    event was found.
+    """
+    cum_in = cum_out = cum_cache_create = cum_cache_read = 0
+    tool_use_positions: dict[str, int] = {}
+    last_uuid = ""
+
+    with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+        for index, raw_line in enumerate(f):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                # partial line — race condition with subagent writing; skip
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != "assistant":
+                continue
+            # record uuid for this assistant event
+            uuid = event.get("uuid")
+            if isinstance(uuid, str) and uuid:
+                last_uuid = uuid
+            # usage
+            msg = event.get("message") or {}
+            usage = msg.get("usage") if isinstance(msg, dict) else None
+            if isinstance(usage, dict):
+                cum_in += int(usage.get("input_tokens", 0) or 0)
+                cum_out += int(usage.get("output_tokens", 0) or 0)
+                cum_cache_create += int(usage.get("cache_creation_input_tokens", 0) or 0)
+                cum_cache_read += int(usage.get("cache_read_input_tokens", 0) or 0)
+            # tool_use positions
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_use":
+                        continue
+                    block_id = block.get("id")
+                    if isinstance(block_id, str) and block_id:
+                        # keep first occurrence only
+                        if block_id not in tool_use_positions:
+                            tool_use_positions[block_id] = index
+
+    return (
+        cum_in,
+        cum_out,
+        cum_cache_create,
+        cum_cache_read,
+        tool_use_positions,
+        last_uuid,
+    )
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write `payload` to `path` atomically via a sibling .tmp + os.replace."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
+    """Compute cumulative tokens from a main session jsonl, with cache by
+    last_uuid.
+
+    On cache hit (cache.last_uuid == current jsonl tail uuid), returns the
+    cached dict without re-scanning. On cache miss (uuid changed, cache
+    missing, or cache malformed), re-scans the jsonl forward, sums
+    input/output/cache_creation/cache_read across all assistant events,
+    collects tool_use id → event-index positions, and atomically writes the
+    result to `cache_path`.
+
+    Returns a dict with keys:
+        cum_in, cum_out, cum_cache_create, cum_cache_read, total, last_uuid,
+        tool_use_positions
+
+    If `jsonl_path` does not exist, returns a zero-valued result without
+    writing the cache.
+    """
+    empty_result = {
+        "cum_in": 0,
+        "cum_out": 0,
+        "cum_cache_create": 0,
+        "cum_cache_read": 0,
+        "total": 0,
+        "last_uuid": "",
+        "tool_use_positions": {},
+    }
+
+    if not jsonl_path.exists():
+        return dict(empty_result)
+
+    # 1. Try to load cache.
+    cache: dict | None = None
+    if cache_path.exists():
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cache = loaded
+            else:
+                # defensive: cache is JSON but not a dict → delete and recompute
+                try:
+                    cache_path.unlink()
+                except OSError:
+                    pass
+        except json.JSONDecodeError:
+            # broken cache → delete and recompute
+            try:
+                cache_path.unlink()
+            except OSError:
+                pass
+
+    # 2. Read the last assistant uuid from the jsonl tail.
+    last_uuid = _read_last_assistant_uuid(jsonl_path)
+
+    # 3. Cache hit?
+    if (
+        cache is not None
+        and last_uuid
+        and cache.get("last_uuid") == last_uuid
+    ):
+        return cache
+
+    # 4. Cache miss → forward scan.
+    cum_in, cum_out, cum_cache_create, cum_cache_read, positions, scanned_uuid = (
+        _scan_main_jsonl(jsonl_path)
+    )
+    # Prefer the scanned uuid over the tail-read one — they should match, but
+    # the forward scan is authoritative.
+    if scanned_uuid:
+        last_uuid = scanned_uuid
+
+    result = {
+        "cum_in": cum_in,
+        "cum_out": cum_out,
+        "cum_cache_create": cum_cache_create,
+        "cum_cache_read": cum_cache_read,
+        "total": cum_in + cum_out + cum_cache_create + cum_cache_read,
+        "last_uuid": last_uuid,
+        "tool_use_positions": positions,
+    }
+
+    # 5. Atomic write to cache (skip if jsonl missing — handled above).
+    _atomic_write_json(cache_path, result)
+
+    return result
