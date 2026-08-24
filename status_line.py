@@ -956,14 +956,19 @@ def render_output(
         sum_in = main_in + sum(agent_in)
         sum_out = main_out + sum(agent_out)
         sum_cached = main_cached + sum(agent_cached)
+        # Pad the label column to match `[status]` (6 chars) + desc (w_desc)
+        # + desc_token_gap (2 chars) so the in_cell lands at the same
+        # x-position as in the agent rows below. `sum:` is 4 chars, so the
+        # left-pad width is w_desc + 9 - 4 = w_desc + 5.
         lines.append(
-            f"sum: {format_tokens(sum_in):>{w_in}} "
+            f"{'sum:':<{w_desc + 5}}{format_tokens(sum_in):>{w_in}} "
             f"{format_tokens(sum_out):>{w_out}} "
             f"{format_tokens(sum_cached):>{w_cached}}"
         )
 
+    # `main:` is 5 chars, so the left-pad width is w_desc + 9 - 5 = w_desc + 4.
     lines.append(
-        f"main: {format_tokens(main_in):>{w_in}} "
+        f"{'main:':<{w_desc + 4}}{format_tokens(main_in):>{w_in}} "
         f"{format_tokens(main_out):>{w_out}} "
         f"{format_tokens(main_cached):>{w_cached}}"
     )
