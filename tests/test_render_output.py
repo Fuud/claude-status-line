@@ -1,13 +1,17 @@
 """Tests for render_output — assemble the multi-line status line string.
 
-render_output(header, main_in, main_out, main_cached, agents) returns a
-string built as:
+render_output(header, start_in, start_out, start_cached, main_in, main_out,
+main_cached, agents) returns a string built as:
     header
     | <table header — labels "in" / "out" / "cached", right-aligned per column>
+    | start: <in> <out> <cached>
     | sum: <in> <out> <cached>  # only if len(agents) > 0
     | main: <in> <out> <cached>
     | for each agent (in input order):
         "[<status>]  <description>  <in> <out> <cached>"
+
+The start row (first-message breakdown) is always rendered and is NOT
+part of the sum row — sum = main + agents only.
 
 Every table row (all lines except the session header) starts with the
 "| " prefix (_TABLE_ROW_PREFIX) so Claude Code's leading-whitespace strip
@@ -25,9 +29,10 @@ NOT padded to a fixed width — only the token columns are. Description
 Line layout for a single-agent scenario:
     [0] header
     [1] table header (in / out / cached)
-    [2] sum
-    [3] main
-    [4] agent
+    [2] start
+    [3] sum
+    [4] main
+    [5] agent
 """
 from __future__ import annotations
 
@@ -48,8 +53,8 @@ from status_line import (
 # ---------------------------------------------------------------------------
 
 def test_single_ok_agent() -> None:
-    """1 agent [ok] with breakdown → 5 lines: header, table header, sum, main,
-    agent line. Each numeric cell formatted via format_tokens."""
+    """1 agent [ok] with breakdown → 6 lines: header, table header, start,
+    sum, main, agent line. Each numeric cell formatted via format_tokens."""
     header = "Session: abc | Branch: master | Model: X | User: u"
     agents = [
         {
@@ -61,32 +66,38 @@ def test_single_ok_agent() -> None:
         },
     ]
 
-    out = render_output(header, 1000, 500, 200, agents)
+    # start=(100, 30, 200) — mirrors the main_normal fixture's first event.
+    out = render_output(header, 100, 30, 200, 1000, 500, 200, agents)
     lines = out.split("\n")
 
-    # header + table header + sum + main + agent = 5
-    assert len(lines) == 5
+    # header + table header + start + sum + main + agent = 6
+    assert len(lines) == 6
     assert lines[0] == header
     # table header line contains the three labels
     assert "in" in lines[1]
     assert "out" in lines[1]
     assert "cached" in lines[1]
+    # start line: 100→"100", 30→"30", 200→"200"
+    assert lines[2].startswith(_TABLE_ROW_PREFIX + "start:")
+    assert "100" in lines[2]
+    assert "30" in lines[2]
+    assert "200" in lines[2]
     # sum line: in=1300→"1k", out=900→"900", cached=300→"300"
-    assert lines[2].startswith(_TABLE_ROW_PREFIX + "sum:")
-    assert "1k" in lines[2]
-    assert "900" in lines[2]
-    assert "300" in lines[2]
-    # main line: 1000→"1k", 500→"500", 200→"200"
-    assert lines[3].startswith(_TABLE_ROW_PREFIX + "main:")
+    assert lines[3].startswith(_TABLE_ROW_PREFIX + "sum:")
     assert "1k" in lines[3]
-    assert "500" in lines[3]
-    assert "200" in lines[3]
+    assert "900" in lines[3]
+    assert "300" in lines[3]
+    # main line: 1000→"1k", 500→"500", 200→"200"
+    assert lines[4].startswith(_TABLE_ROW_PREFIX + "main:")
+    assert "1k" in lines[4]
+    assert "500" in lines[4]
+    assert "200" in lines[4]
     # agent line: starts with [ok], contains description and three numbers
-    assert lines[4].startswith(_TABLE_ROW_PREFIX + "[ok]")
-    assert "Task 1: foo" in lines[4]
-    assert "300" in lines[4]
-    assert "400" in lines[4]
-    assert "100" in lines[4]
+    assert lines[5].startswith(_TABLE_ROW_PREFIX + "[ok]")
+    assert "Task 1: foo" in lines[5]
+    assert "300" in lines[5]
+    assert "400" in lines[5]
+    assert "100" in lines[5]
 
 
 # ---------------------------------------------------------------------------
@@ -94,19 +105,22 @@ def test_single_ok_agent() -> None:
 # ---------------------------------------------------------------------------
 
 def test_zero_agents_no_sum_line() -> None:
-    """0 agents → header + table header + main only (no sum line)."""
+    """0 agents → header + table header + start + main only (no sum line)."""
     header = "Session: abc"
-    out = render_output(header, 0, 42, 0, [])
+    out = render_output(header, 7, 8, 9, 0, 42, 0, [])
     lines = out.split("\n")
 
-    # header + table header + main = 3
-    assert len(lines) == 3
+    # header + table header + start + main = 4
+    assert len(lines) == 4
     assert lines[0] == header
     # table header line follows
     assert "in" in lines[1] and "out" in lines[1] and "cached" in lines[1]
+    # start line precedes main
+    assert lines[2].startswith(_TABLE_ROW_PREFIX + "start:")
+    assert "7" in lines[2] and "8" in lines[2] and "9" in lines[2]
     # main line follows
-    assert lines[2].startswith(_TABLE_ROW_PREFIX + "main:")
-    assert "42" in lines[2]
+    assert lines[3].startswith(_TABLE_ROW_PREFIX + "main:")
+    assert "42" in lines[3]
     # no "sum:" line at all
     assert "sum:" not in out
 
@@ -115,9 +129,9 @@ def test_zero_agents_no_sum_line() -> None:
 # 38 agents → 42 lines (header + table header + sum + main + 38 agents)
 # ---------------------------------------------------------------------------
 
-def test_38_agents_produce_42_lines() -> None:
-    """38 agents → 42 lines: 1 header + 1 table header + 1 sum + 1 main + 38
-    agent lines."""
+def test_38_agents_produce_43_lines() -> None:
+    """38 agents → 43 lines: 1 header + 1 table header + 1 start + 1 sum +
+    1 main + 38 agent lines."""
     header = "Session: big | Branch: m | Model: X | User: u"
     agents = [
         {
@@ -130,17 +144,18 @@ def test_38_agents_produce_42_lines() -> None:
         for i in range(38)
     ]
 
-    out = render_output(header, 5000, 2000, 1000, agents)
+    out = render_output(header, 100, 30, 200, 5000, 2000, 1000, agents)
     lines = out.split("\n")
 
-    assert len(lines) == 42
+    assert len(lines) == 43
     assert lines[0] == header
     # table header is line 1
     assert "in" in lines[1] and "out" in lines[1] and "cached" in lines[1]
-    assert lines[2].startswith(_TABLE_ROW_PREFIX + "sum:")
-    assert lines[3].startswith(_TABLE_ROW_PREFIX + "main:")
+    assert lines[2].startswith(_TABLE_ROW_PREFIX + "start:")
+    assert lines[3].startswith(_TABLE_ROW_PREFIX + "sum:")
+    assert lines[4].startswith(_TABLE_ROW_PREFIX + "main:")
     # remaining 38 lines all start with the table prefix + a status tag
-    for line in lines[4:]:
+    for line in lines[5:]:
         assert line.startswith(_TABLE_ROW_PREFIX + "[")
 
 
@@ -162,9 +177,9 @@ def test_token_alignment_right_aligned() -> None:
         {"status": "ok", "tokens_in": 1234567, "tokens_out": 0, "tokens_cached": 0, "description": "c"},
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
     lines = out.split("\n")
-    agent_lines = lines[4:]  # header + table header + sum + main + agents
+    agent_lines = lines[5:]  # header + table header + start + sum + main + agents
 
     formatted_in = ["10", "50k", "1.2M"]
     # The "in" column width is W1 = max(_TOKEN_COLUMN_WIDTH=7, 2, 4) = 7.
@@ -209,9 +224,9 @@ def test_three_columns_right_aligned() -> None:
         {"status": "ok", "tokens_in": 100,     "tokens_out": 1234, "tokens_cached": 1234567,"description": "z"},
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
     lines = out.split("\n")
-    agent_lines = lines[4:]
+    agent_lines = lines[5:]
 
     # All three rows share the same prefix "[ok]  z  " (description "z"),
     # so column END positions are identical across rows. Right-alignment is
@@ -257,10 +272,10 @@ def test_long_description_truncated() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
     lines = out.split("\n")
-    # header + table header + sum + main + 1 agent = 5
-    agent_line = lines[4]
+    # header + table header + start + sum + main + 1 agent = 6
+    agent_line = lines[5]
 
     assert agent_line.startswith(_TABLE_ROW_PREFIX + "[ok]")
     # description portion ends with U+2026
@@ -299,9 +314,9 @@ def test_sum_calculation() -> None:
     # main: in=50, out=30, cached=10
     # sum: in=350, out=60, cached=30
 
-    out = render_output(header, 50, 30, 10, agents)
+    out = render_output(header, 0, 0, 0, 50, 30, 10, agents)
     lines = out.split("\n")
-    sum_line = lines[2]
+    sum_line = lines[3]
 
     # sum in = 350, format_tokens(350) = "350"
     assert sum_line.startswith(_TABLE_ROW_PREFIX + "sum:")
@@ -327,9 +342,9 @@ def test_sum_aggregates_all_rows() -> None:
     ]
     # main_out = 50 → sum_out = 50+0+100+200+300 = 650
 
-    out = render_output(header, 0, 50, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 50, 0, agents)
     lines = out.split("\n")
-    sum_line = lines[2]
+    sum_line = lines[3]
 
     # 650 < 1000 so format_tokens gives "650"
     assert "650" in sum_line, (
@@ -355,9 +370,9 @@ def test_run_agent_shows_current_values() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
     lines = out.split("\n")
-    agent_line = lines[4]
+    agent_line = lines[5]
 
     assert agent_line.startswith(_TABLE_ROW_PREFIX + "[run]")
     assert "Working on it" in agent_line
@@ -393,9 +408,9 @@ def test_kill_status_renders_as_kill_tag() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
     lines = out.split("\n")
-    agent_line = lines[4]
+    agent_line = lines[5]
 
     assert agent_line.startswith(_TABLE_ROW_PREFIX + "[kill]")
     assert "agent killed mid-flight" in agent_line
@@ -415,9 +430,9 @@ def test_kill_status_zero_breakdown_renders_zeros() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
     lines = out.split("\n")
-    agent_line = lines[4]
+    agent_line = lines[5]
 
     assert agent_line.startswith(_TABLE_ROW_PREFIX + "[kill]")
     assert "killed before tokens" in agent_line
@@ -452,9 +467,9 @@ def test_unknown_status_renders_as_question_mark() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
     lines = out.split("\n")
-    agent_line = lines[4]
+    agent_line = lines[5]
 
     assert agent_line.startswith(_TABLE_ROW_PREFIX + "[?]")
 
@@ -473,10 +488,10 @@ def test_agent_no_assistant_events_renders_zeros() -> None:
         {"status": "run", "description": "no events yet"},
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
     lines = out.split("\n")
-    # header + table header + sum + main + 1 agent = 5
-    agent_line = lines[4]
+    # header + table header + start + sum + main + 1 agent = 6
+    agent_line = lines[5]
 
     assert agent_line.startswith(_TABLE_ROW_PREFIX + "[run]")
     assert "no events yet" in agent_line
@@ -512,9 +527,9 @@ def test_large_values_format_as_k() -> None:
         {"status": "ok", "tokens_in": 2000, "tokens_out": 0, "tokens_cached": 0, "description": "big"},
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
     lines = out.split("\n")
-    agent_line = lines[4]
+    agent_line = lines[5]
 
     # The "in" cell of the agent line should contain "2k" (formatted) and
     # NOT contain the literal "2000" as a substring (which would mean
@@ -540,7 +555,7 @@ def test_table_header_row() -> None:
         {"status": "ok", "tokens_in": 50000, "tokens_out": 200, "tokens_cached": 700, "description": "a"},
     ]
 
-    out = render_output(header, 1000, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, 1000, 0, 0, agents)
     lines = out.split("\n")
     table_header = lines[1]
 
@@ -548,10 +563,11 @@ def test_table_header_row() -> None:
     assert "in" in table_header
     assert "out" in table_header
     assert "cached" in table_header
-    # carries the table-row prefix, and is not a sum/main line
+    # carries the table-row prefix, and is not a sum/main/start line
     assert table_header.startswith(_TABLE_ROW_PREFIX)
     assert not table_header.startswith(_TABLE_ROW_PREFIX + "sum:")
     assert not table_header.startswith(_TABLE_ROW_PREFIX + "main:")
+    assert not table_header.startswith(_TABLE_ROW_PREFIX + "start:")
 
     # The table header carries the "| " prefix followed by exactly the
     # three labels separated by single spaces, each right-aligned to the
@@ -560,9 +576,11 @@ def test_table_header_row() -> None:
     # column is padded to a fixed width). We can verify by reconstructing
     # what the renderer would produce, using the production _col_width
     # helper (so the test tracks the formula rather than recomputing it).
-    in_width = _col_width([50000, 1000], "in")
-    out_width = _col_width([200, 0], "out")
-    cached_width = _col_width([700, 0], "cached")
+    # The column value lists mirror render_output's: start row + main row
+    # + agent rows.
+    in_width = _col_width([0, 1000, 50000], "in")
+    out_width = _col_width([0, 0, 200], "out")
+    cached_width = _col_width([0, 0, 700], "cached")
     w_desc = max(len(a["description"]) for a in agents)
     header_pad = w_desc + _ICON_COL_WIDTH + 4
     expected_table_header = (
@@ -611,8 +629,8 @@ def test_unknown_status_renders_question_mark_icon() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, agents)
-    agent_line = out.split("\n")[4]
+    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    agent_line = out.split("\n")[5]
 
     assert agent_line.startswith(_TABLE_ROW_PREFIX + "[?]"), (
         f"unknown status should render as [?], got: {agent_line!r}"
@@ -639,10 +657,10 @@ def test_negative_number_renders_as_zero() -> None:
         },
     ]
 
-    out = render_output(header, -10, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, -10, 0, 0, agents)
     lines = out.split("\n")
-    main_line = lines[3]  # main row
-    agent_line = lines[4]
+    main_line = lines[4]  # main row
+    agent_line = lines[5]
 
     # main: -10 → "0" (clamped). Sum row: -10 + (-100) = -110 → "0".
     # Both must contain "0" as their formatted value; neither should
@@ -667,4 +685,83 @@ def test_negative_number_renders_as_zero() -> None:
     )
     assert "-50" not in agent_line, (
         f"negative tokens_out should be clamped: {agent_line!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# start row — first-message breakdown (first table row)
+# ---------------------------------------------------------------------------
+
+def test_start_row_is_first_table_row() -> None:
+    """The start row renders right after the labels row (line 2), BEFORE
+    sum/main, carrying the first message's in/out/cached values formatted
+    via format_tokens (1000 → "1k")."""
+    header = "Session: x"
+    agents = [
+        {"status": "ok", "tokens_in": 5, "tokens_out": 5, "tokens_cached": 5, "description": "a"},
+    ]
+
+    # start: in=1000→"1k", out=30→"30", cached=200→"200"
+    out = render_output(header, 1000, 30, 200, 5000, 2000, 1000, agents)
+    lines = out.split("\n")
+
+    start_line = lines[2]
+    assert start_line.startswith(_TABLE_ROW_PREFIX + "start:")
+    # Cells formatted via format_tokens BEFORE right-alignment.
+    assert "1k" in start_line, f"expected formatted '1k' in start row: {start_line!r}"
+    assert "1000" not in start_line, f"raw '1000' should be formatted: {start_line!r}"
+    assert "30" in start_line
+    assert "200" in start_line
+    # Row order: start (2) precedes sum (3) precedes main (4).
+    assert lines[3].startswith(_TABLE_ROW_PREFIX + "sum:")
+    assert lines[4].startswith(_TABLE_ROW_PREFIX + "main:")
+    assert lines[2].startswith(_TABLE_ROW_PREFIX + "start:")
+
+
+def test_start_row_not_included_in_sum() -> None:
+    """sum = main + agents ONLY — the start row is a reference row and must
+    NOT be added into the sum. Sentinel start values must not leak into the
+    sum cells."""
+    header = "Session: x"
+    agents = [
+        {"status": "ok", "tokens_in": 100, "tokens_out": 10, "tokens_cached": 5, "description": "a"},
+    ]
+    # main: in=50, out=30, cached=10 → sum: in=150, out=40, cached=15.
+    # start is (900000, 900000, 900000): if it leaked into the sum, the sum
+    # cells would show "900k" (format_tokens(900050)) instead of the small
+    # values below. No correct sum cell contains "900".
+    out = render_output(header, 900_000, 900_000, 900_000, 50, 30, 10, agents)
+    lines = out.split("\n")
+    sum_line = lines[3]
+
+    assert sum_line.startswith(_TABLE_ROW_PREFIX + "sum:")
+    assert "150" in sum_line, f"sum in must be main+agents (150), got: {sum_line!r}"
+    assert "40" in sum_line, f"sum out must be 40, got: {sum_line!r}"
+    assert "15" in sum_line, f"sum cached must be 15, got: {sum_line!r}"
+    assert "900" not in sum_line, f"start sentinel leaked into sum row: {sum_line!r}"
+
+
+def test_start_row_wide_value_expands_column() -> None:
+    """A wide start value participates in the column-width computation: the
+    start cell and the main cell right-align at the same column even when
+    the start value is the widest cell in its column."""
+    header = "Session: x"
+    # 12_345_678_900 → "12345.7M" (8 chars > _TOKEN_COLUMN_WIDTH=7) — the
+    # in-column must widen to 8 so the start cell does not overflow.
+    wide_start_in = 12_345_678_900
+    out = render_output(header, wide_start_in, 0, 0, 7, 0, 0, [])
+    lines = out.split("\n")
+    start_line, main_line = lines[2], lines[3]
+
+    assert "12345.7M" in start_line, f"wide start value mangled: {start_line!r}"
+    # The in-cell is the first of the three trailing cells; its END offset
+    # from the line's right edge is w_out + 1 + w_cached (both 7 here → 15).
+    # Right-alignment means both rows share that end offset.
+    tail = _TOKEN_COLUMN_WIDTH * 2 + 1
+    assert len(start_line) - len(start_line.rstrip()) == 0, "no trailing spaces expected"
+    start_in_end = len(start_line) - tail
+    main_in_end = len(main_line) - tail
+    assert start_in_end == main_in_end, (
+        f"in-column not aligned across start/main rows:\n"
+        f"start: {start_line!r}\n main: {main_line!r}"
     )

@@ -429,25 +429,44 @@ def _read_last_event(
     return (last_assistant, last_event)
 
 
-def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, int, dict[str, int], str, dict[str, str]]:
+# [decision] _scan_main_jsonl returns a dict (keyed like the compute_main_cum
+# result minus mtime_jsonl) rather than the positional tuple it historically
+# grew into. Adding the start_* triple pushed the tuple to 11 positional
+# fields — past the point where a transposed destructure fails loudly. The
+# dict keeps the scan→result handoff self-describing; the only caller is
+# compute_main_cum.
+
+def _scan_main_jsonl(jsonl_path: Path) -> dict:
     """Forward-scan a main jsonl summing token usage and extracting tool_use
     positions.
 
-    Returns (cum_in, cum_out, cum_cache_create, cum_cache_read,
-             context_tokens, tool_use_positions, last_uuid, task_notifications).
-    last_uuid is "" if no assistant event was found. context_tokens is the
-    input + cache_creation + cache_read of the LAST assistant event — i.e.
-    the context-window size at the most recent API call (the header's
-    "Context: NK (P%)" field). task_notifications maps
-    `<task-id>` from `<task-notification>` queue-operation content to one of
-    the in-vocabulary statuses `{"ok", "kill", "err"}`; unknown statuses
-    are omitted. Last-wins on duplicate task-id (resume scenario).
+    Returns a dict with keys:
+        cum_in, cum_out, cum_cache_create, cum_cache_read
+            — sums of the usage fields across ALL assistant events.
+        start_in, start_out, start_cached
+            — input_tokens / output_tokens / cache_read_input_tokens of the
+              FIRST assistant event that carries a usage block (the table's
+              "start:" row — the session's baseline message). Zeros when no
+              assistant event has usage. cache_creation is NOT surfaced,
+              matching the cached-column semantics of every other row.
+        context_tokens
+            — input + cache_creation + cache_read of the LAST assistant
+              event — i.e. the context-window size at the most recent API
+              call (the header's "Context: NK (P%)" field).
+        tool_use_positions — tool_use block id → event-index map.
+        last_uuid — uuid of the last assistant event, "" if none found.
+        task_notifications — maps `<task-id>` from `<task-notification>`
+            queue-operation content to one of the in-vocabulary statuses
+            `{"ok", "kill", "err"}`; unknown statuses are omitted.
+            Last-wins on duplicate task-id (resume scenario).
     """
     cum_in = cum_out = cum_cache_create = cum_cache_read = 0
+    start_in = start_out = start_cached = 0
     context_tokens = 0
     tool_use_positions: dict[str, int] = {}
     task_notifications: dict[str, str] = {}
     last_uuid = ""
+    seen_first_usage = False
 
     with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
         for index, raw_line in enumerate(f):
@@ -471,11 +490,21 @@ def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, int, dict[st
                 usage = msg.get("usage") if isinstance(msg, dict) else None
                 if isinstance(usage, dict):
                     in_v = int(usage.get("input_tokens", 0) or 0)
-                    cum_in += in_v
-                    cum_out += int(usage.get("output_tokens", 0) or 0)
-                    cum_cache_create += int(usage.get("cache_creation_input_tokens", 0) or 0)
+                    out_v = int(usage.get("output_tokens", 0) or 0)
                     cache_read_v = int(usage.get("cache_read_input_tokens", 0) or 0)
+                    cum_in += in_v
+                    cum_out += out_v
+                    cum_cache_create += int(usage.get("cache_creation_input_tokens", 0) or 0)
                     cum_cache_read += cache_read_v
+                    # First-message capture — set once, on the first
+                    # assistant event that HAS a usage block. A leading
+                    # assistant event without usage contributes nothing,
+                    # mirroring the context_tokens handling below.
+                    if not seen_first_usage:
+                        seen_first_usage = True
+                        start_in = in_v
+                        start_out = out_v
+                        start_cached = cache_read_v
                     # Context-window occupancy at THIS api call — overwrite on
                     # every assistant event so the scan ends holding the LAST
                     # one. Same formula as the payload's
@@ -517,16 +546,19 @@ def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, int, dict[st
                     # last-wins on duplicate task-id (resume scenario)
                     task_notifications[m_id.group(1)] = mapped
 
-    return (
-        cum_in,
-        cum_out,
-        cum_cache_create,
-        cum_cache_read,
-        context_tokens,
-        tool_use_positions,
-        last_uuid,
-        task_notifications,
-    )
+    return {
+        "cum_in": cum_in,
+        "cum_out": cum_out,
+        "cum_cache_create": cum_cache_create,
+        "cum_cache_read": cum_cache_read,
+        "start_in": start_in,
+        "start_out": start_out,
+        "start_cached": start_cached,
+        "context_tokens": context_tokens,
+        "tool_use_positions": tool_use_positions,
+        "last_uuid": last_uuid,
+        "task_notifications": task_notifications,
+    }
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -566,6 +598,9 @@ _EMPTY_MAIN_RESULT: dict = {
     "cum_out": 0,
     "cum_cache_create": 0,
     "cum_cache_read": 0,
+    "start_in": 0,
+    "start_out": 0,
+    "start_cached": 0,
     "context_tokens": 0,
     "last_uuid": "",
     "mtime_jsonl": 0.0,
@@ -588,13 +623,17 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     to `cache_path`.
 
     Returns a dict with keys:
-        cum_in, cum_out, cum_cache_create, cum_cache_read, context_tokens,
+        cum_in, cum_out, cum_cache_create, cum_cache_read,
+        start_in, start_out, start_cached, context_tokens,
         last_uuid, mtime_jsonl, tool_use_positions, task_notifications
 
     context_tokens is the context-window occupancy at the LAST assistant
     event (input + cache_creation + cache_read) — the header's "Context:"
     field, used as fallback when the stdin payload carries no
     context_window.total_input_tokens.
+
+    start_in/start_out/start_cached are the first-message breakdown rendered
+    as the table's "start:" row (see _scan_main_jsonl).
 
     [deviation] Cache key includes `mtime_jsonl` so that queue-operation
     events appended to main jsonl without a corresponding new assistant event
@@ -607,6 +646,11 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     but lack the field would otherwise render "0K (0%)" for one cycle after
     upgrade — same field-presence guard pattern as the agents cache's
     breakdown fields.
+
+    [deviation] Cache hit likewise requires the three `start_*` fields to be
+    present: pre-start-row caches lack them and would render a zeroed
+    "start:" row for one cycle after upgrade. Same guard pattern as the
+    context_tokens check above.
 
     [deviation] The legacy `total` field was removed in Task 2 of the
     breakdown-table plan. The total is now derived by render from the three
@@ -631,35 +675,25 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     cache = _load_dict_cache(cache_path)
 
     # Forward-scan the jsonl — authoritative source for last_uuid,
-    # token totals, and task_notifications in a single pass.
-    cum_in, cum_out, cum_cache_create, cum_cache_read, context_tokens, positions, last_uuid, task_notifications = (
-        _scan_main_jsonl(jsonl_path)
-    )
+    # token totals, start_* fields, and task_notifications in a single pass.
+    scan = _scan_main_jsonl(jsonl_path)
     mtime_jsonl = _jsonl_mtime(jsonl_path)
 
     # Cache hit? Both last_uuid AND mtime_jsonl must match — otherwise stale.
-    # `context_tokens` presence is part of the hit check (see [deviation]
-    # in the docstring): pre-upgrade caches lack the field.
+    # `context_tokens` and the `start_*` fields' presence are part of the
+    # hit check (see [deviation]s in the docstring): pre-upgrade caches
+    # lack them.
     if (
         cache is not None
-        and last_uuid
-        and cache.get("last_uuid") == last_uuid
+        and scan["last_uuid"]
+        and cache.get("last_uuid") == scan["last_uuid"]
         and cache.get("mtime_jsonl") == mtime_jsonl
         and "context_tokens" in cache
+        and all(f in cache for f in ("start_in", "start_out", "start_cached"))
     ):
         return cache
 
-    result = {
-        "cum_in": cum_in,
-        "cum_out": cum_out,
-        "cum_cache_create": cum_cache_create,
-        "cum_cache_read": cum_cache_read,
-        "context_tokens": context_tokens,
-        "last_uuid": last_uuid,
-        "mtime_jsonl": mtime_jsonl,
-        "tool_use_positions": positions,
-        "task_notifications": task_notifications,
-    }
+    result = {**scan, "mtime_jsonl": mtime_jsonl}
 
     # Atomic write to cache. If write fails (disk full, read-only dir),
     # still return the just-computed result — degrading to a no-cache run
@@ -1052,6 +1086,9 @@ def _col_width(values: list, label: str) -> int:
 
 def render_output(
     header: str,
+    start_in: int,
+    start_out: int,
+    start_cached: int,
     main_in: int,
     main_out: int,
     main_cached: int,
@@ -1063,10 +1100,19 @@ def render_output(
         <header>
         | <table header — labels "in" / "out" / "cached", each right-aligned
           within its own column>
+        | start: <in> <out> <cached>
         | sum: <in> <out> <cached>    # only if len(agents) > 0
         | main: <in> <out> <cached>
         | for each agent (in input order):
               [<status>]  <description>  <in> <out> <cached>
+
+    The start row is the FIRST table row: the first assistant event's
+    breakdown (the session's baseline message), letting the reader see
+    what the session began with against the current main/sum totals. It
+    is NOT part of the sum row (sum = main + agents only) — it is a
+    reference row, not an additive component. Always rendered, like the
+    main row, even when it is all zeros (fresh session, no assistant
+    events yet).
 
     Every table row carries the "| " prefix (_TABLE_ROW_PREFIX) so that
     Claude Code's leading-whitespace strip cannot left-shift the
@@ -1095,7 +1141,7 @@ def render_output(
     here handles pre-upgrade caches or callers that build snapshots by
     hand.
     """
-    # 1. Build per-column value lists (main row first, then agents).
+    # 1. Build per-column value lists (start row, main row, then agents).
     # The agent loop runs once, projecting each agent into a triple of
     # ints and summing in lockstep — saves three separate list
     # comprehensions and three separate sum() calls for the sum row.
@@ -1113,9 +1159,12 @@ def render_output(
         # the column layout.
         descriptions.append(_truncate_description(a.get("description", "") or ""))
 
-    in_col = [main_in, *agent_in]
-    out_col = [main_out, *agent_out]
-    cached_col = [main_cached, *agent_cached]
+    # Start cells participate in column-width computation like every other
+    # row's — a wide first-message value must expand its column or it
+    # would overflow the cell alignment.
+    in_col = [start_in, main_in, *agent_in]
+    out_col = [start_out, main_out, *agent_out]
+    cached_col = [start_cached, main_cached, *agent_cached]
 
     # 2. Compute per-column width: at least _TOKEN_COLUMN_WIDTH, at least
     # the label length, at least the longest formatted cell. See
@@ -1142,6 +1191,15 @@ def render_output(
     header_pad = w_desc + _ICON_COL_WIDTH + 4
     lines.append(
         f"{' ' * header_pad}{'in':>{w_in}} {'out':>{w_out}} {'cached':>{w_cached}}"
+    )
+
+    # start row — the FIRST table row. `start:` is 6 chars, padded to the
+    # same `header_pad` width as sum:/main: so its cells land at the same
+    # x-position as every other row.
+    lines.append(
+        f"{'start:':<{header_pad}}{format_tokens(start_in):>{w_in}} "
+        f"{format_tokens(start_out):>{w_out}} "
+        f"{format_tokens(start_cached):>{w_cached}}"
     )
 
     if agents:
@@ -1418,11 +1476,18 @@ def _main_unsafe() -> int:
     agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
     # Task 4 — breakdown-table refactor: pass the three cum_* values
     # directly to render (no `total` field in main_cum anymore). render
-    # applies format_tokens to each cell; we hand it raw ints.
+    # applies format_tokens to each cell; we hand it raw ints. The start_*
+    # triple (first-message breakdown, the "start:" row) rides along the
+    # same main_cum dict; `or 0` guards pre-upgrade caches.
     cum_in = main_cum.get("cum_in", 0)
     cum_out = main_cum.get("cum_out", 0)
     cum_cache_read = main_cum.get("cum_cache_read", 0)
-    output = render_output(header, cum_in, cum_out, cum_cache_read, agents)
+    start_in = int(main_cum.get("start_in") or 0)
+    start_out = int(main_cum.get("start_out") or 0)
+    start_cached = int(main_cum.get("start_cached") or 0)
+    output = render_output(
+        header, start_in, start_out, start_cached, cum_in, cum_out, cum_cache_read, agents
+    )
     print(output)
     return 0
 

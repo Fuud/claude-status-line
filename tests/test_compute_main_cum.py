@@ -1,10 +1,12 @@
 """Tests for compute_main_cum.
 
 compute_main_cum(jsonl_path, cache_path) reads a main session jsonl and returns
-cumulative token counters (input/output/cache_creation/cache_read) plus a map of
-tool_use ids to their event indices in the jsonl. Results are cached in
-`cache_path` keyed by the last assistant event's uuid — if the jsonl tail hasn't
-changed, the cached values are returned without re-scanning.
+cumulative token counters (input/output/cache_creation/cache_read), the
+first-message breakdown (start_in/start_out/start_cached — the table's
+"start:" row), plus a map of tool_use ids to their event indices in the
+jsonl. Results are cached in `cache_path` keyed by the last assistant
+event's uuid — if the jsonl tail hasn't changed, the cached values are
+returned without re-scanning.
 
 Cache semantics:
 - If `cache_path` exists, load and compare `last_uuid` to the jsonl's last
@@ -43,6 +45,9 @@ def _write_main_cache(
     cum_out: int,
     cum_cache_create: int,
     cum_cache_read: int,
+    start_in: int = 0,
+    start_out: int = 0,
+    start_cached: int = 0,
     context_tokens: int = 0,
     total: int | None = None,
     last_uuid: str = MAIN_NORMAL_LAST_UUID,
@@ -52,8 +57,8 @@ def _write_main_cache(
     writes to disk) and return the dict.
 
     `total=None` omits the legacy `total` key; pass an int to include it.
-    `context_tokens` defaults to 0 — a PRESENT (possibly zero) field; the
-    cache-hit guard checks presence, not value.
+    `context_tokens` and the `start_*` fields default to 0 — PRESENT
+    (possibly zero) fields; the cache-hit guard checks presence, not value.
     `mtime_jsonl=None` reads the current MAIN_NORMAL mtime so the cache hit
     succeeds (compute_main_cum's cache key is `(last_uuid, mtime_jsonl)`).
     Shared by the "no total key" and "legacy total field" tests so the
@@ -65,6 +70,9 @@ def _write_main_cache(
         "cum_out": cum_out,
         "cum_cache_create": cum_cache_create,
         "cum_cache_read": cum_cache_read,
+        "start_in": start_in,
+        "start_out": start_out,
+        "start_cached": start_cached,
         "context_tokens": context_tokens,
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime_jsonl,
@@ -203,11 +211,15 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
     sentinel_cum_in = 999_999_999
     sentinel_positions = {"sentinel_tool_id": 0}
     sentinel_context = 424_242
+    sentinel_start = 434_343
     cached = {
         "cum_in": sentinel_cum_in,
         "cum_out": 2,
         "cum_cache_create": 3,
         "cum_cache_read": 4,
+        "start_in": sentinel_start,
+        "start_out": 0,
+        "start_cached": 0,
         "context_tokens": sentinel_context,
         "last_uuid": "66666666-6666-6666-6666-666666666666",  # matches main_with_tool_use tail
         "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
@@ -221,6 +233,7 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
     assert result["cum_in"] == sentinel_cum_in
     assert result["tool_use_positions"] == sentinel_positions
     assert result["context_tokens"] == sentinel_context
+    assert result["start_in"] == sentinel_start
     assert result["last_uuid"] == "66666666-6666-6666-6666-666666666666"
 
 
@@ -423,6 +436,9 @@ def test_cache_hit_preserves_task_notifications(tmp_path: Path) -> None:
         "cum_out": 2,
         "cum_cache_create": 3,
         "cum_cache_read": 4,
+        "start_in": 0,
+        "start_out": 0,
+        "start_cached": 0,
         "context_tokens": 0,
         "total": 999_999_999,
         "last_uuid": "66666666-6666-6666-6666-666666666666",  # matches MAIN_TOOL_USE tail
@@ -490,6 +506,9 @@ def test_cache_hit_preserves_mtime_jsonl_field(tmp_path: Path) -> None:
         "cum_out": 0,
         "cum_cache_create": 0,
         "cum_cache_read": 0,
+        "start_in": 0,
+        "start_out": 0,
+        "start_cached": 0,
         "context_tokens": 0,
         "total": 0,
         "last_uuid": "66666666-6666-6666-6666-666666666666",
@@ -693,3 +712,109 @@ def test_cache_hit_requires_context_tokens_field(tmp_path: Path) -> None:
     # Cache rewritten in the new shape.
     on_disk = json.loads(cache.read_text())
     assert on_disk["context_tokens"] == 1050
+
+
+# ---------------------------------------------------------------------------
+# start_* fields (first-message breakdown, the table's "start:" row)
+# ---------------------------------------------------------------------------
+
+def test_start_values_from_first_assistant_event(tmp_path: Path) -> None:
+    """start_in/start_out/start_cached mirror the FIRST assistant event's
+    usage: main_normal event 1 has input=100, output=30, cache_read=200
+    (NOT the cumulative sums, NOT the last event)."""
+    cache = tmp_path / "main_start.json"
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    assert result["start_in"] == 100
+    assert result["start_out"] == 30
+    assert result["start_cached"] == 200
+    # Distinct from both the cumulative sums (450/230/1400) and the last
+    # event's occupancy (context_tokens=1050).
+    assert result["start_in"] != result["cum_in"]
+    assert result["start_out"] != result["cum_out"]
+    assert result["start_cached"] != result["cum_cache_read"]
+
+
+def test_start_persisted_to_cache(tmp_path: Path) -> None:
+    """After a fresh compute, the cache file on disk carries the start_*
+    fields so a subsequent cache-hit returns them without re-scanning."""
+    cache = tmp_path / "main_start_disk.json"
+    compute_main_cum(MAIN_NORMAL, cache)
+
+    on_disk = json.loads(cache.read_text())
+    assert on_disk["start_in"] == 100
+    assert on_disk["start_out"] == 30
+    assert on_disk["start_cached"] == 200
+
+    # Second call hits the cache and returns the same start values.
+    result2 = compute_main_cum(MAIN_NORMAL, cache)
+    assert result2["start_in"] == 100
+    assert result2["start_out"] == 30
+    assert result2["start_cached"] == 200
+
+
+def test_start_zero_when_no_assistant_events(tmp_path: Path) -> None:
+    """Empty jsonl (or one with no assistant events) → start_* are zeros,
+    so the table's start row renders "0 0 0" for a fresh session."""
+    jsonl = tmp_path / "empty.jsonl"
+    jsonl.write_text("")
+    cache = tmp_path / "main_start_empty.json"
+
+    result = compute_main_cum(jsonl, cache)
+
+    assert result["start_in"] == 0
+    assert result["start_out"] == 0
+    assert result["start_cached"] == 0
+
+
+def test_start_first_event_without_usage_skipped(tmp_path: Path) -> None:
+    """A leading assistant event with NO usage block contributes nothing —
+    the start triple is captured from the FIRST assistant event that HAS
+    usage, mirroring the context_tokens behavior
+    (test_context_tokens_assistant_without_usage)."""
+    jsonl = tmp_path / "start_no_usage.jsonl"
+    jsonl.write_text(
+        '{"type":"assistant","message":{"content":[]},"uuid":"u1"}\n'
+        '{"type":"assistant","message":{"content":[],"usage":{"input_tokens":100,'
+        '"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}},'
+        '"uuid":"u2"}\n'
+    )
+    cache = tmp_path / "main_start_nu.json"
+    result = compute_main_cum(jsonl, cache)
+
+    assert result["start_in"] == 100
+    assert result["start_out"] == 40
+    assert result["start_cached"] == 30
+
+
+def test_cache_hit_requires_start_fields(tmp_path: Path) -> None:
+    """Pre-start-row cache shape: both key parts match but the dict LACKS
+    the start_* fields. The field-presence guard must treat it as a MISS
+    and recompute (else the start row would render zeros for one cycle
+    after upgrade). Mirrors the context_tokens guard test above."""
+    cache = tmp_path / "main_old_schema_no_start.json"
+    # Intentionally WITHOUT the start_* fields (but WITH context_tokens,
+    # so only the start guard can trigger the miss).
+    cached = {
+        "cum_in": 111,
+        "cum_out": 222,
+        "cum_cache_create": 333,
+        "cum_cache_read": 444,
+        "context_tokens": 1050,
+        "last_uuid": MAIN_NORMAL_LAST_UUID,
+        "mtime_jsonl": MAIN_NORMAL.stat().st_mtime,
+        "tool_use_positions": {},
+        "task_notifications": {},
+    }
+    cache.write_text(json.dumps(cached))
+
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    # Recomputed, not the stale sentinels.
+    assert result["cum_in"] == 450
+    assert result["start_in"] == 100
+    assert result["start_out"] == 30
+    assert result["start_cached"] == 200
+    # Cache rewritten in the new shape.
+    on_disk = json.loads(cache.read_text())
+    assert on_disk["start_in"] == 100

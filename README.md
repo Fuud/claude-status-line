@@ -12,6 +12,7 @@ hook. Layout:
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a
 |          in     out   cached
+| start:   12k    1k    0
 | sum:     1.2M   35k   53.2M
 | main:    1.1M   30k   50.8M
 | [ok]    Review: implementation plan     12k    4k   100k
@@ -24,10 +25,13 @@ Line layout:
 - Line 1 — header (`Session: ...`)
 - Line 2 — table header (`in / out / cached`, each right-aligned under
   its own column)
-- Line 3 — `sum:` row aggregating main + every agent across all three
+- Line 3 — `start:` row with the FIRST assistant event's breakdown —
+  the session's baseline message. A reference row: not included in the
+  `sum:` aggregate.
+- Line 4 — `sum:` row aggregating main + every agent across all three
   columns (omitted if there are zero agents)
-- Line 4 — `main:` row with cumulative breakdown for the main session
-- Lines 5+ — one row per agent, each with three numeric cells:
+- Line 5 — `main:` row with cumulative breakdown for the main session
+- Lines 6+ — one row per agent, each with three numeric cells:
   input, output, cache-read. `cache_creation` tokens are tracked but
   NOT displayed.
 
@@ -85,10 +89,16 @@ Code's status-line hook configuration.
 
 Two cache files are persisted under `~/.claude/status_line/data/`:
 
-| File                | Invalidation key                       | Purpose                                |
-| ------------------- | -------------------------------------- | -------------------------------------- |
-| `main_<sid>.json`   | `last_uuid` (tail of main jsonl)       | cumulative token totals + tool_use ids |
-| `agents_<sid>.json` | `(last_uuid, mtime_jsonl, mtime_meta)` | per-agent render-ready snapshot dict   |
+| File                | Invalidation key                       | Purpose                                                    |
+| ------------------- | -------------------------------------- | ---------------------------------------------------------- |
+| `main_<sid>.json`   | `last_uuid` (tail of main jsonl)       | cumulative totals + first-message `start_*` + tool_use ids |
+| `agents_<sid>.json` | `(last_uuid, mtime_jsonl, mtime_meta)` | per-agent render-ready snapshot dict                       |
+
+Both main-cache field groups added after the first release
+(`context_tokens`, `start_in`/`start_out`/`start_cached`) are part of the
+cache-hit check: a pre-upgrade cache file that matches the key but lacks
+them is treated as a miss and rescanned once, then rewritten in the new
+shape.
 
 Each per-agent entry in `agents_<sid>.json` is keyed by `agentId` and
 holds the fields `last_uuid`, `mtime_jsonl`, `mtime_meta`, `status`,
@@ -133,10 +143,11 @@ cd ~/.claude/status_line
 python3 -m pytest tests/ -v
 ```
 
-119+ tests cover: pure functions (`format_tokens`, `detect_status`,
+210+ tests cover: pure functions (`format_tokens`, `detect_status`,
 `parse_stdin`), I/O helpers (`compute_main_cum`, `compute_agent_snapshot`,
-`find_session_dir`, `sort_agents`, `_write_agents_cache`), `render_output`,
-`main()` end-to-end against a real session fixture, and the bash wrapper.
+`find_session_dir`, `sort_agents`, `_write_agents_cache`), `render_output`
+(including the `start:` row), `main()` end-to-end against a real session
+fixture, and the bash wrapper.
 
 ### Real-session fixture
 

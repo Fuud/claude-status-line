@@ -92,11 +92,12 @@ def fake_home_with_real_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 # ---------------------------------------------------------------------------
-# 1. Real session → 42 lines (header + table header + sum + main + 38 agents)
+# 1. Real session → 43 lines (header + table header + start + sum + main + 38
+#    agents)
 # ---------------------------------------------------------------------------
 
 def test_real_session_38_agents(fake_home_with_real_session) -> None:
-    """Feed the real session through main(); expect 42 lines, presence of
+    """Feed the real session through main(); expect 43 lines, presence of
     [ok]/[err] tags, and 'Review implementation plan' as the first agent
     line (lowest toolUseId position in main jsonl).
 
@@ -118,15 +119,15 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
     )
     output = result.stdout.decode("utf-8")
     lines = output.splitlines()
-    # header + table header + sum + main + 38 agents = 42
-    assert len(lines) == 42, (
-        f"expected 42 lines, got {len(lines)}; first 5: {lines[:5]}; "
+    # header + table header + start + sum + main + 38 agents = 43
+    assert len(lines) == 43, (
+        f"expected 43 lines, got {len(lines)}; first 5: {lines[:5]}; "
         f"stderr: {result.stderr.decode('utf-8', 'replace')}"
     )
     # All three status tags must appear (real session covers ok/err/stop).
     assert "[ok]" in output, "expected at least one [ok] in output"
     assert "[err]" in output, "expected at least one [err] in output"
-    # Header / table header / sum / main lines have predictable prefixes
+    # Header / table header / start / sum / main lines have predictable prefixes
     assert lines[0].startswith("Session:"), f"line 0: {lines[0]!r}"
     # Table header line (the breakdown-table labels): contains all three labels
     # "in" / "out" / "cached", each right-aligned under its own column.
@@ -136,10 +137,11 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
     assert not lines[1].startswith("sum:"), (
         f"line 1 must be the table header, not the sum line: {lines[1]!r}"
     )
-    assert lines[2].startswith("| sum:"), f"line 2: {lines[2]!r}"
-    assert lines[3].startswith("| main:"), f"line 3: {lines[3]!r}"
+    assert lines[2].startswith("| start:"), f"line 2: {lines[2]!r}"
+    assert lines[3].startswith("| sum:"), f"line 3: {lines[3]!r}"
+    assert lines[4].startswith("| main:"), f"line 4: {lines[4]!r}"
     # All agent lines start with the table prefix + a bracketed status tag
-    for line in lines[4:]:
+    for line in lines[5:]:
         assert line.startswith("| ["), f"agent line missing status tag: {line!r}"
     # The first agent in the output should be the one with the LOWEST
     # tool_use position in main jsonl. In the f5044e4f session that's
@@ -148,7 +150,7 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
     # assertion "Task 1 first" assumed Task 1 was at position 0; the real
     # session has Agent_61/62/... before Agent_103. We check for the actual
     # first-sorted agent instead.
-    first_agent = lines[4]
+    first_agent = lines[5]
     assert "Review implementation plan" in first_agent, (
         f"first agent should be 'Review implementation plan' (lowest toolUseId "
         f"in main jsonl), got: {first_agent!r}"
@@ -376,9 +378,9 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
     )
     first_output = first.stdout.decode("utf-8")
     first_lines = first_output.splitlines()
-    assert len(first_lines) == 42, (
-        f"first call should produce 42 lines (header + table header + sum + "
-        f"main + 38 agents), got {len(first_lines)}; first 3: {first_lines[:3]}"
+    assert len(first_lines) == 43, (
+        f"first call should produce 43 lines (header + table header + start + "
+        f"sum + main + 38 agents), got {len(first_lines)}; first 3: {first_lines[:3]}"
     )
 
     # Sanity: the agents cache file must exist after the first call.
@@ -394,8 +396,8 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
     )
     second_output = second.stdout.decode("utf-8")
     second_lines = second_output.splitlines()
-    assert len(second_lines) == 42, (
-        f"second call should also produce 42 lines (cache-hit path), "
+    assert len(second_lines) == 43, (
+        f"second call should also produce 43 lines (cache-hit path), "
         f"got {len(second_lines)}; first 3: {second_lines[:3]}; "
         f"this indicates compute_agent_snapshot cache-hit is missing agentId "
         f"and _write_agents_cache raised KeyError, which main() swallowed "
@@ -804,6 +806,9 @@ _DIRLESS_MAIN_LINES = [
 # Expected aggregates: cum_in=1800 → "2k", cum_out=150 → "150",
 # cum_cache_read=4000 → "4k"; last-event occupancy 800+0+1000=1800 → "2K (1%)".
 _DIRLESS_EXPECTED_CELLS = ["2k", "150", "4k"]
+# First event breakdown (the "start:" row): in=1000 → "1k", out=100 → "100",
+# cache_read=3000 → "3k".
+_DIRLESS_EXPECTED_START_CELLS = ["1k", "100", "3k"]
 
 
 def _build_dirless_session(tmp_path: Path, sid: str) -> Path:
@@ -820,8 +825,8 @@ def test_dirless_session_via_transcript_path_renders_main_row(
     tmp_path: Path,
 ) -> None:
     """No `<sid>/` dir; payload carries transcript_path → table header +
-    main row render (no sum row, no agent rows), values from the jsonl,
-    Context from the jsonl fallback."""
+    start row + main row render (no sum row, no agent rows), values from
+    the jsonl, Context from the jsonl fallback."""
     jsonl = _build_dirless_session(tmp_path, DIRLESS_SID)
     stdin = json.dumps({
         "session_id": DIRLESS_SID,
@@ -833,12 +838,18 @@ def test_dirless_session_via_transcript_path_renders_main_row(
 
     assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
     lines = result.stdout.decode("utf-8").splitlines()
-    assert len(lines) == 3, f"expected 3 lines (header, labels, main): {lines!r}"
-    header, labels, main = lines
+    assert len(lines) == 4, (
+        f"expected 4 lines (header, labels, start, main): {lines!r}"
+    )
+    header, labels, start, main = lines
     # Context falls back to jsonl-derived occupancy of the LAST event.
     assert header.endswith("| Context: 2K (1%)"), f"header: {header!r}"
     # "| " table-row prefix, then the three labels
     assert labels.split() == ["|", "in", "out", "cached"], f"labels: {labels!r}"
+    # start row carries the FIRST event's breakdown.
+    start_cells = start.split()
+    assert start_cells[:2] == ["|", "start:"], f"start row: {start!r}"
+    assert start_cells[2:] == _DIRLESS_EXPECTED_START_CELLS, f"start row: {start!r}"
     cells = main.split()
     assert cells[:2] == ["|", "main:"], f"main row: {main!r}"
     assert cells[2:] == _DIRLESS_EXPECTED_CELLS, f"main row: {main!r}"
@@ -855,9 +866,10 @@ def test_dirless_session_via_glob_renders_main_row(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
     lines = result.stdout.decode("utf-8").splitlines()
-    assert len(lines) == 3, f"expected 3 lines: {lines!r}"
+    assert len(lines) == 4, f"expected 4 lines: {lines!r}"
     assert lines[0].endswith("| Context: 2K (1%)"), f"header: {lines[0]!r}"
-    assert lines[2].split()[2:] == _DIRLESS_EXPECTED_CELLS, f"main: {lines[2]!r}"
+    assert lines[2].split()[2:] == _DIRLESS_EXPECTED_START_CELLS, f"start: {lines[2]!r}"
+    assert lines[3].split()[2:] == _DIRLESS_EXPECTED_CELLS, f"main: {lines[3]!r}"
 
 
 def test_dirless_session_skips_agents_cache_write(tmp_path: Path) -> None:
