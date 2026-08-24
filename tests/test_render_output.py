@@ -547,15 +547,17 @@ def test_table_header_row() -> None:
     assert not table_header.startswith("main:")
 
     # The table header has exactly the three labels separated by single
-    # spaces, each right-aligned to the column width. We can verify by
-    # reconstructing what the renderer would produce, using the
-    # production _col_width helper (so the test tracks the formula
-    # rather than recomputing it).
+    # spaces, each right-aligned to the column width, padded on the left
+    # by `w_desc` spaces so the labels line up with the cells in the
+    # rows below. We can verify by reconstructing what the renderer would
+    # produce, using the production _col_width helper (so the test tracks
+    # the formula rather than recomputing it).
     in_width = _col_width([50000, 1000], "in")
     out_width = _col_width([200, 0], "out")
     cached_width = _col_width([700, 0], "cached")
+    w_desc = max(len(a["description"]) for a in agents)
     expected_table_header = (
-        f"{'in':>{in_width}} {'out':>{out_width}} {'cached':>{cached_width}}"
+        f"{' ' * w_desc}{'in':>{in_width}} {'out':>{out_width}} {'cached':>{cached_width}}"
     )
     assert table_header == expected_table_header, (
         f"table header mismatch: got {table_header!r}, expected "

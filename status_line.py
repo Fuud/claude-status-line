@@ -896,8 +896,10 @@ def render_output(
     ("1.2M") expand independently.
 
     Description is truncated to 40 chars with U+2026 by _truncate_description
-    (re-applied here for defense-in-depth). The description column itself
-    is NOT padded — only the numeric columns are right-aligned.
+    (re-applied here for defense-in-depth). The description column IS
+    padded to the longest description in the current agent list so all
+    numeric columns land at the same x-position across rows and align
+    with the table header above.
 
     Agents are NEVER skipped: a run-agent renders its current breakdown
     values (not None), and an agent with no breakdown data renders three
@@ -913,10 +915,16 @@ def render_output(
     agent_in: list[int] = []
     agent_out: list[int] = []
     agent_cached: list[int] = []
+    descriptions: list[str] = []
     for a in agents:
         agent_in.append(int(a.get("tokens_in") or 0))
         agent_out.append(int(a.get("tokens_out") or 0))
         agent_cached.append(int(a.get("tokens_cached") or 0))
+        # Defensive truncation: callers already truncate to 40, but
+        # render_output is the final formatter and shouldn't trust
+        # upstream. Re-apply so a buggy or future caller can't blow up
+        # the column layout.
+        descriptions.append(_truncate_description(a.get("description", "") or ""))
 
     in_col = [main_in, *agent_in]
     out_col = [main_out, *agent_out]
@@ -929,10 +937,19 @@ def render_output(
     w_out = _col_width(out_col, "out")
     w_cached = _col_width(cached_col, "cached")
 
+    # Description column width: padded to the longest description in the
+    # current agent list. Without this, the numeric columns shift right
+    # on rows with shorter descriptions and the table header stops
+    # aligning with the cells. Computed BEFORE assembling lines so the
+    # header can include the same padding.
+    w_desc = max((len(d) for d in descriptions), default=0)
+
     # 3. Assemble lines.
     lines: list[str] = [header]
+    # Table header — `w_desc` spaces on the left so the `in/out/cached`
+    # labels land at the same x-position as the cells in the rows below.
     lines.append(
-        f"{'in':>{w_in}} {'out':>{w_out}} {'cached':>{w_cached}}"
+        f"{' ' * w_desc}{'in':>{w_in}} {'out':>{w_out}} {'cached':>{w_cached}}"
     )
 
     if agents:
@@ -951,17 +968,13 @@ def render_output(
         f"{format_tokens(main_cached):>{w_cached}}"
     )
 
-    for agent, in_v, out_v, cached_v in zip(agents, agent_in, agent_out, agent_cached):
+    for agent, description, in_v, out_v, cached_v in zip(
+        agents, descriptions, agent_in, agent_out, agent_cached
+    ):
         status = agent.get("status", "run")
         icon = f"[{status}]" if status in _STATUSES else "[?]"
-        description = agent.get("description", "") or ""
-        # Defensive truncation: callers already truncate to 40, but
-        # render_output is the final formatter and shouldn't trust
-        # upstream. Re-apply so a buggy or future caller can't blow up
-        # the column layout.
-        description = _truncate_description(description)
         lines.append(
-            f"{icon}{_STATUS_GAP}{description}{_DESC_TOKEN_GAP}"
+            f"{icon}{_STATUS_GAP}{description:<{w_desc}}{_DESC_TOKEN_GAP}"
             f"{format_tokens(in_v):>{w_in}} "
             f"{format_tokens(out_v):>{w_out}} "
             f"{format_tokens(cached_v):>{w_cached}}"
