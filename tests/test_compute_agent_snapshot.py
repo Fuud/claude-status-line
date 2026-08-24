@@ -5,8 +5,9 @@ dict for a single subagent: agentId, status, tokens, description, toolUseId,
 last_uuid, mtime_jsonl, mtime_meta.
 
 Cache semantics:
-- If `cache_entry` (a dict) is provided and its last_uuid + mtime_jsonl match
-  the current jsonl state → return the cache_entry unchanged (cache hit).
+- If `cache_entry` (a dict) is provided and its last_uuid + mtime_jsonl +
+  mtime_meta all match the current file state → return the cache_entry
+  unchanged (cache hit).
 - Otherwise → re-parse the jsonl, compute fields fresh, and return.
 
 The function does NOT write any cache file — the caller (orchestrator) owns
@@ -17,26 +18,22 @@ Spec: see docs/plans/20260824-status-line-tokens-aggregation.md (Task 4).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-
-import pytest
 
 from status_line import compute_agent_snapshot
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
-# All fixture jsonl/meta paths referenced in tests.
+# Fixture jsonl paths used across multiple tests.
 AGENT_OK = FIXTURES_DIR / "agent_ok.jsonl"
 AGENT_ERR_RATE_LIMIT = FIXTURES_DIR / "agent_err_rate_limit.jsonl"
-AGENT_ERR_SERVER_ERROR = FIXTURES_DIR / "agent_err_server_error.jsonl"
 AGENT_STOPPED_USER = FIXTURES_DIR / "agent_stopped_user.jsonl"
 AGENT_RUNNING = FIXTURES_DIR / "agent_running.jsonl"
-AGENT_NO_ASSISTANT = FIXTURES_DIR / "agent_no_assistant.jsonl"
 
 META_NORMAL = FIXTURES_DIR / "meta_normal.json"
 META_STOPPED_BY_USER = FIXTURES_DIR / "meta_stopped_by_user.json"
-META_LONG_DESCRIPTION = FIXTURES_DIR / "meta_long_description.json"
 
 
 def _agent_id(jsonl_path: Path) -> str:
@@ -100,7 +97,9 @@ def test_agent_err_rate_limit() -> None:
 def test_agent_err_server_error() -> None:
     """agent_err_server_error.jsonl → status="err", tokens from last assistant."""
     result = compute_agent_snapshot(
-        AGENT_ERR_SERVER_ERROR, META_NORMAL, cache_entry=None
+        FIXTURES_DIR / "agent_err_server_error.jsonl",
+        META_NORMAL,
+        cache_entry=None,
     )
 
     assert result["status"] == "err"
@@ -124,27 +123,16 @@ def test_agent_stopped_user() -> None:
 
 
 def test_agent_running() -> None:
-    """agent_running.jsonl + meta_normal.json → status='run', tokens=None
-    because the last event is an assistant with stop_reason=tool_use
-    (still mid-flow), BUT it has usage so tokens will be computed.
+    """agent_running.jsonl + meta_normal.json → status='run', tokens=None.
 
-    Per task spec: 'tokens=None for status=run' is the rule, but actually the
-    spec says 'None (since last event is tool_use, not a final assistant)'.
-    We follow the spec literally — when status=run, tokens=None even if usage
-    exists in the last assistant event.
-
-    Wait: re-reading task spec — it says 'last_event is tool_use, not a final
-    assistant' which is wrong (the last event IS an assistant with stop_reason=
-    tool_use). Per the rule 'tokens=None for status=run', we expect None.
-
-    Decision: status='run' → tokens=None per spec literal reading.
+    Decision: status='run' → tokens=None per task spec. Even though the
+    last assistant event has usage data, mid-flow status blanks tokens.
     """
     result = compute_agent_snapshot(
         AGENT_RUNNING, META_NORMAL, cache_entry=None
     )
 
     assert result["status"] == "run"
-    # Per task spec: status='run' → tokens=None
     assert result["tokens"] is None
 
 
@@ -157,7 +145,9 @@ def test_agent_no_assistant() -> None:
     signal that the agent never produced output.
     """
     result = compute_agent_snapshot(
-        AGENT_NO_ASSISTANT, META_NORMAL, cache_entry=None
+        FIXTURES_DIR / "agent_no_assistant.jsonl",
+        META_NORMAL,
+        cache_entry=None,
     )
 
     assert result["status"] == "err"
@@ -188,13 +178,11 @@ def test_meta_long_description_truncated() -> None:
     """agent_ok.jsonl + meta_long_description.json (60 chars) → description
     is 40 chars long, ends with U+2026 '…', first 39 chars match original.
     """
-    # Load the original description to compare.
-    original = json.loads(META_LONG_DESCRIPTION.read_text())["description"]
+    meta_path = FIXTURES_DIR / "meta_long_description.json"
+    original = json.loads(meta_path.read_text())["description"]
     assert len(original) == 60
 
-    result = compute_agent_snapshot(
-        AGENT_OK, META_LONG_DESCRIPTION, cache_entry=None
-    )
+    result = compute_agent_snapshot(AGENT_OK, meta_path, cache_entry=None)
 
     desc = result["description"]
     assert len(desc) == 40
@@ -204,20 +192,7 @@ def test_meta_long_description_truncated() -> None:
 
 
 def test_meta_missing_fallback() -> None:
-    """agent_ok.jsonl + non-existent meta path → description falls back to
-    agentType ('general-purpose' from meta_normal.json semantics), status
-    still computed from last_event.
-
-    For this test we pass a meta path that doesn't exist, but we can't pass
-    a real meta dict with agentType — the function reads from disk. So we
-    fabricate a meta.json with empty description but agentType set, then
-    delete it before passing the path. Actually simpler: use a non-existent
-    path and verify fallback to 'unknown' when nothing can be loaded.
-
-    Better approach: write a meta file with agentType and empty description
-    → fallback to agentType='<from file>'. Plus a separate assertion path
-    for completely missing file → fallback to 'unknown'.
-    """
+    """Missing meta or empty description → fallback to agentType, then 'unknown'."""
     # Case 1: meta file with empty description but valid agentType.
     meta_with_type = FIXTURES_DIR / "_meta_empty_desc.json"
     meta_with_type.write_text(json.dumps({
@@ -366,7 +341,6 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
     }))
     # Force a clearly newer mtime (1.5s in the future to dodge FS resolution).
     future_mtime = mtime_meta_v1 + 5.0
-    import os
     os.utime(work_meta, (future_mtime, future_mtime))
 
     # Second call: cache should miss because mtime_meta changed.

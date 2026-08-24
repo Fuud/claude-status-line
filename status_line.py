@@ -70,32 +70,40 @@ def _is_assistant_error(last_event: dict) -> bool:
     return False
 
 
+_INTERRUPT_MARKER = "Request interrupted by user"
+
+
+def _content_contains_marker(content: object, needle: str) -> bool:
+    """Return True if `needle` appears anywhere in `content` (string,
+    list-of-text-blocks, or list-of-tool_result-blocks-with-nested-content)."""
+    if isinstance(content, str):
+        return needle in content
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text") or block.get("content")
+        if isinstance(text, str) and needle in text:
+            return True
+        inner = block.get("content")
+        if isinstance(inner, list):
+            for sub in inner:
+                if not isinstance(sub, dict):
+                    continue
+                t = sub.get("text") or sub.get("content")
+                if isinstance(t, str) and needle in t:
+                    return True
+    return False
+
+
 def _is_user_interrupted(last_event: dict) -> bool:
     """True if last_event is a user event with the 'Request interrupted'
     marker somewhere in its content (string or list-of-blocks form)."""
     if last_event.get("type") != "user":
         return False
     msg = last_event.get("message", {}) or {}
-    content = msg.get("content")
-    needle = "Request interrupted by user"
-    if isinstance(content, str):
-        return needle in content
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            text = block.get("text") or block.get("content")
-            if isinstance(text, str) and needle in text:
-                return True
-            # tool_result blocks — content may be nested list of dicts
-            inner = block.get("content")
-            if isinstance(inner, list):
-                for sub in inner:
-                    if isinstance(sub, dict):
-                        t = sub.get("text") or sub.get("content")
-                        if isinstance(t, str) and needle in t:
-                            return True
-    return False
+    return _content_contains_marker(msg.get("content"), _INTERRUPT_MARKER)
 
 
 def _is_assistant_end_turn(last_event: dict) -> bool:
@@ -150,6 +158,13 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
+# Module-level cache for _get_branch — tuple (monotonic_ts, branch_str).
+# Avoids a subprocess spawn on every parse_stdin call; invalidated every
+# _BRANCH_CACHE_TTL seconds, which is plenty for status-line cadence.
+_branch_cache: tuple[float, str] | None = None
+_BRANCH_CACHE_TTL = 5.0  # seconds
+
+
 def _get_branch() -> str:
     """Return current git branch (empty string on any error or non-git cwd).
 
@@ -158,17 +173,13 @@ def _get_branch() -> str:
     subprocess spawn on every parse_stdin call while still tracking
     branch switches promptly.
     """
+    global _branch_cache
     now = time.monotonic()
-    cached = _get_branch._cache  # type: ignore[attr-defined]
-    if cached is not None and (now - cached[0]) < _BRANCH_CACHE_TTL:
-        return cached[1]
+    if _branch_cache is not None and (now - _branch_cache[0]) < _BRANCH_CACHE_TTL:
+        return _branch_cache[1]
     branch = _get_branch_impl()
-    _get_branch._cache = (now, branch)  # type: ignore[attr-defined]
+    _branch_cache = (now, branch)
     return branch
-
-
-_get_branch._cache = None  # type: ignore[attr-defined]
-_BRANCH_CACHE_TTL = 5.0  # seconds
 
 
 def _get_branch_impl() -> str:
@@ -293,10 +304,9 @@ def _read_last_event(
     last_assistant: dict | None = None
     last_event: dict | None = None
     for raw in reversed(lines):
-        try:
-            line = raw.decode("utf-8", errors="replace").strip()
-        except Exception:
-            continue
+        # errors="replace" cannot raise; bare decode would only on TypeError
+        # for a non-bytes input, which readlines() never returns.
+        line = raw.decode("utf-8", errors="replace").strip()
         if not line or not line.startswith("{"):
             continue
         try:
@@ -313,6 +323,20 @@ def _read_last_event(
         if last_event is not None and last_assistant is not None:
             break
     return (last_assistant, last_event)
+
+
+def _sum_usage(usage: dict) -> int:
+    """Sum the four token counters from a `usage` dict.
+
+    Returns input + output + cache_creation + cache_read. Coerces each
+    value through `int(... or 0)` so missing/None values count as 0.
+    """
+    return (
+        int(usage.get("input_tokens", 0) or 0)
+        + int(usage.get("output_tokens", 0) or 0)
+        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+        + int(usage.get("cache_read_input_tokens", 0) or 0)
+    )
 
 
 def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, int], str]:
@@ -379,9 +403,45 @@ def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, in
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Write `payload` to `path` atomically via a sibling .tmp + os.replace."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _load_dict_cache(path: Path) -> dict:
+    """Load a JSON-dict cache from `path`. Returns {} on any failure
+    (missing file, OSError, malformed JSON, non-dict payload) — broken
+    caches are unlinked to ensure a clean rebuild on the next write.
+    """
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return {}
+    if isinstance(loaded, dict):
+        return loaded
+    # defensive: valid JSON but not a dict → delete and start fresh
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return {}
+
+
+_EMPTY_MAIN_RESULT: dict = {
+    "cum_in": 0,
+    "cum_out": 0,
+    "cum_cache_create": 0,
+    "cum_cache_read": 0,
+    "total": 0,
+    "last_uuid": "",
+    "tool_use_positions": {},
+}
 
 
 def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
@@ -407,75 +467,46 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     but valid result instead of raising, honoring the "never break the
     parent session" contract documented in the plan.
     """
-    empty_result = {
-        "cum_in": 0,
-        "cum_out": 0,
-        "cum_cache_create": 0,
-        "cum_cache_read": 0,
-        "total": 0,
-        "last_uuid": "",
-        "tool_use_positions": {},
+    if not jsonl_path.exists():
+        return dict(_EMPTY_MAIN_RESULT)
+
+    # _load_dict_cache unlinks the file on its own failure paths, so the
+    # result is always either a valid dict or {} (never a malformed file).
+    cache = _load_dict_cache(cache_path)
+
+    # Forward-scan the jsonl — authoritative source for last_uuid and
+    # totals in a single pass.
+    cum_in, cum_out, cum_cache_create, cum_cache_read, positions, last_uuid = (
+        _scan_main_jsonl(jsonl_path)
+    )
+
+    # Cache hit?
+    if (
+        cache is not None
+        and last_uuid
+        and cache.get("last_uuid") == last_uuid
+    ):
+        return cache
+
+    result = {
+        "cum_in": cum_in,
+        "cum_out": cum_out,
+        "cum_cache_create": cum_cache_create,
+        "cum_cache_read": cum_cache_read,
+        "total": cum_in + cum_out + cum_cache_create + cum_cache_read,
+        "last_uuid": last_uuid,
+        "tool_use_positions": positions,
     }
 
-    if not jsonl_path.exists():
-        return dict(empty_result)
-
+    # Atomic write to cache. If write fails (disk full, read-only dir),
+    # still return the just-computed result — degrading to a no-cache run
+    # is better than throwing away correct values we have in hand.
     try:
-        # 1. Try to load cache.
-        cache: dict | None = None
-        if cache_path.exists():
-            try:
-                loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    cache = loaded
-                else:
-                    # defensive: cache is JSON but not a dict → delete and recompute
-                    try:
-                        cache_path.unlink()
-                    except OSError:
-                        pass
-            except json.JSONDecodeError:
-                # broken cache → delete and recompute
-                try:
-                    cache_path.unlink()
-                except OSError:
-                    pass
-
-        # 2. Forward-scan the jsonl — authoritative source for last_uuid
-        # and totals in a single pass. We previously tail-scanned first to
-        # short-circuit cache hits cheaply, but the forward scan is
-        # dominant on cache miss, so we run it once.
-        cum_in, cum_out, cum_cache_create, cum_cache_read, positions, last_uuid = (
-            _scan_main_jsonl(jsonl_path)
-        )
-
-        # 3. Cache hit?
-        if (
-            cache is not None
-            and last_uuid
-            and cache.get("last_uuid") == last_uuid
-        ):
-            return cache
-
-        result = {
-            "cum_in": cum_in,
-            "cum_out": cum_out,
-            "cum_cache_create": cum_cache_create,
-            "cum_cache_read": cum_cache_read,
-            "total": cum_in + cum_out + cum_cache_create + cum_cache_read,
-            "last_uuid": last_uuid,
-            "tool_use_positions": positions,
-        }
-
-        # 4. Atomic write to cache.
         _atomic_write_json(cache_path, result)
-
-        return result
     except OSError:
-        # I/O failure (read error, write error, permission denied).
-        # Return whatever we can — degraded result is better than raising
-        # into the Claude Code status-line hook.
-        return dict(empty_result)
+        pass
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -504,15 +535,9 @@ def _truncate_description(s: str) -> str:
 
 
 def _load_meta_dict(meta_path: Path) -> dict:
-    """Read meta_path as JSON; return {} on any failure (missing file,
-    OSError, malformed JSON, non-dict payload)."""
-    try:
-        loaded = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return {}
-    if isinstance(loaded, dict):
-        return loaded
-    return {}
+    """Read meta_path as a JSON dict; return {} on any failure (missing
+    file, OSError, malformed JSON, non-dict payload)."""
+    return _load_dict_cache(meta_path)
 
 
 def compute_agent_snapshot(
@@ -543,10 +568,7 @@ def compute_agent_snapshot(
     what detect_status would return. See module-level note above.
     """
     # 1. mtime_jsonl (0.0 if missing).
-    try:
-        mtime_jsonl = jsonl_path.stat().st_mtime
-    except OSError:
-        mtime_jsonl = 0.0
+    mtime_jsonl = _jsonl_mtime(jsonl_path)
 
     # 2. Last assistant event AND last event of any type — both extracted
     # from a single reverse pass via _read_last_event. The assistant
@@ -565,7 +587,7 @@ def compute_agent_snapshot(
     last_uuid_for_compare: str | None = (
         last_event.get("uuid") if last_event else None
     )
-    if cache_entry is not None and isinstance(cache_entry, dict):
+    if cache_entry is not None:
         if (
             cache_entry.get("last_uuid") == last_uuid_for_compare
             and cache_entry.get("mtime_jsonl") == mtime_jsonl
@@ -600,15 +622,7 @@ def compute_agent_snapshot(
     else:
         msg = last_event.get("message") or {}
         usage = msg.get("usage") if isinstance(msg, dict) else None
-        if isinstance(usage, dict):
-            tokens = (
-                int(usage.get("input_tokens", 0) or 0)
-                + int(usage.get("output_tokens", 0) or 0)
-                + int(usage.get("cache_creation_input_tokens", 0) or 0)
-                + int(usage.get("cache_read_input_tokens", 0) or 0)
-            )
-        else:
-            tokens = None
+        tokens = _sum_usage(usage) if isinstance(usage, dict) else None
 
     # description — meta.description, fallback to meta.agentType, then
     # "unknown". Truncate to 40 chars with U+2026 if longer.
@@ -619,15 +633,13 @@ def compute_agent_snapshot(
 
     tool_use_id = meta.get("toolUseId") or ""
 
-    last_uuid = last_uuid_for_compare
-
     return {
         "agentId": agent_id,
         "status": status,
         "tokens": tokens,
         "description": description,
         "toolUseId": tool_use_id,
-        "last_uuid": last_uuid,
+        "last_uuid": last_uuid_for_compare,
         "mtime_jsonl": mtime_jsonl,
         "mtime_meta": mtime_meta_for_compare,
     }
@@ -637,6 +649,14 @@ def _meta_mtime(meta_path: Path) -> float:
     """Return meta_path.st_mtime, or 0.0 if missing/unstat'able."""
     try:
         return meta_path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _jsonl_mtime(jsonl_path: Path) -> float:
+    """Return jsonl_path.st_mtime, or 0.0 if missing/unstat'able."""
+    try:
+        return jsonl_path.stat().st_mtime
     except OSError:
         return 0.0
 
@@ -730,6 +750,9 @@ _TOKEN_COLUMN_WIDTH = 7
 _STATUS_GAP = "  "
 # Gap between the description column and the token column (2 spaces).
 _DESC_TOKEN_GAP = "  "
+# Recognized agent statuses — single source of truth for render_output's
+# validation and the module docstring's promise.
+_STATUSES = ("ok", "run", "err", "stop")
 
 
 def render_output(header: str, main_total: int, agents: list) -> str:
@@ -762,7 +785,7 @@ def render_output(header: str, main_total: int, agents: list) -> str:
         status = agent.get("status", "run")
         # ASCII status tag: "[<status>]" — derived inline from the status
         # value. Unknown statuses surface as "[?]" rather than failing.
-        icon = f"[{status}]" if status in ("ok", "run", "err", "stop") else "[?]"
+        icon = f"[{status}]" if status in _STATUSES else "[?]"
         description = agent.get("description", "") or ""
         # Defensive truncation: callers (compute_agent_snapshot) already
         # truncate to 40, but render_output is the final formatter and
@@ -833,19 +856,73 @@ def main() -> int:
         return 0
 
 
-def _main_unsafe() -> int:
-    """Internal implementation — assumes the caller (main) wraps OSError.
-    See main() docstring for the never-crash contract."""
-    input_str = sys.stdin.read()
-    parsed = parse_stdin(input_str)
-    session_id = parsed.get("session_id", "") or ""
-
-    header = (
-        f"Session: {session_id} | "
+def _build_header(parsed: dict) -> str:
+    """Build the single header line from a parsed stdin dict."""
+    sid = parsed.get("session_id", "") or ""
+    return (
+        f"Session: {sid} | "
         f"Branch: {parsed['branch']} | "
         f"Model: {parsed['model']} | "
         f"User: {parsed['user']}"
     )
+
+
+def _data_dir() -> Path | None:
+    """Ensure ~/.claude/status_line/data exists. Returns None if mkdir fails."""
+    data_dir = Path.home() / ".claude" / "status_line" / "data"
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir
+    except OSError:
+        return None
+
+
+def _cache_path(data_dir: Path | None, name: str, session_id: str) -> Path:
+    """Return the cache path for `name` (e.g. "main", "agents"). If data_dir
+    is None, returns /dev/null so writes go nowhere and reads always miss."""
+    if data_dir is None:
+        return Path(os.devnull)
+    return data_dir / f"{name}_{session_id}.json"
+
+
+def _compute_agents(session_dir: Path, agents_cache_path: Path) -> list:
+    """Build per-agent snapshots for every agent-*.jsonl under session_dir,
+    using agents_cache_path as the source of stale cache entries."""
+    agents: list = []
+    agents_cache = _load_dict_cache(agents_cache_path)
+    subagents_dir = session_dir / "subagents"
+    if not subagents_dir.exists():
+        return agents
+    for jsonl_path in sorted(subagents_dir.glob("agent-*.jsonl")):
+        agent_id = jsonl_path.stem
+        meta_path = jsonl_path.parent / f"{agent_id}.meta.json"
+        cache_entry = agents_cache.get(agent_id)
+        snapshot = compute_agent_snapshot(jsonl_path, meta_path, cache_entry)
+        agents.append(snapshot)
+    return agents
+
+
+def _write_agents_cache(agents_cache_path: Path, agents: list) -> None:
+    """Persist the per-agent cache atomically. Drops transient/derivable
+    fields; keeps the keys listed in _AGENT_CACHE_FIELDS."""
+    new_cache = {
+        a["agentId"]: {k: a.get(k) for k in _AGENT_CACHE_FIELDS}
+        for a in agents
+    }
+    try:
+        _atomic_write_json(agents_cache_path, new_cache)
+    except OSError:
+        # Cache write failure is non-fatal — output is still correct,
+        # just slower next invocation.
+        pass
+
+
+def _main_unsafe() -> int:
+    """Internal implementation — assumes the caller (main) wraps OSError.
+    See main() docstring for the never-crash contract."""
+    parsed = parse_stdin(sys.stdin.read())
+    session_id = parsed.get("session_id", "") or ""
+    header = _build_header(parsed)
 
     if not session_id:
         # empty session_id → header only, exit 0
@@ -858,66 +935,18 @@ def _main_unsafe() -> int:
         print(header)
         return 0
 
-    # cache lives under ~/.claude/status_line/data/<sid>.json
-    data_dir: Path | None = Path.home() / ".claude" / "status_line" / "data"
-    try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        # If we can't create the data dir, fall through to a no-cache run —
-        # we'll still produce correct output, just slower next time.
-        data_dir = None
-
-    def _cache_path(name: str) -> Path:
-        if data_dir is None:
-            return Path(os.devnull)  # writes go nowhere; reads always miss
-        return data_dir / f"{name}_{session_id}.json"
+    data_dir = _data_dir()
+    main_cache = _cache_path(data_dir, "main", session_id)
+    agents_cache = _cache_path(data_dir, "agents", session_id)
 
     # main jsonl lives as a SIBLING of session_dir (see deviation note above)
     main_jsonl = session_dir.parent / f"{session_id}.jsonl"
-    main_cum = compute_main_cum(main_jsonl, _cache_path("main"))
+    main_cum = compute_main_cum(main_jsonl, main_cache)
 
-    agents: list = []
-    subagents_dir = session_dir / "subagents"
-    if subagents_dir.exists():
-        # Load existing per-agent cache (if any) to feed into snapshots.
-        agents_cache: dict = {}
-        agents_cache_path = _cache_path("agents")
-        if agents_cache_path.exists():
-            try:
-                loaded = json.loads(agents_cache_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    agents_cache = loaded
-                else:
-                    try:
-                        agents_cache_path.unlink()
-                    except OSError:
-                        pass
-            except (json.JSONDecodeError, OSError, ValueError):
-                # broken cache → start fresh; will be overwritten below
-                agents_cache = {}
-
-        for jsonl_path in sorted(subagents_dir.glob("agent-*.jsonl")):
-            agent_id = jsonl_path.stem
-            meta_path = jsonl_path.parent / f"{agent_id}.meta.json"
-            cache_entry = agents_cache.get(agent_id)
-            snapshot = compute_agent_snapshot(jsonl_path, meta_path, cache_entry)
-            agents.append(snapshot)
-
-        # Persist per-agent cache atomically. Keep only the fields we need
-        # for invalidation + rendering; drop transient/derivable data.
-        new_cache = {
-            a["agentId"]: {k: a.get(k) for k in _AGENT_CACHE_FIELDS}
-            for a in agents
-        }
-        try:
-            _atomic_write_json(agents_cache_path, new_cache)
-        except OSError:
-            # Cache write failure is non-fatal — output is still correct,
-            # just slower next invocation.
-            pass
+    agents = _compute_agents(session_dir, agents_cache)
+    _write_agents_cache(agents_cache, agents)
 
     agents = sort_agents(agents, main_cum.get("tool_use_positions", {}))
-
     output = render_output(header, main_cum.get("total", 0), agents)
     print(output)
     return 0

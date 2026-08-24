@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from status_line import parse_stdin, _get_branch, _get_branch_impl
+import status_line
 
 
 VALID_PAYLOAD = json.dumps(
@@ -50,7 +51,7 @@ VALID_PAYLOAD = json.dumps(
 def test_valid_json_extracts_all_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset _get_branch cache so we get a fresh subprocess call, and
     chdir to a non-git dir so it returns '' deterministically."""
-    _get_branch._cache = None
+    status_line._branch_cache = None
     monkeypatch.chdir(tmp_path)
     result = parse_stdin(VALID_PAYLOAD)
     assert result["session_id"] == "abc"
@@ -127,7 +128,7 @@ def test_empty_object_uses_all_defaults(tmp_path: Path, monkeypatch: pytest.Monk
 def test_branch_empty_when_not_in_git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """In a non-git directory, branch should be ""."""
     monkeypatch.chdir(tmp_path)
-    _get_branch._cache = None  # bypass TTL cache for deterministic test
+    status_line._branch_cache = None  # bypass TTL cache for deterministic test
     result = parse_stdin(VALID_PAYLOAD)
     assert result["branch"] == ""
 
@@ -151,7 +152,7 @@ def test_non_string_fields_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 def test_get_branch_caches_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Subsequent calls within TTL hit the cache and don't re-invoke git."""
-    _get_branch._cache = None
+    status_line._branch_cache = None
     call_count = {"n": 0}
 
     def fake_impl() -> str:
@@ -175,7 +176,7 @@ def test_get_branch_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     _get_branch doesn't itself hang past the test timeout (we cap the test
     at 5 seconds via pytest's timeout).
     """
-    _get_branch._cache = None
+    status_line._branch_cache = None
 
     def slow_impl() -> str:
         # simulate a slow git by sleeping longer than the cache TTL
@@ -193,8 +194,8 @@ def test_get_branch_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_get_branch_handles_subprocess_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     """_get_branch_impl returning "" propagates correctly (non-git repo)."""
-    _get_branch._cache = None
+    status_line._branch_cache = None
     monkeypatch.setattr("status_line._get_branch_impl", lambda: "")
     assert _get_branch() == ""
     # and the cache should hold the empty string, not None
-    assert _get_branch._cache[1] == ""
+    assert status_line._branch_cache is not None and status_line._branch_cache[1] == ""

@@ -19,15 +19,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from status_line import compute_main_cum
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 MAIN_NORMAL = FIXTURES_DIR / "main_normal.jsonl"
 MAIN_TOOL_USE = FIXTURES_DIR / "main_with_tool_use.jsonl"
-AGENT_NO_ASSISTANT = FIXTURES_DIR / "agent_no_assistant.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +55,7 @@ def test_empty_jsonl_returns_zeros(tmp_path: Path) -> None:
 def test_no_assistant_events_returns_empty(tmp_path: Path) -> None:
     """Jsonl that contains only user events → zero totals and empty positions."""
     cache = tmp_path / "main_no_assist.json"
-    result = compute_main_cum(AGENT_NO_ASSISTANT, cache)
+    result = compute_main_cum(FIXTURES_DIR / "agent_no_assistant.jsonl", cache)
 
     assert result["total"] == 0
     assert result["cum_in"] == 0
@@ -240,7 +237,7 @@ def test_atomic_write_via_tmp(tmp_path: Path) -> None:
     # The cache file itself must exist.
     assert cache.exists()
     # And no `.tmp` leftover next to it.
-    tmp_file = cache.with_suffix(cache.suffix + ".tmp")
+    tmp_file = cache.with_name(cache.name + ".tmp")
     assert not tmp_file.exists(), f"leftover tmp file: {tmp_file}"
     # Belt-and-braces: list all files in tmp_path and make sure none end with .tmp.
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]

@@ -1,9 +1,5 @@
-import os
 import subprocess
-import sys
 from pathlib import Path
-
-import pytest
 
 SH_PATH = Path(__file__).parent.parent / "status_line.sh"
 

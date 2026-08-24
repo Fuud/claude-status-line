@@ -5,14 +5,10 @@ Format rules (from Technical Details):
 - 1000 <= n < 1_000_000:  "Nk" (no decimals)
 - n >= 1_000_000:      "N.NM" (1 decimal, e.g. "1.2M")
 
-[decision] format_tokens(999500) → "1000k" (we round DOWN to nearest k, so 999500
-displays as "1000k" because 999500 / 1000 = 999.5 → integer division rounds to 999,
-wait no — 999500 >= 1000 and < 1_000_000 so it's "Nk" branch, 999500 // 1000 = 999,
-999 * 1000 = 999000 → but 999500 != 999000, so plain integer division loses precision.
-The current implementation uses n // 1000, so 999500 // 1000 = 999 → "999k".
-That contradicts the test expectation "1000k". Decision: use math.floor rounding
-in a way that gives "1000k" for 999500 — i.e. round to nearest, not truncate.
-We will pick "1000k" per the explicit test requirement (round 999500 → 1000k).
+[decision] format_tokens uses Python's round() (banker's rounding) for the
+k and M buckets. 999500 / 1000 = 999.5 → rounds to 1000 (not 999) because
+banker's rounding still rounds .5 to even — and 1000 is the next even
+integer — yielding "1000k" per the explicit test requirement.
 """
 from __future__ import annotations
 
@@ -79,6 +75,6 @@ def test_format_tokens_just_above_k_threshold() -> None:
 
 
 def test_format_tokens_just_below_m_threshold() -> None:
-    # 999_999 / 1_000_000 = 0.999999 → rounds to 1.0 → "1.0M"
+    # 999_999 is still in the k branch (< 1_000_000); 999_999 / 1000 = 999.999
+    # → rounds to 1000 → "1000k" (not "1.0M").
     assert format_tokens(999_999) == "1000k"
-    # 999_500 / 1_000 = 999.5 → "1000k" (still in k branch)

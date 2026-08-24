@@ -55,7 +55,7 @@ def fake_home_with_real_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     """
     real_session_root = FIXTURES / "real_session"
     real_session_dir = real_session_root / REAL_SESSION_SID
-    assert real_session_root.exists(), f"fixtures/real_session missing"
+    assert real_session_root.exists(), "fixtures/real_session missing"
     assert real_session_dir.exists(), f"real session dir missing: {real_session_dir}"
 
     projects_root = tmp_path / ".claude" / "projects"
