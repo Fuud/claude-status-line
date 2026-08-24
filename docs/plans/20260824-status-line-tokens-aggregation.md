@@ -198,13 +198,13 @@ main: 78k
 - Create: `~/.claude/status_line/tests/test_detect_status.py`
 - Create: `~/.claude/status_line/tests/test_parse_stdin.py`
 
-- [ ] написать тесты `test_format_tokens`: 0 → "0", 850 → "850", 1000 → "1k", 78000 → "78k", 1234567 → "1.2M", 999 → "999", 999500 → "1000k" (или "1.0M" — выбрать одно, документировать)
-- [ ] написать тесты `test_detect_status`: для каждой фикстуры (agent_ok, agent_err_rate_limit, agent_err_server_error, agent_stopped_user, agent_running, agent_no_assistant, agent_err_with_stopped_by_user) + meta_stopped_by_user + meta_normal — ожидаемый статус. Включая приоритет: err > stop при `stoppedByUser=true` И `error` в последнем event → статус err
-- [ ] написать тесты `test_parse_stdin`: валидный JSON → dict с правильными полями; пустой input → fallback (пустой dict); отсутствующие поля → defaults (0, empty string)
-- [ ] реализовать `format_tokens(n)` — пороги из тестов
-- [ ] реализовать `detect_status(last_event_dict, meta_dict)` — ветки err/stop/ok/run по правилам из Technical Details
-- [ ] реализовать `parse_stdin(json_str)` — `json.loads` + extract полей с `// ""` defaults
-- [ ] прогнать `python3 -m pytest tests/test_format_tokens.py tests/test_detect_status.py tests/test_parse_stdin.py -v` — все PASS
+- [x] написать тесты `test_format_tokens`: 0 → "0", 850 → "850", 1000 → "1k", 78000 → "78k", 1234567 → "1.2M", 999 → "999", 999500 → "1000k" (или "1.0M" — выбрать одно, документировать)
+- [x] написать тесты `test_detect_status`: для каждой фикстуры (agent_ok, agent_err_rate_limit, agent_err_server_error, agent_stopped_user, agent_running, agent_no_assistant, agent_err_with_stopped_by_user) + meta_stopped_by_user + meta_normal — ожидаемый статус. Включая приоритет: err > stop при `stoppedByUser=true` И `error` в последнем event → статус err
+- [x] написать тесты `test_parse_stdin`: валидный JSON → dict с правильными полями; пустой input → fallback (пустой dict); отсутствующие поля → defaults (0, empty string)
+- [x] реализовать `format_tokens(n)` — пороги из тестов
+- [x] реализовать `detect_status(last_event_dict, meta_dict)` — ветки err/stop/ok/run по правилам из Technical Details
+- [x] реализовать `parse_stdin(json_str)` — `json.loads` + extract полей с `// ""` defaults
+- [x] прогнать `python3 -m pytest tests/test_format_tokens.py tests/test_detect_status.py tests/test_parse_stdin.py -v` — все PASS
 
 ### Task 3: compute_main_cum с кешем по last_uuid (TDD)
 
