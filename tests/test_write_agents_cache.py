@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from status_line import _AGENT_CACHE_FIELDS, _write_agents_cache
 
 
@@ -92,8 +94,6 @@ def test_missing_agentid_raises(tmp_path: Path) -> None:
     cache-miss paths. If a caller violates this contract, KeyError is
     surfaced (NOT swallowed) so the bug is visible — main() catches
     Exception and degrades to the fallback header."""
-    import pytest
-
     cache = tmp_path / "agents_broken.json"
     agents = [{"status": "ok", "tokens_in": 1}]  # no agentId
 
@@ -106,8 +106,6 @@ def test_oserror_on_write_is_swallowed(tmp_path: Path, monkeypatch) -> None:
     slower next invocation. We monkeypatch _atomic_write_json to raise
     OSError and verify _write_agents_cache returns cleanly (no
     exception)."""
-    from status_line import _atomic_write_json
-
     cache = tmp_path / "agents_write_fail.json"
 
     def boom(*args, **kwargs):

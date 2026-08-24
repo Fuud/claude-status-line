@@ -853,6 +853,15 @@ def _col_width(values: list, label: str) -> int:
     Exposed at module scope so tests can mirror the width formula
     without copying it. `values` is expected to be a list of ints; the
     `default=0` on the max() handles the empty-list case.
+
+    [deviation] Plan spec (step 2 of the breakdown-table section) wrote
+    this as `max(len(format_tokens(v)) for v in col + [label])` with the
+    floor pulled in separately: `min(_TOKEN_COLUMN_WIDTH, computed)`.
+    Mathematically equivalent — appending `label` to `col` only adds
+    `len(label)` to the candidate set, and the floor is just another
+    `max` operand — but the refactor splits the floor into an explicit
+    named constant so the intent ("never narrower than 7") is visible
+    at the call site rather than buried inside a generator expression.
     """
     longest_value = max((len(format_tokens(v)) for v in values), default=0)
     return max(_TOKEN_COLUMN_WIDTH, len(label), longest_value)

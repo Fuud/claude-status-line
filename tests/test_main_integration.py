@@ -116,11 +116,6 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
         f"stderr: {result.stderr.decode('utf-8', 'replace')}"
     )
     # All three status tags must appear (real session covers ok/err/stop).
-    # [deviation] The f5044e4f session evolved after the plan was written —
-    # when the fixture was copied the session had no agents with
-    # stoppedByUser=true in meta, so [stop] is not currently present in
-    # the snapshot. We only assert [ok] and [err] here. If a future session
-    # snapshot has stopped agents, add the [stop] assertion back.
     assert "[ok]" in output, "expected at least one [ok] in output"
     assert "[err]" in output, "expected at least one [err] in output"
     # Header / table header / sum / main lines have predictable prefixes

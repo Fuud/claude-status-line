@@ -31,6 +31,40 @@ MAIN_QUEUE_OPS = FIXTURES_DIR / "main_with_queue_ops.jsonl"
 MAIN_DUP_TASK = FIXTURES_DIR / "main_with_duplicate_task_id.jsonl"
 MAIN_MISSING_TAGS = FIXTURES_DIR / "main_with_missing_tags.jsonl"
 
+# Last assistant uuid in MAIN_NORMAL — used as the cache-hit key in
+# tests that pre-seed the cache file with a known payload.
+MAIN_NORMAL_LAST_UUID = "77777777-7777-7777-7777-777777777777"
+
+
+def _write_main_cache(
+    cache_path: Path,
+    *,
+    cum_in: int,
+    cum_out: int,
+    cum_cache_create: int,
+    cum_cache_read: int,
+    total: int | None = None,
+    last_uuid: str = MAIN_NORMAL_LAST_UUID,
+) -> dict:
+    """Write a main-cache payload (the same shape compute_main_cum
+    writes to disk) and return the dict.
+
+    `total=None` omits the legacy `total` key; pass an int to include it.
+    Shared by the "no total key" and "legacy total field" tests so the
+    cache-payload literal lives in one place."""
+    payload: dict = {
+        "cum_in": cum_in,
+        "cum_out": cum_out,
+        "cum_cache_create": cum_cache_create,
+        "cum_cache_read": cum_cache_read,
+        "last_uuid": last_uuid,
+        "tool_use_positions": {},
+    }
+    if total is not None:
+        payload["total"] = total
+    cache_path.write_text(json.dumps(payload))
+    return payload
+
 
 # ---------------------------------------------------------------------------
 # empty file / no assistant events
@@ -527,14 +561,13 @@ def test_cached_payload_has_no_total_key(tmp_path: Path) -> None:
     # accepted (we don't fail closed on missing `total` because the field
     # is simply absent on the new schema — the old "total present" check
     # would have made every existing live cache invalidate forever).
-    cache.write_text(json.dumps({
-        "cum_in": 11,
-        "cum_out": 22,
-        "cum_cache_create": 33,
-        "cum_cache_read": 44,
-        "last_uuid": "77777777-7777-7777-7777-777777777777",
-        "tool_use_positions": {},
-    }))
+    _write_main_cache(
+        cache,
+        cum_in=11,
+        cum_out=22,
+        cum_cache_create=33,
+        cum_cache_read=44,
+    )
     result2 = compute_main_cum(MAIN_NORMAL, cache)
     assert result2["cum_in"] == 11  # cache hit succeeded
     assert "total" not in result2
@@ -550,16 +583,14 @@ def test_cache_hit_accepts_legacy_total_field(tmp_path: Path) -> None:
     until the cache is rewritten by a real recompute.
     """
     cache = tmp_path / "main_with_legacy_total.json"
-    cached = {
-        "cum_in": 100,
-        "cum_out": 50,
-        "cum_cache_create": 25,
-        "cum_cache_read": 200,
-        "total": 100 + 50 + 25 + 200,  # legacy field, would be re-derived
-        "last_uuid": "77777777-7777-7777-7777-777777777777",
-        "tool_use_positions": {},
-    }
-    cache.write_text(json.dumps(cached))
+    cached = _write_main_cache(
+        cache,
+        cum_in=100,
+        cum_out=50,
+        cum_cache_create=25,
+        cum_cache_read=200,
+        total=100 + 50 + 25 + 200,  # legacy field, would be re-derived
+    )
 
     result = compute_main_cum(MAIN_NORMAL, cache)
 

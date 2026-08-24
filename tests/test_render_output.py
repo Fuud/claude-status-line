@@ -28,6 +28,7 @@ Line layout for a single-agent scenario:
 from __future__ import annotations
 
 from status_line import (
+    _DESC_TOKEN_GAP,
     _STATUS_GAP,
     _TOKEN_COLUMN_WIDTH,
     _col_width,
@@ -264,7 +265,6 @@ def test_long_description_truncated() -> None:
     # _DESC_TOKEN_GAP length. Slicing this way avoids splitting on
     # _DESC_TOKEN_GAP, which would mis-split on a description
     # containing internal double-space runs.
-    from status_line import _DESC_TOKEN_GAP  # local import — only used here
     prefix = "[ok]" + _STATUS_GAP
     cell_section_len = _TOKEN_COLUMN_WIDTH * 3 + 2  # 3 cells + 2 separators
     desc_part = agent_line[len(prefix) : -(cell_section_len + len(_DESC_TOKEN_GAP))]
@@ -634,6 +634,18 @@ def test_negative_number_renders_as_zero() -> None:
     # main: -10 → "0" (clamped). Sum row: -10 + (-100) = -110 → "0".
     # Both must contain "0" as their formatted value; neither should
     # leak the negative sign or the raw digit.
+    # Positive assertion: each clamped cell must render as "0". The main
+    # row has 3 cells (in/out/cached), so expects 3 "0"s; the agent row
+    # likewise has 3 cells and expects 3 "0"s (description "sentinel-
+    # negatives" contains no digits).
+    assert main_line.count("0") >= 3, (
+        f"main row should contain three '0's for clamped cells, "
+        f"got: {main_line!r}"
+    )
+    assert agent_line.count("0") >= 3, (
+        f"agent row should contain three '0's for clamped in/out/cached, "
+        f"got: {agent_line!r}"
+    )
     assert "-10" not in main_line, (
         f"negative main_in should be clamped: {main_line!r}"
     )
