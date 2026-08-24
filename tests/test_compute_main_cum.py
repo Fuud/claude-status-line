@@ -538,3 +538,37 @@ def test_cached_payload_has_no_total_key(tmp_path: Path) -> None:
     result2 = compute_main_cum(MAIN_NORMAL, cache)
     assert result2["cum_in"] == 11  # cache hit succeeded
     assert "total" not in result2
+
+
+def test_cache_hit_accepts_legacy_total_field(tmp_path: Path) -> None:
+    """Pre-upgrade caches from the old schema include a `total` key (cum_in
+    + cum_out + cum_cache_create + cum_cache_read). The cache-hit branch
+    must ignore that extra field — `total` is not consulted anywhere —
+    so the cache still returns the cached cum_* values intact. This is
+    the upgrade-path guarantee: an existing live cache with `total`
+    continues to feed correct values to render on first run after upgrade,
+    until the cache is rewritten by a real recompute.
+    """
+    cache = tmp_path / "main_with_legacy_total.json"
+    cached = {
+        "cum_in": 100,
+        "cum_out": 50,
+        "cum_cache_create": 25,
+        "cum_cache_read": 200,
+        "total": 100 + 50 + 25 + 200,  # legacy field, would be re-derived
+        "last_uuid": "77777777-7777-7777-7777-777777777777",
+        "tool_use_positions": {},
+    }
+    cache.write_text(json.dumps(cached))
+
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    # Cache hit: cum_in/out/cache_create/cache_read preserved.
+    assert result["cum_in"] == 100
+    assert result["cum_out"] == 50
+    assert result["cum_cache_create"] == 25
+    assert result["cum_cache_read"] == 200
+    # The legacy `total` is left untouched on the cached dict (we never
+    # strip it — render doesn't read it, and stripping would invalidate
+    # every existing live cache on first run after upgrade).
+    assert result.get("total") == cached["total"]

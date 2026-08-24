@@ -307,9 +307,10 @@ def _read_last_event(
     may be None if no such event exists.
 
     Used by compute_agent_snapshot, which needs both: the assistant
-    event drives `tokens` and `last_uuid`, while the last event of any
-    type drives status detection (a user "[Request interrupted by
-    user]" event after the final assistant must surface as "stop").
+    event drives `tokens_in` / `tokens_out` / `tokens_cached` and
+    `last_uuid`, while the last event of any type drives status
+    detection (a user "[Request interrupted by user]" event after the
+    final assistant must surface as "stop").
     """
     if not jsonl_path.exists():
         return (None, None)
@@ -652,13 +653,14 @@ def compute_agent_snapshot(
     # _AGENT_CACHE_FIELDS comment) and below in the cache-miss builder.
     agent_id = jsonl_path.stem
     if cache_entry is not None:
+        breakdown_present = all(
+            f in cache_entry for f in ("tokens_in", "tokens_out", "tokens_cached")
+        )
         if (
             cache_entry.get("last_uuid") == last_uuid_for_compare
             and cache_entry.get("mtime_jsonl") == mtime_jsonl
             and cache_entry.get("mtime_meta") == mtime_meta_for_compare
-            and "tokens_in" in cache_entry
-            and "tokens_out" in cache_entry
-            and "tokens_cached" in cache_entry
+            and breakdown_present
         ):
             # Preserve the invariant: the returned snapshot always has
             # `agentId` inside, regardless of cache hit or miss. The
@@ -691,12 +693,12 @@ def compute_agent_snapshot(
     # so missing/None values are 0. cache_creation_input_tokens is NOT
     # surfaced. Always returns three ints — including for status="run"
     # (mid-flow) and for missing/empty jsonl — so render always sees numbers.
-    msg = last_event.get("message") or {} if last_event else {}
+    msg = (last_event.get("message") or {}) if last_event else {}
     usage = msg.get("usage") if isinstance(msg, dict) else None
     if isinstance(usage, dict):
-        tokens_in = int(usage.get("input_tokens", 0) or 0)
-        tokens_out = int(usage.get("output_tokens", 0) or 0)
-        tokens_cached = int(usage.get("cache_read_input_tokens", 0) or 0)
+        tokens_in = int(usage.get("input_tokens") or 0)
+        tokens_out = int(usage.get("output_tokens") or 0)
+        tokens_cached = int(usage.get("cache_read_input_tokens") or 0)
     else:
         tokens_in = tokens_out = tokens_cached = 0
 
@@ -838,6 +840,24 @@ _DESC_TOKEN_GAP = "  "
 _STATUSES = ("ok", "run", "err", "stop", "kill")
 
 
+def _col_width(values: list, label: str) -> int:
+    """Compute a right-aligned column width for a numeric column.
+
+    Width is the maximum of:
+        - _TOKEN_COLUMN_WIDTH (the floor — guarantees readability even
+          for narrow columns),
+        - len(label) (so labels like "cached" don't overflow),
+        - the longest formatted value across `values` (so values like
+          "1.2M" don't overflow).
+
+    Exposed at module scope so tests can mirror the width formula
+    without copying it. `values` is expected to be a list of ints; the
+    `default=0` on the max() handles the empty-list case.
+    """
+    longest_value = max((len(format_tokens(v)) for v in values), default=0)
+    return max(_TOKEN_COLUMN_WIDTH, len(label), longest_value)
+
+
 def render_output(
     header: str,
     main_in: int,
@@ -878,16 +898,24 @@ def render_output(
     hand.
     """
     # 1. Build per-column value lists (main row first, then agents).
-    in_col = [main_in] + [int(a.get("tokens_in") or 0) for a in agents]
-    out_col = [main_out] + [int(a.get("tokens_out") or 0) for a in agents]
-    cached_col = [main_cached] + [int(a.get("tokens_cached") or 0) for a in agents]
+    # The agent loop runs once, projecting each agent into a triple of
+    # ints and summing in lockstep — saves three separate list
+    # comprehensions and three separate sum() calls for the sum row.
+    agent_in: list[int] = []
+    agent_out: list[int] = []
+    agent_cached: list[int] = []
+    for a in agents:
+        agent_in.append(int(a.get("tokens_in") or 0))
+        agent_out.append(int(a.get("tokens_out") or 0))
+        agent_cached.append(int(a.get("tokens_cached") or 0))
+
+    in_col = [main_in, *agent_in]
+    out_col = [main_out, *agent_out]
+    cached_col = [main_cached, *agent_cached]
 
     # 2. Compute per-column width: at least _TOKEN_COLUMN_WIDTH, at least
-    # the label length, at least the longest formatted cell.
-    def _col_width(values: list, label: str) -> int:
-        longest_value = max((len(format_tokens(v)) for v in values), default=0)
-        return max(_TOKEN_COLUMN_WIDTH, len(label), longest_value)
-
+    # the label length, at least the longest formatted cell. See
+    # _col_width at module scope (importable for tests).
     w_in = _col_width(in_col, "in")
     w_out = _col_width(out_col, "out")
     w_cached = _col_width(cached_col, "cached")
@@ -899,11 +927,9 @@ def render_output(
     )
 
     if agents:
-        sum_in = main_in + sum(int(a.get("tokens_in") or 0) for a in agents)
-        sum_out = main_out + sum(int(a.get("tokens_out") or 0) for a in agents)
-        sum_cached = main_cached + sum(
-            int(a.get("tokens_cached") or 0) for a in agents
-        )
+        sum_in = main_in + sum(agent_in)
+        sum_out = main_out + sum(agent_out)
+        sum_cached = main_cached + sum(agent_cached)
         lines.append(
             f"sum: {format_tokens(sum_in):>{w_in}} "
             f"{format_tokens(sum_out):>{w_out}} "
@@ -916,7 +942,7 @@ def render_output(
         f"{format_tokens(main_cached):>{w_cached}}"
     )
 
-    for agent in agents:
+    for agent, in_v, out_v, cached_v in zip(agents, agent_in, agent_out, agent_cached):
         status = agent.get("status", "run")
         icon = f"[{status}]" if status in _STATUSES else "[?]"
         description = agent.get("description", "") or ""
@@ -925,9 +951,6 @@ def render_output(
         # upstream. Re-apply so a buggy or future caller can't blow up
         # the column layout.
         description = _truncate_description(description)
-        in_v = int(agent.get("tokens_in") or 0)
-        out_v = int(agent.get("tokens_out") or 0)
-        cached_v = int(agent.get("tokens_cached") or 0)
         lines.append(
             f"{icon}{_STATUS_GAP}{description}{_DESC_TOKEN_GAP}"
             f"{format_tokens(in_v):>{w_in}} "

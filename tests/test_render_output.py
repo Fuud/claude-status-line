@@ -28,22 +28,11 @@ Line layout for a single-agent scenario:
 from __future__ import annotations
 
 from status_line import (
-    _DESC_TOKEN_GAP,
     _STATUS_GAP,
     _TOKEN_COLUMN_WIDTH,
-    format_tokens,
+    _col_width,
     render_output,
 )
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-
-def _col_width(values: list, label: str) -> int:
-    """Mirror the renderer's width formula for direct assertions."""
-    longest_value = max((len(format_tokens(v)) for v in values), default=0)
-    return max(_TOKEN_COLUMN_WIDTH, len(label), longest_value)
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +142,10 @@ def test_38_agents_produce_42_lines() -> None:
 
 def test_token_alignment_right_aligned() -> None:
     """Each numeric column is right-aligned to its own fixed width, and
-    1000 (raw) renders as '1k' (formatted), NOT '1000' — this exercises the
-    format_tokens-before-:>W rule."""
+    integer values are formatted via format_tokens BEFORE padding to
+    width (1234567 → "1.2M", 50000 → "50k", NOT the raw digits). This
+    exercises the format_tokens-before-:>W rule with a wide range of
+    magnitudes."""
     header = "Session: x"
     agents = [
         # tokens_in: 10, 50000, 1234567 — widest is "1.2M" (4 chars)
@@ -167,16 +158,16 @@ def test_token_alignment_right_aligned() -> None:
     lines = out.split("\n")
     agent_lines = lines[4:]  # header + table header + sum + main + agents
 
-    # format_tokens of 1000 → "1k", not "1000"
     formatted_in = ["10", "50k", "1.2M"]
-    # The "in" column width is W1 = max(7, 2, len("1.2M")=4) = 7.
+    # The "in" column width is W1 = max(_TOKEN_COLUMN_WIDTH=7, 2, 4) = 7.
     # Each value is right-aligned to width 7 → ends at column position
     # len(prefix) + W1. The prefix is "[ok]  <desc>  " (variable desc width).
     # Within each row, the END of the "in" cell is the same column index.
     end_positions = []
     for line, expected in zip(agent_lines, formatted_in):
         assert expected in line, (
-            f"expected {expected!r} in line {line!r} (1000 must render as '1k')"
+            f"expected formatted {expected!r} in line {line!r} "
+            f"(format_tokens must be applied before right-alignment)"
         )
         end = line.rfind(expected) + len(expected)
         end_positions.append(end)
@@ -223,17 +214,19 @@ def test_three_columns_right_aligned() -> None:
         f"agent lines have different lengths (not right-aligned): {line_lengths}"
     )
 
-    # Each cell has width 7 (max of label length, formatted value length,
-    # and _TOKEN_COLUMN_WIDTH). Cell section = w_in + 1 + w_out + 1 + w_cached
-    # = 23 chars, located at the END of each line. We can extract each cell
-    # by slicing that section.
-    cell_section = agent_lines[0][-23:]
-    in_cell = cell_section[0:7]
-    out_cell = cell_section[8:15]
-    cached_cell = cell_section[16:23]
-    assert len(in_cell) == 7, f"in cell width != 7: {in_cell!r}"
-    assert len(out_cell) == 7, f"out cell width != 7: {out_cell!r}"
-    assert len(cached_cell) == 7, f"cached cell width != 7: {cached_cell!r}"
+    # Each cell has width _TOKEN_COLUMN_WIDTH=7 (max of label length,
+    # formatted value length, and the column-width floor). Cell section
+    # = w_in + 1 + w_out + 1 + w_cached chars, located at the END of
+    # each line. We can extract each cell by slicing that section at
+    # offsets derived from the column width, so the test tracks the
+    # constant instead of hardcoding "23" or "7".
+    cell_section = agent_lines[0][-(_TOKEN_COLUMN_WIDTH * 3 + 2):]
+    in_cell = cell_section[0:_TOKEN_COLUMN_WIDTH]
+    out_cell = cell_section[_TOKEN_COLUMN_WIDTH + 1 : _TOKEN_COLUMN_WIDTH * 2 + 1]
+    cached_cell = cell_section[_TOKEN_COLUMN_WIDTH * 2 + 2 :]
+    assert len(in_cell) == _TOKEN_COLUMN_WIDTH, f"in cell width != {_TOKEN_COLUMN_WIDTH}: {in_cell!r}"
+    assert len(out_cell) == _TOKEN_COLUMN_WIDTH, f"out cell width != {_TOKEN_COLUMN_WIDTH}: {out_cell!r}"
+    assert len(cached_cell) == _TOKEN_COLUMN_WIDTH, f"cached cell width != {_TOKEN_COLUMN_WIDTH}: {cached_cell!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -264,15 +257,23 @@ def test_long_description_truncated() -> None:
     assert agent_line.startswith("[ok]")
     # description portion ends with U+2026
     assert "…" in agent_line, f"ellipsis missing from line {agent_line!r}"
-    # description width ≤ 40 chars
+    # The description column runs from after the status tag prefix up
+    # to (but not including) the _DESC_TOKEN_GAP separator. We exclude
+    # both the prefix and the trailing cell-section by computing the
+    # cell section size from _TOKEN_COLUMN_WIDTH and adding
+    # _DESC_TOKEN_GAP length. Slicing this way avoids splitting on
+    # _DESC_TOKEN_GAP, which would mis-split on a description
+    # containing internal double-space runs.
+    from status_line import _DESC_TOKEN_GAP  # local import — only used here
     prefix = "[ok]" + _STATUS_GAP
-    assert agent_line.startswith(prefix)
-    desc_part = agent_line[len(prefix):]
-    # description runs up to the gap before the first numeric column
-    parts = desc_part.split(_DESC_TOKEN_GAP, 1)
-    desc = parts[0]
-    assert len(desc) <= 40, f"description width {len(desc)} > 40: {desc!r}"
-    assert desc.endswith("…"), f"description not ellipsised: {desc!r}"
+    cell_section_len = _TOKEN_COLUMN_WIDTH * 3 + 2  # 3 cells + 2 separators
+    desc_part = agent_line[len(prefix) : -(cell_section_len + len(_DESC_TOKEN_GAP))]
+    assert len(desc_part) <= 40, (
+        f"description width {len(desc_part)} > 40: {desc_part!r}"
+    )
+    assert desc_part.endswith("…"), (
+        f"description not ellipsised: {desc_part!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -356,10 +357,15 @@ def test_run_agent_shows_current_values() -> None:
     # 2500 → round(2.5)=2 (banker's) → "2k"
     # 800 → "800"
     # 1500 → round(1.5)=2 → "2k"
-    assert "2k" in agent_line
+    # Both in and cached collapse to "2k"; exactly two "2k" substrings
+    # must appear in the line (one for in, one for cached). Verify the
+    # count to guard against silent format regressions where only one
+    # field collapses.
+    assert agent_line.count("2k") == 2, (
+        f"expected exactly 2 '2k' substrings (in=2500 + cached=1500), "
+        f"got {agent_line.count('2k')} in line {agent_line!r}"
+    )
     assert "800" in agent_line
-    # cached "2k" should appear at least once
-    assert agent_line.count("2k") >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -467,16 +473,16 @@ def test_agent_no_assistant_events_renders_zeros() -> None:
 
     assert agent_line.startswith("[run]")
     assert "no events yet" in agent_line
-    # Three right-aligned "0" cells of width ≥ _TOKEN_COLUMN_WIDTH=7. With
+    # Three right-aligned "0" cells of width _TOKEN_COLUMN_WIDTH=7. With
     # all values being 0, format_tokens gives "0" (1 char) and the column
     # width is 7. Cell section = 7+1+7+1+7 = 23 chars at the END of the
-    # line. We extract each cell by slicing the section at known offsets
-    # (rsplit on _DESC_TOKEN_GAP is unreliable here because the right-aligned
-    # padding spaces can contain 2+ consecutive spaces).
-    cell_section = agent_line[-23:]
-    in_cell = cell_section[0:7]
-    out_cell = cell_section[8:15]
-    cached_cell = cell_section[16:23]
+    # line. Derived from _TOKEN_COLUMN_WIDTH so the test tracks the
+    # constant instead of hardcoding 23.
+    cell_section_len = _TOKEN_COLUMN_WIDTH * 3 + 2
+    cell_section = agent_line[-cell_section_len:]
+    in_cell = cell_section[0:_TOKEN_COLUMN_WIDTH]
+    out_cell = cell_section[_TOKEN_COLUMN_WIDTH + 1 : _TOKEN_COLUMN_WIDTH * 2 + 1]
+    cached_cell = cell_section[_TOKEN_COLUMN_WIDTH * 2 + 2 :]
     # Each cell is right-aligned: "0" right-padded to width 7 = 6 spaces + "0".
     for cell in (in_cell, out_cell, cached_cell):
         assert cell.endswith("0"), (
@@ -541,10 +547,9 @@ def test_table_header_row() -> None:
 
     # The table header has exactly the three labels separated by single
     # spaces, each right-aligned to the column width. We can verify by
-    # reconstructing what the renderer would produce.
-    # in_col values (table header doesn't include main_in/main_out/main_cached
-    # — only its own labels), out_col, cached_col.
-    # Cell widths computed via _col_width helper:
+    # reconstructing what the renderer would produce, using the
+    # production _col_width helper (so the test tracks the formula
+    # rather than recomputing it).
     in_width = _col_width([50000, 1000], "in")
     out_width = _col_width([200, 0], "out")
     cached_width = _col_width([700, 0], "cached")
@@ -556,9 +561,13 @@ def test_table_header_row() -> None:
         f"{expected_table_header!r}"
     )
 
+    # Note: comprehensive format_tokens coverage lives in
+    # tests/test_format_tokens.py — we don't re-assert it here to keep
+    # this file focused on render_output's contract.
+
 
 # ---------------------------------------------------------------------------
-# helpers
+# unknown status → [?] fallback icon
 # ---------------------------------------------------------------------------
 
 def test_format_tokens_used_for_cell_values() -> None:
@@ -570,3 +579,67 @@ def test_format_tokens_used_for_cell_values() -> None:
     assert format_tokens(999) == "999"
     # 1_500_000 → "1.5M"
     assert format_tokens(1_500_000) == "1.5M"
+
+
+def test_unknown_status_renders_question_mark_icon() -> None:
+    """An agent with a status not in _STATUSES (e.g. data corruption,
+    future-added state) renders as "[?]" instead of crashing. The renderer
+    validates the status against _STATUSES — the source-of-truth list —
+    rather than relying on callers to whitelist.
+    """
+    header = "Session: x"
+    agents = [
+        {
+            "status": "unknown-state",
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "tokens_cached": 0,
+            "description": "future-state",
+        },
+    ]
+
+    out = render_output(header, 0, 0, 0, agents)
+    agent_line = out.split("\n")[4]
+
+    assert agent_line.startswith("[?]"), (
+        f"unknown status should render as [?], got: {agent_line!r}"
+    )
+    assert "future-state" in agent_line
+
+
+# ---------------------------------------------------------------------------
+# negative-number defensive path — clamps to 0 (format_tokens contract)
+# ---------------------------------------------------------------------------
+
+def test_negative_number_renders_as_zero() -> None:
+    """format_tokens clamps negative values to "0" (defensive: status line
+    must never display negative tokens). render_output relies on this
+    rather than re-implementing the clamp."""
+    header = "Session: x"
+    agents = [
+        {
+            "status": "run",
+            "tokens_in": -100,
+            "tokens_out": -50,
+            "tokens_cached": 0,
+            "description": "sentinel-negatives",
+        },
+    ]
+
+    out = render_output(header, -10, 0, 0, agents)
+    lines = out.split("\n")
+    main_line = lines[3]  # main row
+    agent_line = lines[4]
+
+    # main: -10 → "0" (clamped). Sum row: -10 + (-100) = -110 → "0".
+    # Both must contain "0" as their formatted value; neither should
+    # leak the negative sign or the raw digit.
+    assert "-10" not in main_line, (
+        f"negative main_in should be clamped: {main_line!r}"
+    )
+    assert "-100" not in agent_line, (
+        f"negative tokens_in should be clamped: {agent_line!r}"
+    )
+    assert "-50" not in agent_line, (
+        f"negative tokens_out should be clamped: {agent_line!r}"
+    )

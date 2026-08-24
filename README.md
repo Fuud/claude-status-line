@@ -11,14 +11,28 @@ hook. Layout:
 
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a
-sum: 53.2M
-main: 50.8M
-[ok]    Review: implementation    103k
+         in     out   cached
+sum:     1.2M   35k   53.2M
+main:    1.1M   30k   50.8M
+[ok]    Review: implementation plan     12k    4k   100k
 [err]   Review: quality
-[run]   Task 4: MissingGlyphLog
+[run]   Task 4: MissingGlyphLog          3k    1k    12k
 ```
 
-Each agent line carries one of four status tags:
+Line layout:
+
+- Line 1 — header (`Session: ...`)
+- Line 2 — table header (`in / out / cached`, each right-aligned under
+  its own column)
+- Line 3 — `sum:` row aggregating main + every agent across all three
+  columns (omitted if there are zero agents)
+- Line 4 — `main:` row with cumulative breakdown for the main session
+- Lines 5+ — one row per agent, each with three numeric cells:
+  input, output, cache-read. `cache_creation` tokens are tracked but
+  NOT displayed.
+
+Each numeric cell is formatted via `format_tokens` (so `1000` renders
+as `1k`, `1_500_000` as `1.5M`).
 
 | Tag      | Meaning                                              |
 | -------- | ---------------------------------------------------- |
@@ -72,6 +86,14 @@ Two cache files are persisted under `~/.claude/status_line/data/`:
 | `main_<sid>.json`   | `last_uuid` (tail of main jsonl)       | cumulative token totals + tool_use ids |
 | `agents_<sid>.json` | `(last_uuid, mtime_jsonl, mtime_meta)` | per-agent render-ready snapshot dict   |
 
+Each per-agent entry in `agents_<sid>.json` is keyed by `agentId` and
+holds the fields `last_uuid`, `mtime_jsonl`, `mtime_meta`, `status`,
+`tokens_in`, `tokens_out`, `tokens_cached`, `description`, `toolUseId`.
+The three `tokens_*` fields are the breakdown columns rendered in the
+status line (input / output / cache-read). Cache-hit requires all three
+fields to be present — a pre-upgrade cache missing any of them
+invalidates and triggers a forward re-parse (see Edge cases).
+
 Both files are written atomically (`.tmp` → `os.replace()`).
 
 ### Edge cases handled
@@ -87,7 +109,16 @@ Both files are written atomically (`.tmp` → `os.replace()`).
   deleted, recomputed.
 - **Empty jsonl**: returns zeros across the board, no crash.
 - **Subagent with zero assistant events**: status forced to `[err]`
-  (or `[stop]` if `meta.stoppedByUser=true`).
+  (or `[stop]` if `meta.stoppedByUser=true`); the agent line is still
+  emitted with three zero cells in the breakdown columns (never
+  skipped).
+- **Pre-upgrade agents cache (no breakdown fields)**: cache-hit
+  requires `tokens_in`/`tokens_out`/`tokens_cached` to be present; if
+  any are missing, the entry is treated as a miss and the jsonl is
+  re-scanned. After the first such re-scan the cache is rewritten
+  with the new shape and subsequent calls hit cleanly. Without this
+  check, a stale entry would render zeros (via `int(field or 0)`) until
+  the next jsonl mutation.
 
 ## Tests
 
@@ -98,10 +129,10 @@ cd ~/.claude/status_line
 python3 -m pytest tests/ -v
 ```
 
-74+ tests cover: pure functions (`format_tokens`, `detect_status`,
+119+ tests cover: pure functions (`format_tokens`, `detect_status`,
 `parse_stdin`), I/O helpers (`compute_main_cum`, `compute_agent_snapshot`,
-`find_session_dir`, `sort_agents`), `render_output`, `main()` end-to-end
-against a real session fixture, and the bash wrapper.
+`find_session_dir`, `sort_agents`, `_write_agents_cache`), `render_output`,
+`main()` end-to-end against a real session fixture, and the bash wrapper.
 
 ### Real-session fixture
 

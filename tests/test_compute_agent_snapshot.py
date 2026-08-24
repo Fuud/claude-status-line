@@ -23,7 +23,7 @@ import json
 import os
 from pathlib import Path
 
-from status_line import compute_agent_snapshot, _compute_agents
+from status_line import _AGENT_CACHE_FIELDS, _compute_agents, compute_agent_snapshot
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -279,29 +279,25 @@ def test_meta_long_description_truncated() -> None:
     assert desc[:39] == original[:39]
 
 
-def test_meta_missing_fallback() -> None:
+def test_meta_missing_fallback(tmp_path: Path) -> None:
     """Missing meta or empty description → fallback to agentType, then 'unknown'."""
     # Case 1: meta file with empty description but valid agentType.
-    meta_with_type = FIXTURES_DIR / "_meta_empty_desc.json"
+    meta_with_type = tmp_path / "_meta_empty_desc.json"
     meta_with_type.write_text(json.dumps({
         "agentType": "Explore",
         "toolUseId": "toolu_999",
     }))
-    try:
-        result = compute_agent_snapshot(
-            AGENT_OK, meta_with_type, cache_entry=None
-        )
-        assert result["description"] == "Explore"
-        assert result["toolUseId"] == "toolu_999"
-        # Status still computed from last event.
-        assert result["status"] == "ok"
-    finally:
-        meta_with_type.unlink(missing_ok=True)
+    result = compute_agent_snapshot(
+        AGENT_OK, meta_with_type, cache_entry=None
+    )
+    assert result["description"] == "Explore"
+    assert result["toolUseId"] == "toolu_999"
+    # Status still computed from last event.
+    assert result["status"] == "ok"
 
     # Case 2: completely missing meta path → fallback to 'unknown'.
-    missing_meta = FIXTURES_DIR / "_meta_definitely_missing.json"
-    if missing_meta.exists():
-        missing_meta.unlink()
+    missing_meta = tmp_path / "_meta_definitely_missing.json"
+    assert not missing_meta.exists()
 
     result = compute_agent_snapshot(
         AGENT_OK, missing_meta, cache_entry=None
@@ -677,3 +673,79 @@ def test_compute_agents_no_match_no_override(tmp_path: Path) -> None:
     assert len(agents) == 1
     # agent_running.jsonl → "run"; unmatched queue key has no effect.
     assert agents[0]["status"] == "run"
+
+
+# ---------------------------------------------------------------------------
+# cache-fields invariant — _AGENT_CACHE_FIELDS is the persisted shape,
+# agentId is NOT inside each entry (it's the dict key)
+# ---------------------------------------------------------------------------
+
+def test_agent_cache_fields_does_not_include_agentid() -> None:
+    """[invariant] _AGENT_CACHE_FIELDS must NOT contain "agentId" — the
+    per-agent cache stores agentId as the OUTER dict key, not as a field
+    inside each entry. compute_agent_snapshot re-injects agentId into the
+    returned dict on the cache-hit path so downstream callers see a
+    uniform shape. If a future change accidentally adds "agentId" to
+    _AGENT_CACHE_FIELDS, _write_agents_cache would write a redundant
+    field and the agentId-reinjection path would no longer be exercised.
+    """
+    assert "agentId" not in _AGENT_CACHE_FIELDS, (
+        f"agentId must be the cache dict key, not an inner field. "
+        f"_AGENT_CACHE_FIELDS={_AGENT_CACHE_FIELDS!r}"
+    )
+
+
+def test_agent_cache_fields_includes_all_rendered_keys() -> None:
+    """The persisted cache must carry every field the renderer needs to
+    rebuild an agent line: status, tokens_in/out/cached, description,
+    toolUseId, plus the cache-key fields (last_uuid, mtime_jsonl,
+    mtime_meta)."""
+    required = {
+        "status",
+        "tokens_in",
+        "tokens_out",
+        "tokens_cached",
+        "description",
+        "toolUseId",
+        "last_uuid",
+        "mtime_jsonl",
+        "mtime_meta",
+    }
+    assert required.issubset(set(_AGENT_CACHE_FIELDS)), (
+        f"_AGENT_CACHE_FIELDS missing required keys: "
+        f"{required - set(_AGENT_CACHE_FIELDS)}"
+    )
+
+
+def test_cache_hit_injects_agentid_into_returned_dict() -> None:
+    """compute_agent_snapshot must re-inject agentId on the cache-hit
+    path. Without this, _write_agents_cache raises KeyError(a['agentId'])
+    and main()'s except clause silently degrades to the fallback header.
+    The regression tested by test_second_call_after_cache in
+    test_main_integration.py."""
+    mtime = AGENT_OK.stat().st_mtime
+    last_uuid = "a0000000-0000-0000-0000-000000000004"
+
+    # Pre-upgrade-style cache entry that already has agentId inside; the
+    # function should still overwrite it with the canonical agent_id
+    # derived from the jsonl filename stem.
+    cache_entry = {
+        "agentId": "wrong-id-from-cache",
+        "status": "ok",
+        "tokens_in": 11_111,
+        "tokens_out": 22_222,
+        "tokens_cached": 33_333,
+        "description": "from-cache",
+        "toolUseId": "toolu_cached",
+        "last_uuid": last_uuid,
+        "mtime_jsonl": mtime,
+        "mtime_meta": META_NORMAL.stat().st_mtime,
+    }
+
+    result = compute_agent_snapshot(
+        AGENT_OK, META_NORMAL, cache_entry=cache_entry
+    )
+    assert result["agentId"] == _agent_id(AGENT_OK), (
+        f"agentId should be re-injected from jsonl filename stem, "
+        f"got: {result['agentId']!r}"
+    )
