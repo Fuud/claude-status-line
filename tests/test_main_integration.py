@@ -310,3 +310,75 @@ def test_empty_stdin_only_header(fake_home_with_real_session) -> None:
     assert lines[0].startswith("Session:")
     # Session_id slot in header should be empty
     assert "Session:  |" in lines[0], f"expected empty sid in header: {lines[0]!r}"
+
+
+# ---------------------------------------------------------------------------
+# 7. Re-run main() with a valid agents cache on disk
+# ---------------------------------------------------------------------------
+
+def test_second_call_after_cache(fake_home_with_real_session) -> None:
+    """Run main() twice with the same stdin.
+
+    The first invocation populates the agents_<sid>.json cache; the second
+    invocation hits the cache for every subagent and exercises the
+    compute_agent_snapshot cache-hit early-return path. Without the
+    agentId-reinjection fix, the second call raised KeyError inside
+    _write_agents_cache and main()'s except clause silently degraded to
+    the hardcoded fallback header ("Session:  | Branch:  | Model:  | User:
+    n/a") — a single line instead of the expected 41.
+
+    This is the actual runtime scenario: the status-line hook fires every
+    few seconds, so every real invocation is a "second call after cache"
+    case.
+    """
+    tmp_path, sid = fake_home_with_real_session
+    stdin = json.dumps({
+        "session_id": sid,
+        "model": {"display_name": "MiniMax-M3"},
+        "context_window": {"used_percentage": 0, "total_input_tokens": 0},
+    })
+
+    # 1st call — populates cache.
+    first = _run_main(stdin, tmp_path)
+    assert first.returncode == 0, (
+        f"first call failed; stderr={first.stderr.decode('utf-8', 'replace')}"
+    )
+    first_output = first.stdout.decode("utf-8")
+    first_lines = first_output.splitlines()
+    assert len(first_lines) == 41, (
+        f"first call should produce 41 lines, got {len(first_lines)}; "
+        f"first 3: {first_lines[:3]}"
+    )
+
+    # Sanity: the agents cache file must exist after the first call.
+    data_dir = tmp_path / ".claude" / "status_line" / "data"
+    agents_cache_path = data_dir / f"agents_{sid}.json"
+    assert agents_cache_path.exists(), "agents cache should be written by 1st call"
+
+    # 2nd call — exercises the cache-hit path for every subagent. Without
+    # the fix, this returns 1 line (the hardcoded fallback header).
+    second = _run_main(stdin, tmp_path)
+    assert second.returncode == 0, (
+        f"second call failed; stderr={second.stderr.decode('utf-8', 'replace')}"
+    )
+    second_output = second.stdout.decode("utf-8")
+    second_lines = second_output.splitlines()
+    assert len(second_lines) == 41, (
+        f"second call should also produce 41 lines (cache-hit path), "
+        f"got {len(second_lines)}; first 3: {second_lines[:3]}; "
+        f"this indicates compute_agent_snapshot cache-hit is missing agentId "
+        f"and _write_agents_cache raised KeyError, which main() swallowed "
+        f"into the fallback header"
+    )
+    # Header must reflect the real session_id, not the empty fallback.
+    assert "Session: " + sid in second_lines[0], (
+        f"second call header should contain the real session_id, got: "
+        f"{second_lines[0]!r}"
+    )
+    # Output must be byte-identical to the first call (no flake — the cache
+    # hit should be deterministic for unchanged files).
+    assert second_output == first_output, (
+        "cache-hit output diverged from cache-miss output:\n"
+        f"first:  {first_output[:200]!r}\n"
+        f"second: {second_output[:200]!r}"
+    )

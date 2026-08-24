@@ -587,16 +587,23 @@ def compute_agent_snapshot(
     last_uuid_for_compare: str | None = (
         last_event.get("uuid") if last_event else None
     )
+    # agent_id is needed both for the cache-hit dict-shape invariant (see
+    # _AGENT_CACHE_FIELDS comment) and below in the cache-miss builder.
+    agent_id = jsonl_path.stem
     if cache_entry is not None:
         if (
             cache_entry.get("last_uuid") == last_uuid_for_compare
             and cache_entry.get("mtime_jsonl") == mtime_jsonl
             and cache_entry.get("mtime_meta") == mtime_meta_for_compare
         ):
-            return cache_entry
+            # Preserve the invariant: the returned snapshot always has
+            # `agentId` inside, regardless of cache hit or miss. The
+            # on-disk cache stores agentId as the dict key (see
+            # _AGENT_CACHE_FIELDS), so we re-inject it here from the
+            # canonical source (jsonl_path.stem).
+            return {**cache_entry, "agentId": agent_id}
 
     # 5. Compute fields.
-    agent_id = jsonl_path.stem
 
     # status — apply "0 assistant events → err" override. Also check
     # last_jsonl_event for the user-interrupt marker even when we have
@@ -822,9 +829,12 @@ def render_output(header: str, main_total: int, agents: list) -> str:
 # only place main() knows about the disk layout, all compute_* helpers are
 # layout-agnostic.
 
-# Fields persisted in agents_<sid>.json cache. agentId is the dict key, so
-# not stored inside each entry. mtime_jsonl/last_uuid drive invalidation;
-# the rest is the render-ready snapshot.
+# Fields persisted in agents_<sid>.json cache. agentId is the dict key,
+# so NOT stored inside each entry; compute_agent_snapshot re-injects
+# agentId on the cache-hit path to keep the returned dict shape stable
+# for downstream consumers (see _write_agents_cache and _AGENT_CACHE_FIELDS
+# invariant). mtime_jsonl/last_uuid drive invalidation; the rest is the
+# render-ready snapshot.
 _AGENT_CACHE_FIELDS = (
     "last_uuid",
     "mtime_jsonl",
@@ -946,7 +956,12 @@ def _main_unsafe() -> int:
     agents = _compute_agents(session_dir, agents_cache)
     _write_agents_cache(agents_cache, agents)
 
-    agents = sort_agents(agents, main_cum.get("tool_use_positions", {}))
+    # sort_agents calls .get(...) on the second argument, so it MUST be a
+    # dict. A malformed cache (e.g. tool_use_positions accidentally written
+    # as a list) would otherwise raise AttributeError and be swallowed by
+    # main()'s except clause — silently degrading to the fallback header.
+    tool_use_positions = main_cum.get("tool_use_positions")
+    agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
     output = render_output(header, main_cum.get("total", 0), agents)
     print(output)
     return 0
