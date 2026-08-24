@@ -463,7 +463,6 @@ _EMPTY_MAIN_RESULT: dict = {
     "cum_out": 0,
     "cum_cache_create": 0,
     "cum_cache_read": 0,
-    "total": 0,
     "last_uuid": "",
     "mtime_jsonl": 0.0,
     "tool_use_positions": {},
@@ -485,7 +484,7 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     to `cache_path`.
 
     Returns a dict with keys:
-        cum_in, cum_out, cum_cache_create, cum_cache_read, total, last_uuid,
+        cum_in, cum_out, cum_cache_create, cum_cache_read, last_uuid,
         mtime_jsonl, tool_use_positions, task_notifications
 
     [deviation] Cache key includes `mtime_jsonl` so that queue-operation
@@ -493,6 +492,13 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     still invalidate the cache (last_uuid alone would miss them). Without
     mtime in the key, newly-fired task-notifications would be invisible
     to the orchestrator override for as long as the main session stays idle.
+
+    [deviation] The legacy `total` field was removed in Task 2 of the
+    breakdown-table plan. The total is now derived by render from the three
+    breakdown values (in + out + cached). Persisted `total` keys in old
+    cache files from before this change are harmless: cache-hit returns
+    the cached dict unchanged, and render ignores the extra field. We do
+    not actively migrate.
 
     If `jsonl_path` does not exist, returns a zero-valued result without
     writing the cache.
@@ -530,7 +536,6 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
         "cum_out": cum_out,
         "cum_cache_create": cum_cache_create,
         "cum_cache_read": cum_cache_read,
-        "total": cum_in + cum_out + cum_cache_create + cum_cache_read,
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime_jsonl,
         "tool_use_positions": positions,

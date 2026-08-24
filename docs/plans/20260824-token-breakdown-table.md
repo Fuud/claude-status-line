@@ -178,12 +178,12 @@ def render_output(
 - Modify: `status_line.py` (функция `compute_main_cum`, константа `_EMPTY_MAIN_RESULT`)
 - Modify: `tests/test_compute_main_cum.py`
 
-- [ ] добавить тест: `compute_main_cum` возвращает dict БЕЗ ключа `"total"`
-- [ ] добавить тест: `_EMPTY_MAIN_RESULT` (через `compute_main_cum` с несуществующим jsonl) не содержит `"total"`
-- [ ] удалить ключ `"total": 0` из `_EMPTY_MAIN_RESULT`
-- [ ] удалить строку `"total": cum_in + cum_out + cum_cache_create + cum_cache_read` из result-словаря в `compute_main_cum`
-- [ ] удалить или обновить существующие тесты, проверяющие `result["total"]` (например `test_compute_main_cum_basic`, `test_total_field_*` и т.п.)
-- [ ] запустить `python -m pytest tests/test_compute_main_cum.py` — все тесты должны проходить
+- [x] добавить тест: `compute_main_cum` возвращает dict БЕЗ ключа `"total"`
+- [x] добавить тест: `_EMPTY_MAIN_RESULT` (через `compute_main_cum` с несуществующим jsonl) не содержит `"total"`
+- [x] удалить ключ `"total": 0` из `_EMPTY_MAIN_RESULT`
+- [x] удалить строку `"total": cum_in + cum_out + cum_cache_create + cum_cache_read` из result-словаря в `compute_main_cum`
+- [x] удалить или обновить существующие тесты, проверяющие `result["total"]` (например `test_compute_main_cum_basic`, `test_total_field_*` и т.п.)
+- [x] запустить `python -m pytest tests/test_compute_main_cum.py` — все тесты должны проходить
 
 ### Task 3: Переписать `render_output` под табличный формат (TDD)
 
