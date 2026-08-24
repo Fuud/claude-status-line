@@ -1,0 +1,8 @@
+{
+  "agentId": "d0000000-0000-0000-0000-000000000001",
+  "agentType": "general-purpose",
+  "description": "Review: quality",
+  "toolUseId": "toolu_002",
+  "spawnDepth": 1,
+  "stoppedByUser": true
+}

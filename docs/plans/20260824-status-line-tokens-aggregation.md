@@ -173,21 +173,21 @@ main: 78k
 - Create: `~/.claude/status_line/tests/fixtures/meta_long_description.json`
 - Create: `~/.claude/status_line/tests/fixtures/real_session/` (копия f5044e4f)
 
-- [ ] удалить `tests/__init__.py` из списка (modern pytest не требует)
-- [ ] установить pytest: `python3 -m pip install --user pytest` (если нет)
-- [ ] проверить окружение: `which python3 && python3 --version` — если python3 отсутствует, остановиться и сообщить пользователю (без fallback на bash — по решению brainstorm)
-- [ ] создать `tests/conftest.py` с `pytest.fixture` для `tmp_data_dir` (tmp-каталог для кешей)
-- [ ] создать фикстуры: каждый файл — минимальный но реалистичный (5-10 строк jsonl, 1-2 поля в meta)
-- [ ] `agent_ok.jsonl`: последний event = assistant с `stop_reason: end_turn`, usage=100+200+300+50
-- [ ] `agent_err_rate_limit.jsonl`: последний event = assistant с `error: rate_limit`, `apiErrorStatus: 429`
-- [ ] `agent_err_server_error.jsonl`: последний event = assistant с `error: server_error`
-- [ ] `agent_stopped_user.jsonl`: последний event = user с content `[Request interrupted by user]`
-- [ ] `agent_running.jsonl`: последний event = assistant с `stop_reason: tool_use`
-- [ ] `agent_no_assistant.jsonl`: только user events (tool_result)
-- [ ] `agent_err_with_stopped_by_user.jsonl`: последний event = assistant с `error: rate_limit` (для теста приоритета err > stop при `stoppedByUser: true` в meta)
-- [ ] `meta_long_description.json`: description длиной 60 символов для теста обрезки
-- [ ] скопировать реальную сессию `f5044e4f-3e01-4330-be72-eb008a1d035e` из `C--Users-f-bobin-IdeaProjects-agentic-terminal` в `fixtures/real_session/` (через `cp -r`, ~12 MB). **Когда исходная сессия мутирует** (Claude Code допишет event-ы), снапшот stdout в интеграционном тесте сломается — перегенерировать: `rm -rf fixtures/real_session && cp -r ~/.claude/projects/C--Users-f-bobin-IdeaProjects-agentic-terminal/f5044e4f-* fixtures/real_session`
-- [ ] прогнать `python3 -m pytest tests/ -v --collect-only` — все фикстуры на месте, тесты ещё не написаны (только collect)
+- [x] удалить `tests/__init__.py` из списка (modern pytest не требует)
+- [x] установить pytest: `python3 -m pip install --user pytest` (если нет)
+- [x] проверить окружение: `which python3 && python3 --version` — если python3 отсутствует, остановиться и сообщить пользователю (без fallback на bash — по решению brainstorm)
+- [x] создать `tests/conftest.py` с `pytest.fixture` для `tmp_data_dir` (tmp-каталог для кешей)
+- [x] создать фикстуры: каждый файл — минимальный но реалистичный (5-10 строк jsonl, 1-2 поля в meta)
+- [x] `agent_ok.jsonl`: последний event = assistant с `stop_reason: end_turn`, usage=100+200+300+50
+- [x] `agent_err_rate_limit.jsonl`: последний event = assistant с `error: rate_limit`, `apiErrorStatus: 429`
+- [x] `agent_err_server_error.jsonl`: последний event = assistant с `error: server_error`
+- [x] `agent_stopped_user.jsonl`: последний event = user с content `[Request interrupted by user]`
+- [x] `agent_running.jsonl`: последний event = assistant с `stop_reason: tool_use`
+- [x] `agent_no_assistant.jsonl`: только user events (tool_result)
+- [x] `agent_err_with_stopped_by_user.jsonl`: последний event = assistant с `error: rate_limit` (для теста приоритета err > stop при `stoppedByUser: true` в meta)
+- [x] `meta_long_description.json`: description длиной 60 символов для теста обрезки
+- [x] скопировать реальную сессию `f5044e4f-3e01-4330-be72-eb008a1d035e` из `C--Users-f-bobin-IdeaProjects-agentic-terminal` в `fixtures/real_session/` (через `cp -r`, ~12 MB). **Когда исходная сессия мутирует** (Claude Code допишет event-ы), снапшот stdout в интеграционном тесте сломается — перегенерировать: `rm -rf fixtures/real_session && cp -r ~/.claude/projects/C--Users-f-bobin-IdeaProjects-agentic-terminal/f5044e4f-* fixtures/real_session`
+- [x] прогнать `python3 -m pytest tests/ -v --collect-only` — все фикстуры на месте, тесты ещё не написаны (только collect)
 
 ### Task 2: Чистые функции — format_tokens, detect_status, parse_stdin (TDD)
 

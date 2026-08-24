@@ -1,0 +1,7 @@
+{
+  "agentId": "long0000-0000-0000-0000-000000000001",
+  "agentType": "general-purpose",
+  "description": "this description is exactly sixty characters in total length",
+  "toolUseId": "toolu_003",
+  "spawnDepth": 1
+}

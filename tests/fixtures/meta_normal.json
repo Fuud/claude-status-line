@@ -1,0 +1,7 @@
+{
+  "agentId": "a0000000-0000-0000-0000-000000000001",
+  "agentType": "general-purpose",
+  "description": "Fixer: smells findings",
+  "toolUseId": "toolu_001",
+  "spawnDepth": 1
+}
