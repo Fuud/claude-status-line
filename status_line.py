@@ -246,9 +246,9 @@ def parse_stdin(json_str: str) -> dict:
         if isinstance(name, str):
             out["model"] = name
 
-    # `user` is not derivable from the current payload (no host/uid field),
-    # so we keep the default "n/a". Field is present so downstream renderers
-    # don't have to check for it.
+    # `user` is not derivable from the payload (no host/uid field), so it
+    # comes from the AI_USER env var; unset or empty falls back to "n/a".
+    out["user"] = os.environ.get("AI_USER") or "n/a"
     return out
 
 

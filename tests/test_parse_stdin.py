@@ -8,7 +8,7 @@ hook via stdin and returns a dict with:
         "prompt_id":  str,
         "model":      str,
         "branch":     str,        # `git branch --show-current` or ""
-        "user":       str,        # currently "n/a" — TODO: parse from cwd
+        "user":       str,        # AI_USER env var, or "n/a"
     }
 
 Behaviour:
@@ -18,6 +18,9 @@ Behaviour:
 - Missing fields → defaults for those fields.
 - branch: tries `git --no-optional-locks branch --show-current` in cwd; on any
   error (not a git repo, timeout, git missing) returns "".
+- user: read from the AI_USER env var on every call; unset or empty → "n/a".
+  Tests delenv/setenv explicitly so they don't depend on the developer's
+  environment.
 
 [deviation] _get_branch caches the result for 5 seconds. Tests that need to
 verify the actual subprocess invocation must reset the cache (see
@@ -53,19 +56,37 @@ def test_valid_json_extracts_all_fields(tmp_path: Path, monkeypatch: pytest.Monk
     chdir to a non-git dir so it returns '' deterministically."""
     status_line._branch_cache = None
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_USER", raising=False)
     result = parse_stdin(VALID_PAYLOAD)
     assert result["session_id"] == "abc"
     assert result["prompt_id"] == "p1"
     assert result["model"] == "X"
-    # user not extractable from current payload → defaults to "n/a"
+    # AI_USER unset → defaults to "n/a"
     assert result["user"] == "n/a"
     # branch from git, in a non-git cwd → ""
     assert result["branch"] == ""
 
 
+def test_user_taken_from_ai_user_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """AI_USER set → user field mirrors it, payload content is irrelevant."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AI_USER", "f.bobin")
+    result = parse_stdin(VALID_PAYLOAD)
+    assert result["user"] == "f.bobin"
+
+
+def test_user_empty_ai_user_falls_back_to_na(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """AI_USER set but empty → "n/a", not an empty status-line field."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AI_USER", "")
+    result = parse_stdin(VALID_PAYLOAD)
+    assert result["user"] == "n/a"
+
+
 def test_empty_string_returns_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # chdir to a non-git dir so _get_branch() returns ""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_USER", raising=False)
     result = parse_stdin("")
     assert result == {
         "session_id": "",
@@ -78,6 +99,7 @@ def test_empty_string_returns_defaults(tmp_path: Path, monkeypatch: pytest.Monke
 
 def test_whitespace_only_returns_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_USER", raising=False)
     result = parse_stdin("   \n  \t  \n")
     assert result == {
         "session_id": "",
@@ -90,6 +112,7 @@ def test_whitespace_only_returns_defaults(tmp_path: Path, monkeypatch: pytest.Mo
 
 def test_invalid_json_returns_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_USER", raising=False)
     result = parse_stdin("this is { not json [")
     assert result == {
         "session_id": "",
@@ -103,6 +126,7 @@ def test_invalid_json_returns_defaults(tmp_path: Path, monkeypatch: pytest.Monke
 def test_missing_fields_use_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Partial JSON without most fields → defaults for missing ones."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_USER", raising=False)
     result = parse_stdin(json.dumps({"session_id": "only-sid"}))
     assert result == {
         "session_id": "only-sid",
@@ -115,6 +139,7 @@ def test_missing_fields_use_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_empty_object_uses_all_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_USER", raising=False)
     result = parse_stdin("{}")
     assert result == {
         "session_id": "",
