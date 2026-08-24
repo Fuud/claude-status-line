@@ -1,19 +1,21 @@
 """Tests for compute_agent_snapshot.
 
 compute_agent_snapshot(jsonl_path, meta_path, cache_entry) returns a snapshot
-dict for a single subagent: agentId, status, tokens, description, toolUseId,
-last_uuid, mtime_jsonl, mtime_meta.
+dict for a single subagent: agentId, status, tokens_in, tokens_out,
+tokens_cached, description, toolUseId, last_uuid, mtime_jsonl, mtime_meta.
 
 Cache semantics:
 - If `cache_entry` (a dict) is provided and its last_uuid + mtime_jsonl +
-  mtime_meta all match the current file state → return the cache_entry
-  unchanged (cache hit).
+  mtime_meta all match the current file state AND breakdown fields
+  (tokens_in/out/cached) are present in cache_entry → return the cache_entry
+  unchanged (cache hit). The field-presence check guards against stale
+  caches from the pre-breakdown schema.
 - Otherwise → re-parse the jsonl, compute fields fresh, and return.
 
 The function does NOT write any cache file — the caller (orchestrator) owns
 cache persistence.
 
-Spec: see docs/plans/20260824-status-line-tokens-aggregation.md (Task 4).
+Spec: see docs/plans/20260824-token-breakdown-table.md (Task 1).
 """
 from __future__ import annotations
 
@@ -52,19 +54,23 @@ def _agent_id(jsonl_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def test_agent_ok_full_snapshot() -> None:
-    """agent_ok.jsonl + meta_normal.json → status="ok", tokens from last
-    assistant usage sum, description from meta, agentId from filename,
-    toolUseId from meta, last_uuid = last assistant uuid.
+    """agent_ok.jsonl + meta_normal.json → status="ok", breakdown from last
+    assistant usage (in=100, out=50, cached=300; cache_creation=200 is dropped),
+    description from meta, agentId from filename, toolUseId from meta,
+    last_uuid = last assistant uuid.
 
-    Last assistant event in agent_ok.jsonl has usage:
-      input_tokens=100, cache_creation=200, cache_read=300, output=50
-      → total = 650
-    Last assistant uuid: 'a0000000-0000-0000-0000-000000000004'.
+    No `tokens` field — replaced by three breakdown fields per plan Task 1.
     """
     result = compute_agent_snapshot(AGENT_OK, META_NORMAL, cache_entry=None)
 
     assert result["status"] == "ok"
-    assert result["tokens"] == 100 + 200 + 300 + 50  # 650
+    # Last assistant: input=100, cache_read=300, output=50; cache_creation NOT
+    # in any column.
+    assert result["tokens_in"] == 100
+    assert result["tokens_out"] == 50
+    assert result["tokens_cached"] == 300
+    # Field `tokens` no longer exists.
+    assert "tokens" not in result
     assert result["description"] == "Fixer: smells findings"
     assert result["agentId"] == _agent_id(AGENT_OK)
     assert result["toolUseId"] == "toolu_001"
@@ -83,25 +89,26 @@ def test_agent_ok_full_snapshot() -> None:
 def test_agent_err_rate_limit() -> None:
     """agent_err_rate_limit.jsonl + meta_normal.json → status="err".
 
-    Last assistant has usage (input=50, cache_creation=0, cache_read=100,
-    output=10) → total=160. Per spec choice in the task description, we keep
-    tokens from the last assistant event even when status is err (to surface
-    partial progress before the failure).
+    Last assistant: input=50, cache_read=100, output=10 (cache_creation=0).
+    Breakdown values retained even on err status.
     """
     result = compute_agent_snapshot(
         AGENT_ERR_RATE_LIMIT, META_NORMAL, cache_entry=None
     )
 
     assert result["status"] == "err"
-    # Tokens from last assistant event are retained despite err status.
-    assert result["tokens"] == 50 + 0 + 100 + 10  # 160
+    assert result["tokens_in"] == 50
+    assert result["tokens_out"] == 10
+    assert result["tokens_cached"] == 100
     assert result["description"] == "Fixer: smells findings"
     assert result["agentId"] == _agent_id(AGENT_ERR_RATE_LIMIT)
     assert result["last_uuid"] == "b0000000-0000-0000-0000-000000000004"
 
 
 def test_agent_err_server_error() -> None:
-    """agent_err_server_error.jsonl → status="err", tokens from last assistant."""
+    """agent_err_server_error.jsonl → status="err", breakdown from last assistant.
+    Last assistant: input=60, cache_read=120, output=15.
+    """
     result = compute_agent_snapshot(
         FIXTURES_DIR / "agent_err_server_error.jsonl",
         META_NORMAL,
@@ -109,46 +116,54 @@ def test_agent_err_server_error() -> None:
     )
 
     assert result["status"] == "err"
-    # last assistant: input=60, cache_creation=0, cache_read=120, output=15 → 195
-    assert result["tokens"] == 60 + 0 + 120 + 15  # 195
+    assert result["tokens_in"] == 60
+    assert result["tokens_out"] == 15
+    assert result["tokens_cached"] == 120
 
 
 def test_agent_stopped_user() -> None:
     """agent_stopped_user.jsonl + meta_normal.json → status='stop'. Last event
     is a user event with 'Request interrupted by user'. Last assistant event
-    is mid-flow (stop_reason=tool_use), with usage tokens retained per spec
-    (status='stop' doesn't blank tokens — tokens reflect the last assistant).
+    is mid-flow (stop_reason=tool_use), with breakdown retained per plan.
+    Last assistant: input=30, cache_read=60, output=10.
     """
     result = compute_agent_snapshot(
         AGENT_STOPPED_USER, META_NORMAL, cache_entry=None
     )
 
     assert result["status"] == "stop"
-    # Last assistant: input=30, cache_creation=0, cache_read=60, output=10 → 100
-    assert result["tokens"] == 30 + 0 + 60 + 10  # 100
+    assert result["tokens_in"] == 30
+    assert result["tokens_out"] == 10
+    assert result["tokens_cached"] == 60
 
 
 def test_agent_running() -> None:
-    """agent_running.jsonl + meta_normal.json → status='run', tokens=None.
+    """agent_running.jsonl + meta_normal.json → status='run', breakdown
+    from last assistant event is non-zero (no longer blanked by run status).
 
-    Decision: status='run' → tokens=None per task spec. Even though the
-    last assistant event has usage data, mid-flow status blanks tokens.
+    Previously `tokens=None` for run; after Task 1, breakdown fields are
+    always populated from the last assistant event's usage. The user sees
+    current values, not blanks.
     """
     result = compute_agent_snapshot(
         AGENT_RUNNING, META_NORMAL, cache_entry=None
     )
 
     assert result["status"] == "run"
-    assert result["tokens"] is None
+    # Last assistant: input=40, cache_read=80, output=15.
+    assert result["tokens_in"] == 40
+    assert result["tokens_out"] == 15
+    assert result["tokens_cached"] == 80
+    # No `tokens` field anywhere.
+    assert "tokens" not in result
 
 
 def test_agent_no_assistant() -> None:
-    """agent_no_assistant.jsonl (only user events) → status='err', tokens=None.
+    """agent_no_assistant.jsonl (only user events) → status='err',
+    tokens_in/out/cached all zero.
 
-    Per plan spec ('agent с 0 assistant event-ов → status=err, tokens=None'):
-    the override applies here. detect_status alone would return 'run' for
-    a last-user-event with no error markers, but the plan wants 'err' as a
-    signal that the agent never produced output.
+    Per plan spec, the agent with zero assistant events surfaces breakdown
+    zeros so the row is never blanked. Status override → "err" is preserved.
     """
     result = compute_agent_snapshot(
         FIXTURES_DIR / "agent_no_assistant.jsonl",
@@ -157,7 +172,73 @@ def test_agent_no_assistant() -> None:
     )
 
     assert result["status"] == "err"
-    assert result["tokens"] is None
+    assert result["tokens_in"] == 0
+    assert result["tokens_out"] == 0
+    assert result["tokens_cached"] == 0
+    assert result["last_uuid"] is None
+    assert "tokens" not in result
+
+
+# ---------------------------------------------------------------------------
+# breakdown-field edge cases (new per Task 1)
+# ---------------------------------------------------------------------------
+
+def test_breakdown_absent_usage_block_yields_zeros(tmp_path: Path) -> None:
+    """Assistant event present but `message.usage` absent → all three
+    breakdown fields = 0. Synthesize a degenerate assistant event with
+    no usage key.
+    """
+    jsonl = tmp_path / "agent-no-usage.jsonl"
+    jsonl.write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg-no-usage",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "model": "claude-opus-4-1",
+                "stop_reason": "end_turn",
+            },
+            "uuid": "abcd0000-0000-0000-0000-000000000001",
+        })
+        + "\n"
+    )
+
+    result = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert result["status"] == "ok"
+    assert result["tokens_in"] == 0
+    assert result["tokens_out"] == 0
+    assert result["tokens_cached"] == 0
+
+
+def test_breakdown_zero_when_no_assistant_events(tmp_path: Path) -> None:
+    """Empty jsonl (no events at all) → last_event is None → all three
+    fields = 0. Distinct from `agent_no_assistant.jsonl` (which has user
+    events) — this covers the truly-empty case.
+    """
+    jsonl = tmp_path / "agent-empty.jsonl"
+    jsonl.write_text("")  # zero lines
+
+    result = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert result["tokens_in"] == 0
+    assert result["tokens_out"] == 0
+    assert result["tokens_cached"] == 0
+    assert result["last_uuid"] is None
+
+
+def test_breakdown_missing_jsonl_yields_zeros(tmp_path: Path) -> None:
+    """Missing jsonl file → no events → all three fields = 0."""
+    missing = tmp_path / "agent-does-not-exist.jsonl"
+    assert not missing.exists()
+
+    result = compute_agent_snapshot(missing, META_NORMAL, cache_entry=None)
+
+    assert result["tokens_in"] == 0
+    assert result["tokens_out"] == 0
+    assert result["tokens_cached"] == 0
     assert result["last_uuid"] is None
 
 
@@ -169,15 +250,16 @@ def test_meta_stopped_by_user_triggers_stop() -> None:
     """agent_ok.jsonl + meta_stopped_by_user.json → status='stop'.
 
     Even though the agent finished cleanly (last assistant end_turn),
-    meta.stoppedByUser=true overrides to 'stop'.
+    meta.stoppedByUser=true overrides to 'stop'. Breakdown still computed.
     """
     result = compute_agent_snapshot(
         AGENT_OK, META_STOPPED_BY_USER, cache_entry=None
     )
 
     assert result["status"] == "stop"
-    # Tokens still computed from last assistant event.
-    assert result["tokens"] == 100 + 200 + 300 + 50  # 650
+    assert result["tokens_in"] == 100
+    assert result["tokens_out"] == 50
+    assert result["tokens_cached"] == 300
 
 
 def test_meta_long_description_truncated() -> None:
@@ -234,11 +316,11 @@ def test_meta_missing_fallback() -> None:
 # cache hit / miss
 # ---------------------------------------------------------------------------
 
-def test_cache_hit() -> None:
-    """Pre-populate cache_entry with matching last_uuid AND mtime_jsonl →
-    function returns the cached dict without re-parsing. Sentinel value
-    'tokens=999_999_999' (which doesn't match any real event in the jsonl)
-    proves the cache was used.
+def test_cache_hit_with_breakdown_fields() -> None:
+    """Pre-populate cache_entry with matching last_uuid + mtime_jsonl +
+    mtime_meta AND all three breakdown fields → function returns the
+    cached dict without re-parsing. Sentinel values on the breakdown
+    fields prove the cache was used.
     """
     mtime = AGENT_OK.stat().st_mtime
     last_uuid = "a0000000-0000-0000-0000-000000000004"
@@ -246,7 +328,9 @@ def test_cache_hit() -> None:
     cache_entry = {
         "agentId": _agent_id(AGENT_OK),
         "status": "ok",
-        "tokens": 999_999_999,
+        "tokens_in": 11_111,
+        "tokens_out": 22_222,
+        "tokens_cached": 33_333,
         "description": "from-cache",
         "toolUseId": "toolu_cached",
         "last_uuid": last_uuid,
@@ -258,10 +342,73 @@ def test_cache_hit() -> None:
         AGENT_OK, META_NORMAL, cache_entry=cache_entry
     )
 
-    # If cache was used, the sentinel survives.
-    assert result["tokens"] == 999_999_999
+    # If cache was used, the sentinels survive.
+    assert result["tokens_in"] == 11_111
+    assert result["tokens_out"] == 22_222
+    assert result["tokens_cached"] == 33_333
     assert result["description"] == "from-cache"
     assert result["toolUseId"] == "toolu_cached"
+
+
+def test_cache_miss_when_breakdown_fields_missing() -> None:
+    """[upgrade path] Cache entry has matching last_uuid + mtime_jsonl +
+    mtime_meta but is missing one or more breakdown fields → cache MISS,
+    forward re-parse fills in fresh values. Without this check, a stale
+    pre-upgrade cache would render zeros (because render would fall back
+    via `int(a.get(field) or 0)`) until the next jsonl mutation.
+    """
+    mtime = AGENT_OK.stat().st_mtime
+    last_uuid = "a0000000-0000-0000-0000-000000000004"
+    mtime_meta = META_NORMAL.stat().st_mtime
+
+    # Case A: missing tokens_in entirely.
+    cache_no_in = {
+        "agentId": "wrong-id",
+        "status": "run",
+        "tokens_out": 222,
+        "tokens_cached": 333,
+        "description": "stale-no-in",
+        "toolUseId": "toolu_stale",
+        "last_uuid": last_uuid,
+        "mtime_jsonl": mtime,
+        "mtime_meta": mtime_meta,
+    }
+    r_a = compute_agent_snapshot(
+        AGENT_OK, META_NORMAL, cache_entry=cache_no_in
+    )
+    assert r_a["tokens_in"] == 100, (
+        "cache miss expected: missing tokens_in triggers re-parse"
+    )
+    assert r_a["tokens_out"] == 50
+    assert r_a["tokens_cached"] == 300
+    assert r_a["description"] == "Fixer: smells findings"
+
+    # Case B: missing tokens_out entirely.
+    cache_no_out = dict(cache_no_in)
+    cache_no_out["tokens_in"] = 111
+    del cache_no_out["tokens_out"]
+    r_b = compute_agent_snapshot(
+        AGENT_OK, META_NORMAL, cache_entry=cache_no_out
+    )
+    assert r_b["tokens_out"] == 50, (
+        "cache miss expected: missing tokens_out triggers re-parse"
+    )
+    assert r_b["tokens_in"] == 100
+    assert r_b["tokens_cached"] == 300
+
+    # Case C: missing tokens_cached entirely.
+    cache_no_cached = dict(cache_no_in)
+    cache_no_cached["tokens_in"] = 111
+    cache_no_cached["tokens_out"] = 222
+    del cache_no_cached["tokens_cached"]
+    r_c = compute_agent_snapshot(
+        AGENT_OK, META_NORMAL, cache_entry=cache_no_cached
+    )
+    assert r_c["tokens_cached"] == 300, (
+        "cache miss expected: missing tokens_cached triggers re-parse"
+    )
+    assert r_c["tokens_in"] == 100
+    assert r_c["tokens_out"] == 50
 
 
 def test_cache_miss_recomputes() -> None:
@@ -273,7 +420,9 @@ def test_cache_miss_recomputes() -> None:
     cache_wrong_uuid = {
         "agentId": "wrong-id",
         "status": "run",
-        "tokens": 42,
+        "tokens_in": 111,
+        "tokens_out": 222,
+        "tokens_cached": 333,
         "description": "stale-description",
         "toolUseId": "toolu_stale",
         "last_uuid": "stale-uuid-that-doesnt-match",
@@ -283,7 +432,9 @@ def test_cache_miss_recomputes() -> None:
     result = compute_agent_snapshot(
         AGENT_OK, META_NORMAL, cache_entry=cache_wrong_uuid
     )
-    assert result["tokens"] == 650
+    assert result["tokens_in"] == 100
+    assert result["tokens_out"] == 50
+    assert result["tokens_cached"] == 300
     assert result["description"] == "Fixer: smells findings"
     assert result["last_uuid"] == "a0000000-0000-0000-0000-000000000004"
 
@@ -291,13 +442,17 @@ def test_cache_miss_recomputes() -> None:
     cache_stale_mtime = dict(cache_wrong_uuid)
     cache_stale_mtime["last_uuid"] = "a0000000-0000-0000-0000-000000000004"
     cache_stale_mtime["mtime_jsonl"] = 0.0  # stale
-    cache_stale_mtime["tokens"] = 7777
+    cache_stale_mtime["tokens_in"] = 7777
+    cache_stale_mtime["tokens_out"] = 7778
+    cache_stale_mtime["tokens_cached"] = 7779
     cache_stale_mtime["description"] = "stale-via-mtime"
 
     result2 = compute_agent_snapshot(
         AGENT_OK, META_NORMAL, cache_entry=cache_stale_mtime
     )
-    assert result2["tokens"] == 650
+    assert result2["tokens_in"] == 100
+    assert result2["tokens_out"] == 50
+    assert result2["tokens_cached"] == 300
     assert result2["description"] == "Fixer: smells findings"
 
 
@@ -307,9 +462,9 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
     even when jsonl mtime+uuid are unchanged.
 
     Strategy: copy AGENT_OK to tmp, copy META_NORMAL to tmp with a different
-    filename, build cache_entry with matching last_uuid+mtime_jsonl but
-    STALE mtime_meta, then mutate the meta file (touch with new mtime) and
-    verify the cache is invalidated."""
+    filename, build cache_entry with matching last_uuid+mtime_jsonl AND
+    breakdown fields, but STALE mtime_meta, then mutate the meta file
+    (touch with new mtime) and verify the cache is invalidated."""
     src_jsonl = AGENT_OK
     src_meta = META_NORMAL
     work_jsonl = tmp_path / "agent-test.jsonl"
@@ -323,11 +478,14 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
     mtime_meta_v1 = work_meta.stat().st_mtime
     last_uuid = "a0000000-0000-0000-0000-000000000004"
 
-    # Cache built when meta was at v1.
+    # Cache built when meta was at v1. Includes the three breakdown fields
+    # so the only thing invalidating the cache is mtime_meta.
     cache_v1 = {
         "agentId": "agent-test",
         "status": "ok",
-        "tokens": 999_999_999,  # sentinel — should not survive
+        "tokens_in": 9_999_999,  # sentinel — should not survive
+        "tokens_out": 9_999_999,
+        "tokens_cached": 9_999_999,
         "description": "stale-from-v1",
         "toolUseId": "toolu_v1",
         "last_uuid": last_uuid,
@@ -335,9 +493,11 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
         "mtime_meta": mtime_meta_v1,
     }
 
-    # First call: cache hits (matching key).
+    # First call: cache hits (matching key + breakdown present).
     r1 = compute_agent_snapshot(work_jsonl, work_meta, cache_entry=cache_v1)
-    assert r1["tokens"] == 999_999_999, "expected cache hit on first call"
+    assert r1["tokens_in"] == 9_999_999, "expected cache hit on first call"
+    assert r1["tokens_out"] == 9_999_999
+    assert r1["tokens_cached"] == 9_999_999
 
     # Mutate the meta file — write new content AND bump mtime forward.
     work_meta.write_text(json.dumps({
@@ -351,7 +511,7 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
 
     # Second call: cache should miss because mtime_meta changed.
     r2 = compute_agent_snapshot(work_jsonl, work_meta, cache_entry=cache_v1)
-    assert r2["tokens"] != 999_999_999, (
+    assert r2["tokens_in"] != 9_999_999, (
         "cache should have invalidated on meta mtime change, but the "
         "sentinel survived"
     )

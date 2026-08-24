@@ -343,20 +343,6 @@ def _read_last_event(
     return (last_assistant, last_event)
 
 
-def _sum_usage(usage: dict) -> int:
-    """Sum the four token counters from a `usage` dict.
-
-    Returns input + output + cache_creation + cache_read. Coerces each
-    value through `int(... or 0)` so missing/None values count as 0.
-    """
-    return (
-        int(usage.get("input_tokens", 0) or 0)
-        + int(usage.get("output_tokens", 0) or 0)
-        + int(usage.get("cache_creation_input_tokens", 0) or 0)
-        + int(usage.get("cache_read_input_tokens", 0) or 0)
-    )
-
-
 def _scan_main_jsonl(jsonl_path: Path) -> tuple[int, int, int, int, dict[str, int], str, dict[str, str]]:
     """Forward-scan a main jsonl summing token usage and extracting tool_use
     positions.
@@ -599,22 +585,34 @@ def compute_agent_snapshot(
     """Return snapshot dict for a single subagent.
 
     Returns a dict with keys:
-        agentId      — jsonl filename without `.jsonl` extension
-        status       — one of {"ok","err","stop","run"} (see detect_status)
-        tokens       — sum of input+output+cache_creation+cache_read from
-                       the last assistant event's `usage`; None if there is
-                       no assistant event or status is "run" (mid-flow).
-        description  — meta.description, truncated to 40 chars with "…".
-                       Falls back to meta.agentType, then "unknown".
-        toolUseId    — meta.toolUseId (string; "" if missing)
-        last_uuid    — uuid of the last assistant event, or None
-        mtime_jsonl  — st_mtime of jsonl_path, or 0.0 if missing
-        mtime_meta   — st_mtime of meta_path, or 0.0 if missing
+        agentId       — jsonl filename without `.jsonl` extension
+        status        — one of {"ok","err","stop","run"} (see detect_status)
+        tokens_in     — input_tokens from the last assistant event's usage
+                        (or 0 if no assistant event / no usage block)
+        tokens_out    — output_tokens from the last assistant event's usage
+                        (or 0 if no assistant event / no usage block)
+        tokens_cached — cache_read_input_tokens from the last assistant event's
+                        usage (or 0 if no assistant event / no usage block).
+                        cache_creation_input_tokens is NOT surfaced.
+        description   — meta.description, truncated to 40 chars with "…".
+                        Falls back to meta.agentType, then "unknown".
+        toolUseId     — meta.toolUseId (string; "" if missing)
+        last_uuid     — uuid of the last assistant event, or None
+        mtime_jsonl   — st_mtime of jsonl_path, or 0.0 if missing
+        mtime_meta    — st_mtime of meta_path, or 0.0 if missing
+
+    Breakdown fields (tokens_in / tokens_out / tokens_cached) are ALWAYS
+    populated as ints, even for status="run" (mid-flow) — the user sees
+    current values, not blanks. Agents with no assistant events or with
+    a missing `usage` block get zeros in all three fields.
 
     Cache hit: if `cache_entry` is provided AND its last_uuid AND
-    mtime_jsonl match the current jsonl state, the cache_entry is returned
-    unchanged. This function does NOT write to any cache file — the caller
-    (orchestrator) owns cache persistence.
+    mtime_jsonl AND mtime_meta match the current on-disk state AND all
+    three breakdown fields are present in cache_entry, the cache_entry is
+    returned unchanged. The field-presence check guards against stale
+    pre-upgrade caches (which would render zeros via `int(a.get(field)
+    or 0)` until the next jsonl mutation). This function does NOT write
+    to any cache file — the caller (orchestrator) owns cache persistence.
 
     [deviation] When the jsonl contains zero assistant events at all, status
     is forced to "err" (or "stop" if meta.stoppedByUser=true) regardless of
@@ -625,9 +623,10 @@ def compute_agent_snapshot(
 
     # 2. Last assistant event AND last event of any type — both extracted
     # from a single reverse pass via _read_last_event. The assistant
-    # event drives `tokens` and `last_uuid`; the very last event of any
-    # type drives status detection (e.g. a user "[Request interrupted
-    # by user]" event after the final assistant must surface as "stop").
+    # event drives breakdown fields and `last_uuid`; the very last event
+    # of any type drives status detection (e.g. a user "[Request
+    # interrupted by user]" event after the final assistant must surface
+    # as "stop").
     last_event, last_jsonl_event = _read_last_event(jsonl_path)
 
     # 3. Load meta ({} on any failure).
@@ -636,6 +635,10 @@ def compute_agent_snapshot(
     # 4. Cache hit check. mtime_meta is part of the key: if meta.json
     # mutates (e.g. stoppedByUser added later, description edited),
     # cache must invalidate even if jsonl mtime+uuid are unchanged.
+    # Field-presence check for the three breakdown fields is REQUIRED:
+    # a pre-upgrade cache (old format) would otherwise satisfy the
+    # key-match but lack the new fields, leading to render zeros in the
+    # breakdown columns until the next jsonl mutation.
     mtime_meta_for_compare = _meta_mtime(meta_path)
     last_uuid_for_compare: str | None = (
         last_event.get("uuid") if last_event else None
@@ -648,6 +651,9 @@ def compute_agent_snapshot(
             cache_entry.get("last_uuid") == last_uuid_for_compare
             and cache_entry.get("mtime_jsonl") == mtime_jsonl
             and cache_entry.get("mtime_meta") == mtime_meta_for_compare
+            and "tokens_in" in cache_entry
+            and "tokens_out" in cache_entry
+            and "tokens_cached" in cache_entry
         ):
             # Preserve the invariant: the returned snapshot always has
             # `agentId` inside, regardless of cache hit or miss. The
@@ -675,14 +681,19 @@ def compute_agent_snapshot(
         detect_input = last_jsonl_event if last_jsonl_event is not None else last_event
         status = detect_status(detect_input, meta)
 
-    # tokens — None if no assistant event or status is "run"; otherwise sum
-    # input + output + cache_creation + cache_read from last_event.message.usage.
-    if last_event is None or status == "run":
-        tokens: int | None = None
+    # breakdown — input_tokens / output_tokens / cache_read_input_tokens from
+    # the last assistant event's `message.usage`. Coerce via `int(... or 0)`
+    # so missing/None values are 0. cache_creation_input_tokens is NOT
+    # surfaced. Always returns three ints — including for status="run"
+    # (mid-flow) and for missing/empty jsonl — so render always sees numbers.
+    msg = last_event.get("message") or {} if last_event else {}
+    usage = msg.get("usage") if isinstance(msg, dict) else None
+    if isinstance(usage, dict):
+        tokens_in = int(usage.get("input_tokens", 0) or 0)
+        tokens_out = int(usage.get("output_tokens", 0) or 0)
+        tokens_cached = int(usage.get("cache_read_input_tokens", 0) or 0)
     else:
-        msg = last_event.get("message") or {}
-        usage = msg.get("usage") if isinstance(msg, dict) else None
-        tokens = _sum_usage(usage) if isinstance(usage, dict) else None
+        tokens_in = tokens_out = tokens_cached = 0
 
     # description — meta.description, fallback to meta.agentType, then
     # "unknown". Truncate to 40 chars with U+2026 if longer.
@@ -696,7 +707,9 @@ def compute_agent_snapshot(
     return {
         "agentId": agent_id,
         "status": status,
-        "tokens": tokens,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "tokens_cached": tokens_cached,
         "description": description,
         "toolUseId": tool_use_id,
         "last_uuid": last_uuid_for_compare,
@@ -891,13 +904,15 @@ def render_output(header: str, main_total: int, agents: list) -> str:
 # so NOT stored inside each entry; compute_agent_snapshot re-injects
 # agentId on the cache-hit path to keep the returned dict shape stable
 # for downstream consumers (see _write_agents_cache and _AGENT_CACHE_FIELDS
-# invariant). mtime_jsonl/last_uuid drive invalidation; the rest is the
-# render-ready snapshot.
+# invariant). mtime_jsonl/mtime_meta drive invalidation; the breakdown
+# fields are the new render-ready shape (replacing the prior `tokens` sum).
 _AGENT_CACHE_FIELDS = (
     "last_uuid",
     "mtime_jsonl",
     "status",
-    "tokens",
+    "tokens_in",
+    "tokens_out",
+    "tokens_cached",
     "description",
     "toolUseId",
     "mtime_meta",

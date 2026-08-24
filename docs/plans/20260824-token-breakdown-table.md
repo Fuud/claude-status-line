@@ -156,20 +156,20 @@ def render_output(
 - Modify: `status_line.py` (функция `compute_agent_snapshot`, константа `_AGENT_CACHE_FIELDS`)
 - Modify: `tests/test_compute_agent_snapshot.py`
 
-- [ ] добавить тесты: `tokens_in / tokens_out / tokens_cached` присутствуют в snapshot с правильными значениями из `last_event.message.usage`
-- [ ] добавить тест: `last_event is None` → все три поля = 0
-- [ ] добавить тест: status `run` + last_event есть → breakdown не нули
-- [ ] добавить тест: usage-блок отсутствует → все три поля = 0
-- [ ] добавить тест: cache hit (cache_entry с breakdown-полями + совпадающие ключи) → возвращается запись с breakdown
-- [ ] добавить тест: cache miss при совпадающих ключах, но отсутствии breakdown-полей → пересчёт заполняет все поля (upgrade-путь)
-- [ ] удалить или обновить существующие тесты, проверяющие поле `tokens` (например `test_agent_ok_full_snapshot`, `test_agent_running_snapshot` и т.п.) — больше нет поля `tokens`
-- [ ] обновить `test_agent_no_assistant_*`: теперь проверять `tokens_in/out/cached == 0` (не `tokens is None`)
-- [ ] в `compute_agent_snapshot` после получения `last_event` добавить вычисление `tokens_in`, `tokens_out`, `tokens_cached` через `int(usage.get(field, 0) or 0)`
-- [ ] в `compute_agent_snapshot` убрать ветку `tokens=None` для run-агентов — теперь всегда возвращаем числа (или нули)
-- [ ] в `compute_agent_snapshot` убрать поле `tokens` из возвращаемого dict (полностью)
-- [ ] в cache-hit ветке `compute_agent_snapshot` добавить field-presence check: `"tokens_in" in cache_entry and "tokens_out" in cache_entry and "tokens_cached" in cache_entry`
-- [ ] в `_AGENT_CACHE_FIELDS` убрать `"tokens"`, добавить `"tokens_in", "tokens_out", "tokens_cached"`
-- [ ] запустить `python -m pytest tests/test_compute_agent_snapshot.py` — все тесты должны проходить
+- [x] добавить тесты: `tokens_in / tokens_out / tokens_cached` присутствуют в snapshot с правильными значениями из `last_event.message.usage`
+- [x] добавить тест: `last_event is None` → все три поля = 0
+- [x] добавить тест: status `run` + last_event есть → breakdown не нули
+- [x] добавить тест: usage-блок отсутствует → все три поля = 0
+- [x] добавить тест: cache hit (cache_entry с breakdown-полями + совпадающие ключи) → возвращается запись с breakdown
+- [x] добавить тест: cache miss при совпадающих ключах, но отсутствии breakdown-полей → пересчёт заполняет все поля (upgrade-путь)
+- [x] удалить или обновить существующие тесты, проверяющие поле `tokens` (например `test_agent_ok_full_snapshot`, `test_agent_running_snapshot` и т.п.) — больше нет поля `tokens`
+- [x] обновить `test_agent_no_assistant_*`: теперь проверять `tokens_in/out/cached == 0` (не `tokens is None`)
+- [x] в `compute_agent_snapshot` после получения `last_event` добавить вычисление `tokens_in`, `tokens_out`, `tokens_cached` через `int(usage.get(field, 0) or 0)`
+- [x] в `compute_agent_snapshot` убрать ветку `tokens=None` для run-агентов — теперь всегда возвращаем числа (или нули)
+- [x] в `compute_agent_snapshot` убрать поле `tokens` из возвращаемого dict (полностью)
+- [x] в cache-hit ветке `compute_agent_snapshot` добавить field-presence check: `"tokens_in" in cache_entry and "tokens_out" in cache_entry and "tokens_cached" in cache_entry`
+- [x] в `_AGENT_CACHE_FIELDS` убрать `"tokens"`, добавить `"tokens_in", "tokens_out", "tokens_cached"`
+- [x] запустить `python -m pytest tests/test_compute_agent_snapshot.py` — все тесты должны проходить
 
 ### Task 2: Drop `total` из `compute_main_cum`
 
