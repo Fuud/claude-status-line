@@ -10,19 +10,19 @@ Renders a multi-line status string consumed by the Claude Code status-line
 hook. Layout:
 
 ```
-Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a
-|          in     out   cached
-| start:   12k    1k    0
-| sum:     1.2M   35k   53.2M
-| main:    1.1M   30k   50.8M
-| [ok]    Review: implementation plan     12k    4k   100k
-| [err]   Review: quality                 0      0      0
-| [run]   Task 4: MissingGlyphLog          3k    1k    12k
+Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
+|                                           in     out  cached
+| start:                                   12k      1k       0
+| sum:                                    1.1M     35k   50.9M
+| main:                                   1.1M     30k   50.8M
+| [ok]    Review: implementation plan      12k      4k    100k
+| [err]   Review: quality                    0       0       0
+| [run]   Task 4: MissingGlyphLog           3k      1k     12k
 ```
 
 Line layout:
 
-- Line 1 — header (`Session: ...`)
+- Line 1 — header (`Session: ... | Context: NK (P%)`)
 - Line 2 — table header (`in / out / cached`, each right-aligned under
   its own column)
 - Line 3 — `start:` row with the FIRST assistant event's breakdown —
