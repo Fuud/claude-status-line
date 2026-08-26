@@ -74,12 +74,16 @@ Code's status-line hook configuration.
 `main()` is called by Claude Code via the wrapper. It:
 
 1. Reads the JSON hook payload from stdin.
-2. Resolves `session_id` → `~/.claude/projects/<encoded>/<sid>/` via
-   `find_session_dir`.
+2. Resolves `session_id` → ALL matching session dirs
+   `~/.claude/projects/<encoded>/<sid>/` via `_resolve_session_dirs`
+   (a session id can legitimately exist in several encoded project dirs —
+   e.g. the main checkout and a worktree copy; the `transcript_path`'s
+   dir comes first, the rest in glob order).
 3. Computes cumulative tokens for the main jsonl (`compute_main_cum`),
    with on-disk cache at `~/.claude/status_line/data/main_<sid>.json`.
-4. Iterates subagent jsonl files, computing a per-agent snapshot
-   (`compute_agent_snapshot`) using the agents cache at
+4. Iterates subagent jsonl files across ALL resolved dirs, computing a
+   per-agent snapshot (`compute_agent_snapshot`) and merging them with
+   dedup by `agentId` (first dir wins), using the agents cache at
    `~/.claude/status_line/data/agents_<sid>.json`.
 5. Sorts agents by main-jsonl `tool_use` position (`sort_agents`).
 6. Renders the multi-line output (`render_output`).
@@ -133,6 +137,14 @@ Both files are written atomically (`.tmp` → `os.replace()`).
   with the new shape and subsequent calls hit cleanly. Without this
   check, a stale entry would render zeros (via `int(field or 0)`) until
   the next jsonl mutation.
+- **Stale empty `agents_<sid>.json`** (written by pre-2026-08 versions
+  that scanned only one session dir — the worktree-split bug): rewritten
+  automatically on the next invocation once agents are found across all
+  session dirs; no manual cleanup needed.
+- **Same session id in multiple project dirs** (main checkout + worktree
+  copy): all matching dirs are resolved, agents merged across them, and
+  duplicates deduped by `agentId` — the `transcript_path`'s dir wins;
+  without a `transcript_path`, glob order decides.
 
 ## Tests
 
@@ -145,9 +157,12 @@ python3 -m pytest tests/ -v
 
 210+ tests cover: pure functions (`format_tokens`, `detect_status`,
 `parse_stdin`), I/O helpers (`compute_main_cum`, `compute_agent_snapshot`,
-`find_session_dir`, `sort_agents`, `_write_agents_cache`), `render_output`
-(including the `start:` row), `main()` end-to-end against a real session
-fixture, and the bash wrapper.
+`find_session_dir(s)`, `_resolve_session_dirs`, `sort_agents`,
+`_write_agents_cache`), `render_output` (including the `start:` row),
+`main()` end-to-end against a real session fixture — including the
+multi-dir merge across duplicate session dirs (`tests/test_resolve_session_dirs.py`,
+`tests/test_find_session_dir.py`) and a runtime smoke test — and the bash
+wrapper.
 
 ### Real-session fixture
 

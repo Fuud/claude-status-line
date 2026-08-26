@@ -86,6 +86,12 @@ Option A+ (согласовано в брейншторме):
   фильтром `is_dir()`, что и `find_session_dir`; возвращает список в порядке
   glob (OS-dependent, как задокументировано); пустой `session_id` или
   несуществующий `projects_root` → `[]`.
+  [deviation] (review fix, 2026-08-26) glob заменён на одноуровневый
+  `*/<sid>` + проверка корневого `<sid>`: рекурсивный `**` обходил все
+  `subagents/` и `tool-results/` поддеревья (~110ms vs ~6ms на реальном
+  дереве) ради совпадений, которых конвенция `<encoded-project>/<sid>/`
+  не порождает — проверено на реальном дереве: все session-каталоги на
+  глубине 1. Семантика для реальных данных идентична.
 - `_resolve_session_dirs`: если `transcript_path` непустой и
   `Path(transcript_path).parent / session_id` — существующий каталог, он идёт
   первым; если glob вернул его же — не дублируем; остальные совпадения — в
@@ -123,6 +129,10 @@ Option A+ (согласовано в брейншторме):
 - [x] убедиться, что новые тесты падают (функции ещё нет)
 - [x] реализовать `find_session_dirs` в `status_line.py` (glob `**/<sid>`,
       фильтр `is_dir()`, список в порядке glob)
+      [deviation] (review fix) заменено на одноуровневый `*/<sid>` +
+      корневой `<sid>` — см. Technical Details; все реальные
+      session-каталоги на глубине 1, полный обход дерева стоил ~110ms
+      за вызов хука
 - [x] переписать `find_session_dir` как обёртку: первый элемент
       `find_session_dirs` или `None` (докстринг обновить; заодно модульный
       докстринг `tests/test_find_session_dir.py` — «returns the first match»
@@ -206,8 +216,23 @@ projects_root=None) -> list[Path]`
 
 ### Task 6: [Final] Update documentation
 
-- [ ] update README.md если описание поведения session dir затронуто
-- [ ] move this plan to `docs/plans/completed/`
+- [x] ➕ (найдено при верификации Task 5) нормализовать backslash'и в
+      `transcript_path` внутри `_resolve_session_dirs`: в проде хук работает
+      под cygwin python3, CC присылает windows-пути с backslash, и
+      `PosixPath('C:\\Users\\...').parent` даёт `'.'` — transcript-приоритет
+      молча деградирует до чистого glob (merge не задет, но дедуп-приоритет
+      не включается). TDD: красный тест в
+      `tests/test_resolve_session_dirs.py`, затем фикс — сделано
+      (7985a52): красный тест подтверждён на cygwin python, фикс
+      `.replace("\\", "/")`; `_find_main_jsonl` проверен ad-hoc —
+      `is_file()` на backslash-пути под cygwin работает (True), не тронут
+- [x] update README.md если описание поведения session dir затронуто —
+      обновлены шаги 2 и 4 «How it works» (e26e077): `_resolve_session_dirs`
+      (все одноимённые каталоги, transcript-каталог первым) и merge агентов
+      с дедупом по `agentId`
+- [x] move this plan to `docs/plans/completed/` — [x] move handled by
+      orchestrator post-run (move-plan.sh); файл не перемещался в этом
+      прогоне
 
 ## Post-Completion
 
