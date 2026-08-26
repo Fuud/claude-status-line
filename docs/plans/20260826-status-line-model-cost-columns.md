@@ -270,12 +270,12 @@ agents, prices=None, host="")` — плоская тройка main заменя
 - Create: `prices.example.json`
 - Modify: `tests/test_main_integration.py`
 
-- [ ] расширить `_run_main` возможностью выставлять И снимать `ANTHROPIC_BASE_URL` per-test (сейчас env машины протекает в subprocess — тесты `@host`-матчинга становятся машинозависимыми)
-- [ ] красные интеграционные тесты на fixture-сессии (subprocess + fake-HOME, `prices.json` пишется в fake-HOME): колонки есть с моделями kimi-k3/glm-5.3 и cost (вариант с `@host`-ключом и с plain-ключом); без файла — колонок нет; битый файл — колонок нет; `<synthetic>` не отображается
-- [ ] обновить ожидания кумулятивных значений агентов/sum в интеграционных тестах (если не закрыто в Task 3)
-- [ ] `_main_unsafe`: `provider_host()` + `load_prices(_PRICES_PATH)` → `render_output` (`main_models` передаётся уже с Task 4)
-- [ ] `.gitignore` += `prices.json`; создать `prices.example.json` с двумя моделями из Technical Details
-- [ ] зелёные тесты, прогон всей suite
+- [x] расширить `_run_main` возможностью выставлять И снимать `ANTHROPIC_BASE_URL` per-test (сейчас env машины протекает в subprocess — тесты `@host`-матчинга становятся машинозависимыми)
+- [x] красные интеграционные тесты на fixture-сессии (subprocess + fake-HOME, `prices.json` пишется в fake-HOME): колонки есть с моделями kimi-k3/glm-5.3 и cost (вариант с `@host`-ключом и с plain-ключом); без файла — колонок нет; битый файл — колонок нет; `<synthetic>` не отображается
+- [x] обновить ожидания кумулятивных значений агентов/sum в интеграционных тестах (если не закрыто в Task 3)
+- [x] `_main_unsafe`: `provider_host()` + `load_prices(_PRICES_PATH)` → `render_output` (`main_models` передаётся уже с Task 4)
+- [x] `.gitignore` += `prices.json`; создать `prices.example.json` с двумя моделями из Technical Details
+- [x] зелёные тесты, прогон всей suite
 
 ### Task 6: README
 

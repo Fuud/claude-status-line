@@ -1597,9 +1597,9 @@ def render_output(
     main_models is the per-model breakdown {model_id: {"in","out","cached"}}
     (see _scan_main_jsonl); the main row's totals are the sum of its
     records. `prices` is a load_prices() dict, `host` a provider_host()
-    string — the orchestrator wires both (Task 5); the model column sits
-    between the description and `in` (left-aligned), the cost column
-    after `cached` (right-aligned).
+    string — the orchestrator wires both (see _main_unsafe); the model
+    column sits between the description and `in` (left-aligned), the cost
+    column after `cached` (right-aligned).
 
     Groups with prices: sum (per-model merge of main_models and every
     agent's `models`, NO cross-model sums, model order = first appearance
@@ -2016,16 +2016,19 @@ def _main_unsafe() -> int:
     # main()'s except clause — silently degrading to the fallback header.
     tool_use_positions = main_cum.get("tool_use_positions")
     agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
-    # Task 4 — model/cost columns: render_output consumes the per-model
+    # Task 4/5 — model/cost columns: render_output consumes the per-model
     # dict (the main row's totals are the sum of its records; cum_in /
-    # cum_out / cum_cache_read are no longer passed flat). prices/host
-    # wiring is the Task 5 orchestrator work — until then the hook
-    # renders the no-prices layout. `or 0` / `or {}` guard pre-upgrade
-    # caches.
+    # cum_out / cum_cache_read are no longer passed flat). prices come from
+    # ~/.claude/status_line/prices.json (None when missing/invalid → the
+    # no-columns layout) and the provider host from ANTHROPIC_BASE_URL (""
+    # when unset — plain keys then match, "@host" keys never do). `or 0` /
+    # `or {}` guard pre-upgrade caches.
     start_in = int(main_cum.get("start_in") or 0)
     start_out = int(main_cum.get("start_out") or 0)
     start_cached = int(main_cum.get("start_cached") or 0)
     main_models = main_cum.get("per_model") or {}
+    prices = load_prices(_PRICES_PATH)
+    host = provider_host()
     output = render_output(
         header,
         start_in,
@@ -2033,8 +2036,8 @@ def _main_unsafe() -> int:
         start_cached,
         main_models,
         agents,
-        prices=None,
-        host="",
+        prices=prices,
+        host=host,
     )
     print(output)
     return 0

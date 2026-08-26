@@ -1,0 +1,18 @@
+[
+  {
+    "model": "glm-5.3@api.z.ai",
+    "in": 6.9,
+    "out": 24,
+    "cache": 1.7,
+    "per": 10000,
+    "units": "credits"
+  },
+  {
+    "model": "kimi-k3",
+    "in": 3,
+    "out": 15,
+    "cache": 0.3,
+    "per": 1000000,
+    "units": "$"
+  }
+]

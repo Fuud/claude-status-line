@@ -1,5 +1,6 @@
 data/
 tests/fixtures/real_session/*
 !tests/fixtures/real_session/README.md
+prices.json
 __pycache__/
 *.pyc

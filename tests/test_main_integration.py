@@ -35,8 +35,10 @@ def _run_main(
 ) -> subprocess.CompletedProcess:
     """Spawn status_line.py with HOME=<home> and feed stdin (str).
 
-    CLAUDE_CODE_CONTEXT_LIMIT is always popped so context-limit resolution
-    is deterministic; pass an override via extra_env."""
+    CLAUDE_CODE_CONTEXT_LIMIT and ANTHROPIC_BASE_URL are always POPPED so
+    context-limit resolution and provider-host matching are deterministic
+    (the machine's own values must not leak into the subprocess); pass
+    per-test overrides via extra_env to set them again."""
     env = os.environ.copy()
     # Path.home() on Windows Python consults USERPROFILE first, then HOME.
     # Override both so the child process sees a deterministic home.
@@ -45,6 +47,10 @@ def _run_main(
     env.pop("HOMEDRIVE", None)
     env.pop("HOMEPATH", None)
     env.pop("CLAUDE_CODE_CONTEXT_LIMIT", None)
+    # provider_host() reads this in the child; without the pop the machine
+    # env decides whether "@host"-keyed prices match, making those tests
+    # machine-dependent.
+    env.pop("ANTHROPIC_BASE_URL", None)
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -1163,3 +1169,187 @@ def test_hook_runtime_smoke_on_multi_project_tree(tmp_path: Path) -> None:
     output = result.stdout.decode("utf-8")
     assert "Smoke 0-0-1" in output, f"target session's agents must render:\n{output!r}"
     assert elapsed < 5.0, f"hook invocation took {elapsed:.2f}s on the synthetic tree (>5s budget)"
+
+
+# ---------------------------------------------------------------------------
+# 12. prices.json / model+cost columns (20260826 plan, Task 5). prices.json
+#     is written into the FAKE home so the subprocess resolves
+#     _PRICES_PATH = <home>/.claude/status_line/prices.json hermetically
+#     (HOME/USERPROFILE are overridden in _run_main). ANTHROPIC_BASE_URL is
+#     popped by _run_main unless a test sets it via extra_env.
+# ---------------------------------------------------------------------------
+
+# Uniform prices (in=out=cache=1 per 1M tokens, "$") keep the expected cost
+# arithmetic trivial: cost = (in + out + cached) / 1e6, "$"-prefixed.
+_UNIT_PRICES = [
+    {"model": "kimi-k3", "in": 1, "out": 1, "cache": 1, "per": 1_000_000, "units": "$"},
+    {"model": "glm-5.3", "in": 1, "out": 1, "cache": 1, "per": 1_000_000, "units": "$"},
+]
+# Same numbers, but keyed "<model>@api.z.ai" — only reachable when the child
+# sees ANTHROPIC_BASE_URL with that hostname (price_for's "@host" chain).
+_UNIT_PRICES_AT_HOST = [
+    {"model": "kimi-k3@api.z.ai", "in": 1, "out": 1, "cache": 1, "per": 1_000_000, "units": "$"},
+    {"model": "glm-5.3@api.z.ai", "in": 1, "out": 1, "cache": 1, "per": 1_000_000, "units": "$"},
+]
+
+# Fixture main jsonl per-model cumulative totals (verified against the file):
+#   kimi-k3:     in=6613240 out=265021 cached=36263168
+#   glm-5.3:     in=414451  out=16739  cached=7183936
+#   <synthetic>: all zero → skipped at render
+# format_tokens → "6.6M"/"265k"/"36.3M" and "414k"/"17k"/"7.2M".
+# Cost with _UNIT_PRICES = (in+out+cached)/1e6 → 43.141429 → "$43.1" and
+# 7.615126 → "$7.6".
+_MAIN_KIMI_ROW = ["|", "main:", "kimi-k3", "6.6M", "265k", "36.3M", "$43.1"]
+_MAIN_GLM_ROW = ["|", "glm-5.3", "414k", "17k", "7.2M", "$7.6"]
+
+# With prices the fixture renders 45 lines: header + table header + start
+# + sum(2 models) + main(2 models) + 38 agent rows (27 kimi-k3, 6 glm-5.3,
+# 5 zero-token agents as single zero rows with an empty model cell).
+_PRICES_LINE_COUNT = 45
+_NO_PRICES_LINE_COUNT = 43
+
+
+def _write_prices(home: Path, payload: object) -> Path:
+    """Write a prices payload to <home>/.claude/status_line/prices.json."""
+    prices_path = home / ".claude" / "status_line" / "prices.json"
+    prices_path.parent.mkdir(parents=True, exist_ok=True)
+    prices_path.write_text(json.dumps(payload), encoding="utf-8")
+    return prices_path
+
+
+def test_prices_plain_key_adds_model_and_cost_columns(
+    fake_home_with_real_session,
+) -> None:
+    """prices.json with PLAIN model keys (no env) → model/cost columns render:
+    table header gains the labels, sum/main expand per model (first-appearance
+    order: kimi-k3 then glm-5.3), costs come from the unit prices, and the
+    zero-token <synthetic> record is not displayed anywhere."""
+    tmp_path, sid = fake_home_with_real_session
+    _write_prices(tmp_path, _UNIT_PRICES)
+
+    stdin = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, (
+        f"non-zero exit; stderr={result.stderr.decode('utf-8', 'replace')}"
+    )
+    output = result.stdout.decode("utf-8")
+    lines = output.splitlines()
+    assert len(lines) == _PRICES_LINE_COUNT, (
+        f"expected {_PRICES_LINE_COUNT} lines, got {len(lines)}; "
+        f"first 8: {lines[:8]}"
+    )
+    # Table header carries the model and cost labels alongside in/out/cached.
+    assert lines[1].split() == ["|", "model", "in", "out", "cached", "cost"], (
+        f"table header: {lines[1]!r}"
+    )
+    # The start row is a reference row: no model, no cost cell.
+    assert lines[2].split()[:2] == ["|", "start:"], f"start row: {lines[2]!r}"
+    assert len(lines[2].split()) == 5, (
+        f"start row must carry exactly in/out/cached cells: {lines[2]!r}"
+    )
+    # sum group: two model rows, label only on the first, both with costs.
+    assert lines[3].split()[:3] == ["|", "sum:", "kimi-k3"], f"sum row 1: {lines[3]!r}"
+    assert lines[3].split()[-1].startswith("$"), f"sum row 1 cost: {lines[3]!r}"
+    assert lines[4].split()[:2] == ["|", "glm-5.3"], f"sum row 2: {lines[4]!r}"
+    assert "sum:" not in lines[4], f"label must ride the first row only: {lines[4]!r}"
+    assert lines[4].split()[-1].startswith("$"), f"sum row 2 cost: {lines[4]!r}"
+    # main group: per-model cumulative totals + computed costs.
+    assert lines[5].split() == _MAIN_KIMI_ROW, f"main row 1: {lines[5]!r}"
+    assert lines[6].split() == _MAIN_GLM_ROW, f"main row 2: {lines[6]!r}"
+    # 38 agent rows, one per agent: single-model agents collapse to one row.
+    agent_lines = lines[7:]
+    assert len(agent_lines) == 38, f"expected 38 agent rows, got {len(agent_lines)}"
+    assert all(line.startswith("| [") for line in agent_lines)
+    assert sum(1 for l in agent_lines if "kimi-k3" in l.split()) == 27
+    assert sum(1 for l in agent_lines if "glm-5.3" in l.split()) == 6
+    # Zero-token <synthetic> records are never displayed (main or agents).
+    assert "<synthetic>" not in output
+    # Both displayed models are priced → no n/a cost cells in any table row
+    # (the header's "User: n/a" is not a table row — skip line 0).
+    assert all("n/a" not in line.split() for line in lines[1:]), (
+        "unpriced model leaked an n/a cost cell"
+    )
+
+
+def test_prices_host_key_matches_via_env(fake_home_with_real_session) -> None:
+    """prices.json keyed "<model>@api.z.ai" + child env
+    ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic → the @host entries
+    match and the rendered costs are identical to the plain-key variant."""
+    tmp_path, sid = fake_home_with_real_session
+    _write_prices(tmp_path, _UNIT_PRICES_AT_HOST)
+
+    stdin = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+    result = _run_main(
+        stdin,
+        tmp_path,
+        extra_env={"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"},
+    )
+    assert result.returncode == 0, (
+        f"non-zero exit; stderr={result.stderr.decode('utf-8', 'replace')}"
+    )
+    lines = result.stdout.decode("utf-8").splitlines()
+    assert len(lines) == _PRICES_LINE_COUNT, f"first 8: {lines[:8]}"
+    assert lines[5].split() == _MAIN_KIMI_ROW, f"main row 1: {lines[5]!r}"
+    assert lines[6].split() == _MAIN_GLM_ROW, f"main row 2: {lines[6]!r}"
+    assert all("n/a" not in line.split() for line in lines[1:])
+
+
+def test_prices_host_key_without_env_is_na(fake_home_with_real_session) -> None:
+    """@host-keyed prices WITHOUT ANTHROPIC_BASE_URL in the child env →
+    provider_host()="" → no entry matches → cost cells render "n/a" (columns
+    still present: the prices file itself is valid).
+
+    This also proves _run_main's env hygiene: the machine's own
+    ANTHROPIC_BASE_URL must not leak into the subprocess and silently match
+    the @host keys."""
+    tmp_path, sid = fake_home_with_real_session
+    _write_prices(tmp_path, _UNIT_PRICES_AT_HOST)
+
+    stdin = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, (
+        f"non-zero exit; stderr={result.stderr.decode('utf-8', 'replace')}"
+    )
+    lines = result.stdout.decode("utf-8").splitlines()
+    assert len(lines) == _PRICES_LINE_COUNT, f"first 8: {lines[:8]}"
+    assert lines[5].split() == _MAIN_KIMI_ROW[:-1] + ["n/a"], (
+        f"main row 1 should be n/a: {lines[5]!r}"
+    )
+    assert lines[6].split() == _MAIN_GLM_ROW[:-1] + ["n/a"], (
+        f"main row 2 should be n/a: {lines[6]!r}"
+    )
+
+
+def test_prices_absent_no_columns(fake_home_with_real_session) -> None:
+    """No prices.json in the (fake) home → no model/cost columns; the layout
+    is the pre-model-columns one (43 lines, plain in/out/cached header)."""
+    tmp_path, sid = fake_home_with_real_session
+    assert not (tmp_path / ".claude" / "status_line" / "prices.json").exists()
+
+    stdin = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, (
+        f"non-zero exit; stderr={result.stderr.decode('utf-8', 'replace')}"
+    )
+    lines = result.stdout.decode("utf-8").splitlines()
+    assert len(lines) == _NO_PRICES_LINE_COUNT, f"first 8: {lines[:8]}"
+    assert lines[1].split() == ["|", "in", "out", "cached"], f"header: {lines[1]!r}"
+    # No per-model expansion either: one flat row per group.
+    assert lines[3].split()[:2] == ["|", "sum:"], f"sum row: {lines[3]!r}"
+    assert lines[4].split()[:2] == ["|", "main:"], f"main row: {lines[4]!r}"
+
+
+def test_prices_broken_file_no_columns(fake_home_with_real_session) -> None:
+    """A malformed prices.json is treated as absent → no model/cost columns,
+    exit 0 (the hook must not break on a corrupt file)."""
+    tmp_path, sid = fake_home_with_real_session
+    _write_prices(tmp_path, "not json {")
+
+    stdin = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, (
+        f"non-zero exit; stderr={result.stderr.decode('utf-8', 'replace')}"
+    )
+    lines = result.stdout.decode("utf-8").splitlines()
+    assert len(lines) == _NO_PRICES_LINE_COUNT, f"first 8: {lines[:8]}"
+    assert lines[1].split() == ["|", "in", "out", "cached"], f"header: {lines[1]!r}"
