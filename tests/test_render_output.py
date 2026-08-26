@@ -1,17 +1,30 @@
 """Tests for render_output — assemble the multi-line status line string.
 
-render_output(header, start_in, start_out, start_cached, main_in, main_out,
-main_cached, agents) returns a string built as:
+render_output(header, start_in, start_out, start_cached, main_models,
+agents, prices=None, host="") returns a string built as:
     header
-    | <table header — labels "in" / "out" / "cached", right-aligned per column>
+    | <table header — labels "model" / "in" / "out" / "cached" / "cost">
     | start: <in> <out> <cached>
-    | sum: <in> <out> <cached>  # only if len(agents) > 0
-    | main: <in> <out> <cached>
+    | sum: [<model>] <in> <out> <cached> [<cost>]  # only if len(agents) > 0
+    | main: [<model>] <in> <out> <cached> [<cost>]
     | for each agent (in input order):
-        "[<status>]  <description>  <in> <out> <cached>"
+        "[<status>]  <description>  [<model>]  <in> <out> <cached> [<cost>]"
 
-The start row (first-message breakdown) is always rendered and is NOT
-part of the sum row — sum = main + agents only.
+main_models is the per-model breakdown dict {model_id: {"in","out","cached"}}
+(the flat main_in/main_out/main_cached triple is gone — the main row's
+totals are the sum of its per-model records).
+
+prices=None (no prices.json) → NO model and NO cost columns: the layout is
+byte-identical to the pre-model-columns render (one row per group, group
+totals). prices present → the model column sits between the description
+and `in` (left-aligned), the cost column after `cached` (right-aligned),
+and each group (sum/main/agent) expands to one row PER MODEL in
+first-appearance order; zero-token per-model records (including
+<synthetic>) are skipped; a group left with no rows renders ONE zero row
+with an EMPTY model cell (agents are never skipped).
+
+The start row (first-message breakdown) is always rendered, is NOT part
+of the sum row, and never carries model/cost cells.
 
 Every table row (all lines except the session header) starts with the
 "| " prefix (_TABLE_ROW_PREFIX) so Claude Code's leading-whitespace strip
@@ -22,11 +35,10 @@ and right-aligned to a per-column width (max of label length, the widest
 formatted cell value, and _TOKEN_COLUMN_WIDTH=7). Each column's width is
 computed independently.
 
-Status icons: "[ok]", "[run]", "[err]", "[stop]". Description column is
-NOT padded to a fixed width — only the token columns are. Description
+Status icons: "[ok]", "[run]", "[err]", "[stop]", "[kill]". Description
 >40 chars is truncated with U+2026.
 
-Line layout for a single-agent scenario:
+Line layout for a single-agent scenario without prices:
     [0] header
     [1] table header (in / out / cached)
     [2] start
@@ -48,6 +60,12 @@ from status_line import (
 )
 
 
+def _main(in_v: int, out_v: int, cached_v: int) -> dict:
+    """Single-record main_models dict reproducing the old flat triple —
+    the conversion target for the pre-model-columns tests below."""
+    return {"glm-5.3": {"in": in_v, "out": out_v, "cached": cached_v}}
+
+
 # ---------------------------------------------------------------------------
 # single ok agent
 # ---------------------------------------------------------------------------
@@ -67,7 +85,7 @@ def test_single_ok_agent() -> None:
     ]
 
     # start=(100, 30, 200) — mirrors the main_normal fixture's first event.
-    out = render_output(header, 100, 30, 200, 1000, 500, 200, agents)
+    out = render_output(header, 100, 30, 200, _main(1000, 500, 200), agents)
     lines = out.split("\n")
 
     # header + table header + start + sum + main + agent = 6
@@ -107,7 +125,7 @@ def test_single_ok_agent() -> None:
 def test_zero_agents_no_sum_line() -> None:
     """0 agents → header + table header + start + main only (no sum line)."""
     header = "Session: abc"
-    out = render_output(header, 7, 8, 9, 0, 42, 0, [])
+    out = render_output(header, 7, 8, 9, _main(0, 42, 0), [])
     lines = out.split("\n")
 
     # header + table header + start + main = 4
@@ -126,7 +144,7 @@ def test_zero_agents_no_sum_line() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 38 agents → 42 lines (header + table header + sum + main + 38 agents)
+# 38 agents → 43 lines (header + table header + start + sum + main + 38 agents)
 # ---------------------------------------------------------------------------
 
 def test_38_agents_produce_43_lines() -> None:
@@ -144,7 +162,7 @@ def test_38_agents_produce_43_lines() -> None:
         for i in range(38)
     ]
 
-    out = render_output(header, 100, 30, 200, 5000, 2000, 1000, agents)
+    out = render_output(header, 100, 30, 200, _main(5000, 2000, 1000), agents)
     lines = out.split("\n")
 
     assert len(lines) == 43
@@ -177,7 +195,7 @@ def test_token_alignment_right_aligned() -> None:
         {"status": "ok", "tokens_in": 1234567, "tokens_out": 0, "tokens_cached": 0, "description": "c"},
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     lines = out.split("\n")
     agent_lines = lines[5:]  # header + table header + start + sum + main + agents
 
@@ -224,7 +242,7 @@ def test_three_columns_right_aligned() -> None:
         {"status": "ok", "tokens_in": 100,     "tokens_out": 1234, "tokens_cached": 1234567,"description": "z"},
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     lines = out.split("\n")
     agent_lines = lines[5:]
 
@@ -272,7 +290,7 @@ def test_long_description_truncated() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     lines = out.split("\n")
     # header + table header + start + sum + main + 1 agent = 6
     agent_line = lines[5]
@@ -314,7 +332,7 @@ def test_sum_calculation() -> None:
     # main: in=50, out=30, cached=10
     # sum: in=350, out=60, cached=30
 
-    out = render_output(header, 0, 0, 0, 50, 30, 10, agents)
+    out = render_output(header, 0, 0, 0, _main(50, 30, 10), agents)
     lines = out.split("\n")
     sum_line = lines[3]
 
@@ -342,7 +360,7 @@ def test_sum_aggregates_all_rows() -> None:
     ]
     # main_out = 50 → sum_out = 50+0+100+200+300 = 650
 
-    out = render_output(header, 0, 0, 0, 0, 50, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 50, 0), agents)
     lines = out.split("\n")
     sum_line = lines[3]
 
@@ -370,7 +388,7 @@ def test_run_agent_shows_current_values() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     lines = out.split("\n")
     agent_line = lines[5]
 
@@ -408,7 +426,7 @@ def test_kill_status_renders_as_kill_tag() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     lines = out.split("\n")
     agent_line = lines[5]
 
@@ -430,7 +448,7 @@ def test_kill_status_zero_breakdown_renders_zeros() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     lines = out.split("\n")
     agent_line = lines[5]
 
@@ -467,7 +485,7 @@ def test_unknown_status_renders_as_question_mark() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     lines = out.split("\n")
     agent_line = lines[5]
 
@@ -488,7 +506,7 @@ def test_agent_no_assistant_events_renders_zeros() -> None:
         {"status": "run", "description": "no events yet"},
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     lines = out.split("\n")
     # header + table header + start + sum + main + 1 agent = 6
     agent_line = lines[5]
@@ -527,7 +545,7 @@ def test_large_values_format_as_k() -> None:
         {"status": "ok", "tokens_in": 2000, "tokens_out": 0, "tokens_cached": 0, "description": "big"},
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     lines = out.split("\n")
     agent_line = lines[5]
 
@@ -555,7 +573,7 @@ def test_table_header_row() -> None:
         {"status": "ok", "tokens_in": 50000, "tokens_out": 200, "tokens_cached": 700, "description": "a"},
     ]
 
-    out = render_output(header, 0, 0, 0, 1000, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(1000, 0, 0), agents)
     lines = out.split("\n")
     table_header = lines[1]
 
@@ -629,7 +647,7 @@ def test_unknown_status_renders_question_mark_icon() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, 0, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
     agent_line = out.split("\n")[5]
 
     assert agent_line.startswith(_TABLE_ROW_PREFIX + "[?]"), (
@@ -657,7 +675,7 @@ def test_negative_number_renders_as_zero() -> None:
         },
     ]
 
-    out = render_output(header, 0, 0, 0, -10, 0, 0, agents)
+    out = render_output(header, 0, 0, 0, _main(-10, 0, 0), agents)
     lines = out.split("\n")
     main_line = lines[4]  # main row
     agent_line = lines[5]
@@ -702,7 +720,7 @@ def test_start_row_is_first_table_row() -> None:
     ]
 
     # start: in=1000→"1k", out=30→"30", cached=200→"200"
-    out = render_output(header, 1000, 30, 200, 5000, 2000, 1000, agents)
+    out = render_output(header, 1000, 30, 200, _main(5000, 2000, 1000), agents)
     lines = out.split("\n")
 
     start_line = lines[2]
@@ -730,7 +748,7 @@ def test_start_row_not_included_in_sum() -> None:
     # start is (900000, 900000, 900000): if it leaked into the sum, the sum
     # cells would show "900k" (format_tokens(900050)) instead of the small
     # values below. No correct sum cell contains "900".
-    out = render_output(header, 900_000, 900_000, 900_000, 50, 30, 10, agents)
+    out = render_output(header, 900_000, 900_000, 900_000, _main(50, 30, 10), agents)
     lines = out.split("\n")
     sum_line = lines[3]
 
@@ -749,7 +767,7 @@ def test_start_row_wide_value_expands_column() -> None:
     # 12_345_678_900 → "12345.7M" (8 chars > _TOKEN_COLUMN_WIDTH=7) — the
     # in-column must widen to 8 so the start cell does not overflow.
     wide_start_in = 12_345_678_900
-    out = render_output(header, wide_start_in, 0, 0, 7, 0, 0, [])
+    out = render_output(header, wide_start_in, 0, 0, _main(7, 0, 0), [])
     lines = out.split("\n")
     start_line, main_line = lines[2], lines[3]
 
@@ -765,3 +783,239 @@ def test_start_row_wide_value_expands_column() -> None:
         f"in-column not aligned across start/main rows:\n"
         f"start: {start_line!r}\n main: {main_line!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# model + cost columns (prices present) — Task 4
+# ---------------------------------------------------------------------------
+
+_PRICES = {
+    "glm-5.3@api.z.ai": {"in": 6.9, "out": 24.0, "cache": 1.7,
+                         "per": 10000, "units": "credits"},
+    "kimi-k3": {"in": 3.0, "out": 15.0, "cache": 0.3,
+                "per": 1000000, "units": "$"},
+}
+
+
+def test_prices_columns_present_and_start_row_without_them() -> None:
+    """With prices: the label row gains `model` and `cost`; the start row
+    (a reference row) leaves both cells EMPTY; every table row carries
+    the '| ' prefix."""
+    header = "Session: x"
+    main_models = {"glm-5.3": {"in": 10000, "out": 5000, "cached": 20000}}
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": 10,
+            "tokens_out": 5,
+            "tokens_cached": 2,
+            "description": "a",
+            "models": {"glm-5.3": {"in": 10, "out": 5, "cached": 2}},
+        },
+    ]
+
+    out = render_output(header, 1, 2, 3, main_models, agents,
+                        prices=_PRICES, host="api.z.ai")
+    lines = out.split("\n")
+
+    # every table row carries the "| " prefix
+    assert all(line.startswith(_TABLE_ROW_PREFIX) for line in lines[1:]), (
+        f"unprefixed table row in {lines[1:]!r}"
+    )
+    # label row: empty label column + model/in/out/cached/cost
+    assert lines[1].split() == ["|", "model", "in", "out", "cached", "cost"], (
+        f"label row: {lines[1]!r}"
+    )
+    # start row: model/cost cells are empty → split sees label + 3 tokens
+    assert lines[2].split() == ["|", "start:", "1", "2", "3"], (
+        f"start row should carry no model/cost: {lines[2]!r}"
+    )
+    # main cost from the @host entry:
+    # (10000*6.9 + 5000*24 + 20000*1.7)/10000 = 223000/10000 = 22.3
+    assert "22.3 credits" in out, f"expected '22.3 credits' in {out!r}"
+    # agent cost: (10*6.9 + 5*24 + 2*1.7)/10000 = 0.01924 → "0.02 credits"
+    assert "0.02 credits" in out, f"expected '0.02 credits' in {out!r}"
+
+
+def test_multi_model_groups_first_row_labels_and_order() -> None:
+    """sum/main/agent groups expand to one row per model. Label/icon/
+    description appear only on the FIRST row of the group. Model order
+    follows FIRST APPEARANCE (main dict order, then agent-only models) —
+    kimi-k3 renders before glm-5.3 although "glm-5.3" sorts first, and
+    MiniMax-M3 (agent-only) appends after main's models in the sum group."""
+    main_models = {
+        "kimi-k3": {"in": 2_000_000, "out": 100_000, "cached": 0},
+        "glm-5.3": {"in": 100, "out": 10, "cached": 5},
+    }
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": 350,
+            "tokens_out": 20,
+            "tokens_cached": 0,
+            "description": "multi agent",
+            "models": {
+                "glm-5.3": {"in": 50, "out": 20, "cached": 0},
+                "MiniMax-M3": {"in": 300, "out": 0, "cached": 0},
+            },
+        },
+    ]
+
+    out = render_output("Session: x", 0, 0, 0, main_models, agents,
+                        prices=_PRICES, host="")
+    lines = out.split("\n")
+
+    # header + label + start + sum(3 models) + main(2) + agent(2) = 10
+    assert len(lines) == 10, f"expected 10 lines, got {len(lines)}: {lines!r}"
+    # sum group: merged per model (main first-appearance order, then the
+    # agent-only MiniMax-M3), NO cross-model aggregation.
+    assert lines[3].split() == ["|", "sum:", "kimi-k3", "2.0M", "100k", "0", "$7.5"], lines[3]
+    assert lines[4].split() == ["|", "glm-5.3", "150", "30", "5", "n/a"], lines[4]
+    assert lines[5].split() == ["|", "MiniMax-M3", "300", "0", "0", "n/a"], lines[5]
+    # main group: one row per model, "main:" only on the first
+    assert lines[6].split() == ["|", "main:", "kimi-k3", "2.0M", "100k", "0", "$7.5"], lines[6]
+    assert lines[7].split() == ["|", "glm-5.3", "100", "10", "5", "n/a"], lines[7]
+    # agent group: icon+description only on the first row; continuation
+    # row carries just the model + cells.
+    assert lines[8].startswith(_TABLE_ROW_PREFIX + "[ok]"), lines[8]
+    assert "multi agent" in lines[8]
+    assert lines[8].split()[-5:] == ["glm-5.3", "50", "20", "0", "n/a"], lines[8]
+    assert lines[9].split() == ["|", "MiniMax-M3", "300", "0", "0", "n/a"], lines[9]
+    assert "multi agent" not in lines[9], (
+        f"description must not repeat on continuation rows: {lines[9]!r}"
+    )
+    # cross-model sum would produce in=450 (150+300) — must not exist
+    assert "450" not in out, f"sum must stay per-model: {out!r}"
+
+
+def test_zero_token_model_rows_skipped() -> None:
+    """A per-model record with all-zero tokens (e.g. <synthetic>) is
+    skipped entirely — it does not render a row."""
+    main_models = {
+        "glm-5.3": {"in": 100, "out": 10, "cached": 5},
+        "<synthetic>": {"in": 0, "out": 0, "cached": 0},
+    }
+    out = render_output("Session: x", 0, 0, 0, main_models, [],
+                        prices=_PRICES, host="")
+    lines = out.split("\n")
+    # header + label + start + ONE main row (glm only)
+    assert len(lines) == 4, f"expected 4 lines, got {len(lines)}: {lines!r}"
+    assert "<synthetic>" not in out, out
+    assert "glm-5.3" in out
+
+
+def test_all_zero_main_group_renders_single_zero_row() -> None:
+    """A group whose every per-model record is zero (only <synthetic>)
+    renders ONE row with zeros and an EMPTY model cell — the group is
+    never skipped."""
+    main_models = {"<synthetic>": {"in": 0, "out": 0, "cached": 0}}
+    out = render_output("Session: x", 0, 0, 0, main_models, [],
+                        prices=_PRICES, host="")
+    lines = out.split("\n")
+    assert len(lines) == 4, f"expected 4 lines, got {len(lines)}: {lines!r}"
+    assert lines[3].split() == ["|", "main:", "0", "0", "0"], lines[3]
+
+
+def test_agent_without_models_renders_zero_row_with_empty_model() -> None:
+    """Agent with no events (no `models` key at all) → single row, zeros,
+    EMPTY model cell — agents are never skipped."""
+    agents = [
+        {
+            "status": "run",
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "tokens_cached": 0,
+            "description": "no events yet",
+        },
+    ]
+    main_models = {"glm-5.3": {"in": 10, "out": 0, "cached": 0}}
+    out = render_output("Session: x", 0, 0, 0, main_models, agents,
+                        prices=_PRICES, host="")
+    lines = out.split("\n")
+    agent_line = lines[5]
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[run]"), agent_line
+    assert "no events yet" in agent_line
+    assert agent_line.split()[-3:] == ["0", "0", "0"], (
+        f"agent row should end in three zero cells: {agent_line!r}"
+    )
+
+
+def test_agent_with_only_zero_models_renders_zero_row() -> None:
+    """Agent whose per-model records are ALL zero (only <synthetic>)
+    → single zero row with an empty model cell."""
+    agents = [
+        {
+            "status": "err",
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "tokens_cached": 0,
+            "description": "synth only",
+            "models": {"<synthetic>": {"in": 0, "out": 0, "cached": 0}},
+        },
+    ]
+    main_models = {"glm-5.3": {"in": 10, "out": 0, "cached": 0}}
+    out = render_output("Session: x", 0, 0, 0, main_models, agents,
+                        prices=_PRICES, host="")
+    lines = out.split("\n")
+    assert "<synthetic>" not in out, out
+    agent_line = lines[5]
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[err]"), agent_line
+    assert "synth only" in agent_line
+    assert agent_line.split()[-3:] == ["0", "0", "0"], agent_line
+
+
+def test_sum_group_zero_fallback_row() -> None:
+    """The sum group left with no rows after zero-skipping renders one
+    zero row with an empty model cell (same invariant as main/agents)."""
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "tokens_cached": 0,
+            "description": "idle",
+            "models": {"<synthetic>": {"in": 0, "out": 0, "cached": 0}},
+        },
+    ]
+    out = render_output("Session: x", 0, 0, 0, {}, agents,
+                        prices=_PRICES, host="")
+    lines = out.split("\n")
+    # header + label + start + sum(1 fallback) + main(1 fallback) + agent(1)
+    assert len(lines) == 6, f"expected 6 lines, got {len(lines)}: {lines!r}"
+    assert lines[3].split() == ["|", "sum:", "0", "0", "0"], lines[3]
+    assert lines[4].split() == ["|", "main:", "0", "0", "0"], lines[4]
+
+
+def test_host_key_matches_priced_model() -> None:
+    """host='api.z.ai' resolves glm-5.3 via the 'glm-5.3@api.z.ai' entry;
+    host='' has no plain glm-5.3 key → the same model renders 'n/a'."""
+    main_models = {"glm-5.3": {"in": 10000, "out": 5000, "cached": 20000}}
+
+    with_host = render_output("Session: x", 0, 0, 0, main_models, [],
+                              prices=_PRICES, host="api.z.ai")
+    assert "22.3 credits" in with_host, with_host
+    assert "n/a" not in with_host, with_host
+
+    without_host = render_output("Session: x", 0, 0, 0, main_models, [],
+                                 prices=_PRICES, host="")
+    assert "n/a" in without_host, without_host
+    assert "22.3 credits" not in without_host, without_host
+
+
+def test_no_prices_no_model_or_cost_columns() -> None:
+    """prices=None (no prices.json) → both columns vanish: one row per
+    group with the group totals, layout identical to the old render —
+    even when main_models itself is multi-model."""
+    main_models = {
+        "glm-5.3": {"in": 100, "out": 10, "cached": 5},
+        "kimi-k3": {"in": 200, "out": 20, "cached": 8},
+    }
+    out = render_output("Session: x", 0, 0, 0, main_models, [])
+    lines = out.split("\n")
+    assert len(lines) == 4, f"expected 4 lines, got {len(lines)}: {lines!r}"
+    assert lines[1].split() == ["|", "in", "out", "cached"], (
+        f"no model/cost labels expected: {lines[1]!r}"
+    )
+    # single main row carrying the summed totals (300/30/13)
+    assert lines[3].split() == ["|", "main:", "300", "30", "13"], lines[3]
+    assert "glm-5.3" not in out and "kimi-k3" not in out

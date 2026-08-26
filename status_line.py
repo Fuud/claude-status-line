@@ -13,6 +13,14 @@ Module-level invariants:
   (tokens_in/out/cached summed over all assistant events with usage,
   plus the `models` per-model breakdown) — not the last event's usage
   (agreed behavior change, plan 20260826-status-line-model-cost-columns).
+- render_output renders the model/cost columns only when a prices dict
+  is passed: prices=None reproduces the pre-model-columns layout
+  byte-for-byte (one row per group, group totals). With prices, every
+  group (sum/main/agent) expands to one row per model in first-appearance
+  order; zero-token per-model records are skipped and a group left empty
+  renders ONE zero row with an empty model cell (groups are never
+  skipped). The start row is a reference row and never carries
+  model/cost cells.
 - The orchestrator override in _compute_agents may additionally set
   agent.status="kill" when a main-log queue-operation task-notification with
   <status>killed</status> is present and the compute_agent_snapshot verdict
@@ -1394,6 +1402,14 @@ def _col_width(values: list, label: str) -> int:
     without copying it. `values` is expected to be a list of ints; the
     `default=0` on the max() handles the empty-list case.
 
+    [decision] Retained (and still exported) after render_table
+    generalized the width computation to arbitrary columns of
+    pre-formatted cells: tests/test_render_output.py imports it to
+    reconstruct expected header strings, and it documents the token-
+    column floor formula (floor _TOKEN_COLUMN_WIDTH, label, widest
+    formatted cell). render_table applies the same max() to its own
+    column specs.
+
     [deviation] Plan spec (step 2 of the breakdown-table section) wrote
     this as `max(len(format_tokens(v)) for v in col + [label])` with the
     floor pulled in separately: `min(_TOKEN_COLUMN_WIDTH, computed)`.
@@ -1407,167 +1423,327 @@ def _col_width(values: list, label: str) -> int:
     return max(_TOKEN_COLUMN_WIDTH, len(label), longest_value)
 
 
+# Floor for the label/description column: an agent row's minimum
+# footprint — the icon padded to _ICON_COL_WIDTH plus the status gap.
+# Together with the column's "gap" (the 2-space _DESC_TOKEN_GAP) this
+# reproduces the pre-model-columns header_pad = w_desc + _ICON_COL_WIDTH
+# + 4 exactly, keeping the prices=None layout byte-identical.
+_LABEL_COL_FLOOR = _ICON_COL_WIDTH + len(_STATUS_GAP)
+
+
+def _cell_text(row: list, index: int) -> str:
+    """Cell at `index` of a render_table row as a string — "" for a
+    missing cell (ragged row) or an explicit None."""
+    cell = row[index] if index < len(row) else ""
+    return "" if cell is None else str(cell)
+
+
+def render_table(columns: list, rows: list) -> list:
+    """Render a table as a list of lines WITHOUT the "| " prefix.
+
+    `columns` is a list of column dicts:
+        {"label": str, "align": "left"|"right", "floor": int,
+         "gap": str (optional, default " ")}
+    `rows` is a list of rows, each a list of pre-formatted (string)
+    cells — render_table does no number formatting of its own.
+
+    The first returned line is the LABEL row built from the columns'
+    labels; then one line per row. Column width =
+        max(floor, len(label), longest cell in that column).
+    Left-aligned cells pad on the right (ljust), right-aligned on the
+    left (rjust); the column's "gap" is glued after it. Ragged rows
+    render missing cells as empty. Every line is right-stripped — an
+    empty cell in the last column leaves no trailing padding spaces
+    (trailing whitespace is never meaningful in this table).
+    """
+    widths = []
+    for index, column in enumerate(columns):
+        longest = max(
+            (len(_cell_text(row, index)) for row in rows), default=0
+        )
+        widths.append(
+            max(
+                int(column.get("floor", 0) or 0),
+                len(column.get("label", "")),
+                longest,
+            )
+        )
+    label_row = [column.get("label", "") for column in columns]
+    lines = []
+    for row in [label_row, *rows]:
+        parts = []
+        for index, column in enumerate(columns):
+            cell = _cell_text(row, index)
+            if column.get("align", "left") == "right":
+                cell = cell.rjust(widths[index])
+            else:
+                cell = cell.ljust(widths[index])
+            parts.append(cell)
+            parts.append(column.get("gap", " "))
+        lines.append("".join(parts).rstrip())
+    return lines
+
+
+def _cost_cell(
+    model: str, rec: dict, prices: "dict | None", host: str
+) -> str:
+    """Cost cell for one per-model row: the formatted number when a price
+    is found, "n/a" when the model is known but unpriced, "" when there
+    is no model at all (the start row and the zero-fallback rows — no
+    model means nothing to price)."""
+    if not model:
+        return ""
+    price = price_for(model, prices, host)
+    if price is None:
+        return "n/a"
+    return format_cost(compute_cost(rec, price), price.get("units", ""))
+
+
+def _models_total(models: "dict | None") -> tuple:
+    """(in, out, cached) summed over a per-model dict's records.
+    Non-dict records are skipped defensively."""
+    total_in = total_out = total_cached = 0
+    for rec in (models or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        total_in += int(rec.get("in") or 0)
+        total_out += int(rec.get("out") or 0)
+        total_cached += int(rec.get("cached") or 0)
+    return total_in, total_out, total_cached
+
+
+def _merge_models(sources: list) -> dict:
+    """Merge per-model dicts into one, summing per model (no cross-model
+    aggregation). Key order = first appearance across `sources` — pass
+    them in render order (main first, then agents)."""
+    merged: dict = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for model, rec in source.items():
+            if not isinstance(rec, dict):
+                continue
+            acc = merged.setdefault(model, {"in": 0, "out": 0, "cached": 0})
+            acc["in"] += int(rec.get("in") or 0)
+            acc["out"] += int(rec.get("out") or 0)
+            acc["cached"] += int(rec.get("cached") or 0)
+    return merged
+
+
+def _group_model_rows(
+    label: str, models: "dict | None", prices: "dict | None", host: str
+) -> list:
+    """Wide rows (label, model, in, out, cached, cost) for one group.
+
+    One row per model in first-appearance order; per-model records whose
+    tokens are ALL zero (e.g. <synthetic>) are skipped entirely. The
+    label (sum:/main:/icon+description) rides only the FIRST row. A group
+    left with no rows after the skip renders ONE zero row with an EMPTY
+    model cell — groups are never skipped (the "agents never skipped"
+    invariant, extended to main and sum).
+    """
+    rows: list = []
+    for model, rec in (models or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        in_v = int(rec.get("in") or 0)
+        out_v = int(rec.get("out") or 0)
+        cached_v = int(rec.get("cached") or 0)
+        if not (in_v or out_v or cached_v):
+            continue
+        rows.append(
+            [
+                label,
+                model,
+                format_tokens(in_v),
+                format_tokens(out_v),
+                format_tokens(cached_v),
+                _cost_cell(model, rec, prices, host),
+            ]
+        )
+        label = ""
+    if not rows:
+        rows.append([label, "", "0", "0", "0", ""])
+    return rows
+
+
 def render_output(
     header: str,
     start_in: int,
     start_out: int,
     start_cached: int,
-    main_in: int,
-    main_out: int,
-    main_cached: int,
+    main_models: dict,
     agents: list,
+    prices: "dict | None" = None,
+    host: str = "",
 ) -> str:
     """Build the multi-line status line string with a tabular breakdown.
 
-    Layout:
+    Layout with prices (the model + cost columns are shown):
         <header>
-        | <table header — labels "in" / "out" / "cached", each right-aligned
-          within its own column>
-        | start: <in> <out> <cached>
-        | sum: <in> <out> <cached>    # only if len(agents) > 0
-        | main: <in> <out> <cached>
+        | <table header — labels "model"/"in"/"out"/"cached"/"cost";
+          the label/description column's label is EMPTY>
+        | start:                                     <in> <out> <cached>
+        | sum:   <model> <in> <out> <cached> <cost>   # only if agents
+        | main:  <model> <in> <out> <cached> <cost>
         | for each agent (in input order):
-              [<status>]  <description>  <in> <out> <cached>
+              [<status>]  <description>  <model> <in> <out> <cached> <cost>
+
+    Layout with prices=None is byte-identical to the pre-model-columns
+    render: NO model and NO cost columns, one row per group carrying the
+    group's totals (backward-compatibility requirement — a missing
+    prices.json must not change the table's shape).
+
+    main_models is the per-model breakdown {model_id: {"in","out","cached"}}
+    (see _scan_main_jsonl); the main row's totals are the sum of its
+    records. `prices` is a load_prices() dict, `host` a provider_host()
+    string — the orchestrator wires both (Task 5); the model column sits
+    between the description and `in` (left-aligned), the cost column
+    after `cached` (right-aligned).
+
+    Groups with prices: sum (per-model merge of main_models and every
+    agent's `models`, NO cross-model sums, model order = first appearance
+    with main first), main, and each agent expand to one row PER MODEL;
+    per-model records with all-zero tokens (e.g. <synthetic>) are skipped
+    entirely; a group left with no rows renders ONE zero row with an
+    EMPTY model cell — groups (and therefore agents) are never skipped.
 
     The start row is the FIRST table row: the first assistant event's
-    breakdown (the session's baseline message), letting the reader see
-    what the session began with against the current main/sum totals. It
-    is NOT part of the sum row (sum = main + agents only) — it is a
-    reference row, not an additive component. Always rendered, like the
-    main row, even when it is all zeros (fresh session, no assistant
-    events yet).
+    breakdown (the session's baseline message). It is a reference row —
+    not part of the sum row, never carrying model/cost cells — and is
+    always rendered, like the main row, even when all zeros.
 
     Every table row carries the "| " prefix (_TABLE_ROW_PREFIX) so that
     Claude Code's leading-whitespace strip cannot left-shift the
     all-spaces token-header row relative to the label/icon rows below.
 
-    Every numeric cell is formatted via format_tokens() (so 1000 → "1k")
-    BEFORE applying :>W — formatting raw 1000 with width 7 would render
-    "   1000" instead of "     1k". Each column's width is computed
-    independently as
-        max(_TOKEN_COLUMN_WIDTH,
-            len(label),
-            len(format_tokens(v)) for v in column)
-    so columns with wider labels ("cached") or wider formatted values
-    ("1.2M") expand independently.
-
-    Description is truncated to 40 chars with U+2026 by _truncate_description
-    (re-applied here for defense-in-depth). The description column IS
-    padded to the longest description in the current agent list so all
-    numeric columns land at the same x-position across rows and align
-    with the table header above.
-
-    Agents are NEVER skipped: a run-agent renders its current breakdown
-    values (not None), and an agent with no breakdown data renders three
-    zeros. The cache-hit invariant in compute_agent_snapshot guarantees
-    all three tokens_* fields are populated; defensive `int(... or 0)`
-    here handles pre-upgrade caches or callers that build snapshots by
-    hand.
+    All padding/alignment is delegated to render_table; the label column
+    (label/description/icon) is left-aligned with floor
+    _LABEL_COL_FLOOR, token columns right-aligned with floor
+    _TOKEN_COLUMN_WIDTH (= _col_width's floor). Description is truncated
+    to 40 chars with U+2026 (re-applied defensively). Defensive
+    `int(... or 0)` / isinstance handling covers pre-upgrade caches and
+    hand-built snapshots.
     """
-    # 1. Build per-column value lists (start row, main row, then agents).
-    # The agent loop runs once, projecting each agent into a triple of
-    # ints and summing in lockstep — saves three separate list
-    # comprehensions and three separate sum() calls for the sum row.
-    agent_in: list[int] = []
-    agent_out: list[int] = []
-    agent_cached: list[int] = []
-    descriptions: list[str] = []
+    # 1. Project agents into render-ready rows: the group label (icon +
+    # status gap + truncated description — only the group's FIRST row
+    # shows it), the flat totals (prices=None path), and the per-model
+    # breakdown (prices path).
+    projected: list[dict] = []
     for a in agents:
-        agent_in.append(int(a.get("tokens_in") or 0))
-        agent_out.append(int(a.get("tokens_out") or 0))
-        agent_cached.append(int(a.get("tokens_cached") or 0))
-        # Defensive truncation: callers already truncate to 40, but
-        # render_output is the final formatter and shouldn't trust
-        # upstream. Re-apply so a buggy or future caller can't blow up
-        # the column layout.
-        descriptions.append(_truncate_description(a.get("description", "") or ""))
-
-    # Start cells participate in column-width computation like every other
-    # row's — a wide first-message value must expand its column or it
-    # would overflow the cell alignment.
-    in_col = [start_in, main_in, *agent_in]
-    out_col = [start_out, main_out, *agent_out]
-    cached_col = [start_cached, main_cached, *agent_cached]
-
-    # 2. Compute per-column width: at least _TOKEN_COLUMN_WIDTH, at least
-    # the label length, at least the longest formatted cell. See
-    # _col_width at module scope (importable for tests).
-    w_in = _col_width(in_col, "in")
-    w_out = _col_width(out_col, "out")
-    w_cached = _col_width(cached_col, "cached")
-
-    # Description column width: padded to the longest description in the
-    # current agent list. Without this, the numeric columns shift right
-    # on rows with shorter descriptions and the table header stops
-    # aligning with the cells. Computed BEFORE assembling lines so the
-    # header can include the same padding.
-    w_desc = max((len(d) for d in descriptions), default=0)
-
-    # 3. Assemble lines.
-    lines: list[str] = [header]
-    # Table header — `w_desc + _ICON_COL_WIDTH` spaces on the left so the
-    # `in/out/cached` labels land at the same x-position as the cells in
-    # the rows below. The agent rows use icon (padded to _ICON_COL_WIDTH)
-    # + status_gap (2) + desc (w_desc) + desc_gap (2), so the prefix
-    # before in_cell is consistently w_desc + _ICON_COL_WIDTH + 4.
-    # sum:/main: rows use the same prefix width below.
-    header_pad = w_desc + _ICON_COL_WIDTH + 4
-    lines.append(
-        f"{' ' * header_pad}{'in':>{w_in}} {'out':>{w_out}} {'cached':>{w_cached}}"
-    )
-
-    # start row — the FIRST table row. `start:` is 6 chars, padded to the
-    # same `header_pad` width as sum:/main: so its cells land at the same
-    # x-position as every other row.
-    lines.append(
-        f"{'start:':<{header_pad}}{format_tokens(start_in):>{w_in}} "
-        f"{format_tokens(start_out):>{w_out}} "
-        f"{format_tokens(start_cached):>{w_cached}}"
-    )
-
-    if agents:
-        sum_in = main_in + sum(agent_in)
-        sum_out = main_out + sum(agent_out)
-        sum_cached = main_cached + sum(agent_cached)
-        # Pad the label column to `header_pad` so the in_cell lands at
-        # the same x-position as in the agent rows below. `sum:` is 4
-        # chars, so the left-pad width is `header_pad` directly.
-        lines.append(
-            f"{'sum:':<{header_pad}}{format_tokens(sum_in):>{w_in}} "
-            f"{format_tokens(sum_out):>{w_out}} "
-            f"{format_tokens(sum_cached):>{w_cached}}"
-        )
-
-    # `main:` is 5 chars, padded to the same `header_pad` width as `sum:`
-    # for the same alignment reason.
-    lines.append(
-        f"{'main:':<{header_pad}}{format_tokens(main_in):>{w_in}} "
-        f"{format_tokens(main_out):>{w_out}} "
-        f"{format_tokens(main_cached):>{w_cached}}"
-    )
-
-    for agent, description, in_v, out_v, cached_v in zip(
-        agents, descriptions, agent_in, agent_out, agent_cached
-    ):
-        status = agent.get("status", "run")
+        status = a.get("status", "run")
         icon = f"[{status}]" if status in _STATUSES else "[?]"
         # Pad icon to _ICON_COL_WIDTH so the description column starts at
         # the same x-position regardless of status name length ("ok" 4
         # chars vs "stop"/"kill" 6 chars). Trailing spaces after short
         # icons are absorbed into the status_gap.
-        lines.append(
-            f"{icon:<{_ICON_COL_WIDTH}}{_STATUS_GAP}{description:<{w_desc}}{_DESC_TOKEN_GAP}"
-            f"{format_tokens(in_v):>{w_in}} "
-            f"{format_tokens(out_v):>{w_out}} "
-            f"{format_tokens(cached_v):>{w_cached}}"
+        models = a.get("models")
+        projected.append(
+            {
+                "label": (
+                    f"{icon:<{_ICON_COL_WIDTH}}{_STATUS_GAP}"
+                    f"{_truncate_description(a.get('description', '') or '')}"
+                ),
+                "in": int(a.get("tokens_in") or 0),
+                "out": int(a.get("tokens_out") or 0),
+                "cached": int(a.get("tokens_cached") or 0),
+                "models": models if isinstance(models, dict) else {},
+            }
         )
+    if not isinstance(main_models, dict):
+        main_models = {}
 
-    # Prepend the table-row marker to everything except the session header
-    # (see _TABLE_ROW_PREFIX). A single post-processing pass guarantees the
-    # prefix is uniform across all row kinds — no per-f-string repetition
-    # to drift out of sync.
+    # 2. Column specs + rows. The label column's gap is the historical
+    # 2-space description gap; token columns keep the single-space
+    # separators. prices=None drops the model/cost columns entirely.
+    label_column: dict = {
+        "label": "",
+        "align": "left",
+        "floor": _LABEL_COL_FLOOR,
+        "gap": _DESC_TOKEN_GAP,
+    }
+    rows: list = []
+    if prices is None:
+        # Today's layout: one row per group, the group's totals.
+        columns = [
+            label_column,
+            {"label": "in", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": " "},
+            {"label": "out", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": " "},
+            {"label": "cached", "align": "right", "floor": _TOKEN_COLUMN_WIDTH},
+        ]
+        main_in, main_out, main_cached = _models_total(main_models)
+        rows.append(
+            [
+                "start:",
+                format_tokens(start_in),
+                format_tokens(start_out),
+                format_tokens(start_cached),
+            ]
+        )
+        if projected:
+            rows.append(
+                [
+                    "sum:",
+                    format_tokens(main_in + sum(p["in"] for p in projected)),
+                    format_tokens(main_out + sum(p["out"] for p in projected)),
+                    format_tokens(main_cached + sum(p["cached"] for p in projected)),
+                ]
+            )
+        rows.append(
+            [
+                "main:",
+                format_tokens(main_in),
+                format_tokens(main_out),
+                format_tokens(main_cached),
+            ]
+        )
+        for p in projected:
+            rows.append(
+                [
+                    p["label"],
+                    format_tokens(p["in"]),
+                    format_tokens(p["out"]),
+                    format_tokens(p["cached"]),
+                ]
+            )
+    else:
+        # Model column between description and `in`; cost column after
+        # `cached` (2-space gaps on both sides of the token block, so
+        # the extra columns read as additions to the old layout).
+        columns = [
+            label_column,
+            {"label": "model", "align": "left", "floor": 0, "gap": _DESC_TOKEN_GAP},
+            {"label": "in", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": " "},
+            {"label": "out", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": " "},
+            {"label": "cached", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": _DESC_TOKEN_GAP},
+            {"label": "cost", "align": "right", "floor": 0},
+        ]
+        rows.append(
+            [
+                "start:",
+                "",
+                format_tokens(start_in),
+                format_tokens(start_out),
+                format_tokens(start_cached),
+                "",
+            ]
+        )
+        if projected:
+            merged = _merge_models(
+                [main_models, *(p["models"] for p in projected)]
+            )
+            rows.extend(_group_model_rows("sum:", merged, prices, host))
+        rows.extend(_group_model_rows("main:", main_models, prices, host))
+        for p in projected:
+            rows.extend(_group_model_rows(p["label"], p["models"], prices, host))
+
+    # 3. Render the table and prepend the row marker to everything
+    # except the session header (see _TABLE_ROW_PREFIX). A single
+    # post-processing pass guarantees the prefix is uniform across all
+    # row kinds — no per-f-string repetition to drift out of sync.
+    table_lines = render_table(columns, rows)
     return "\n".join(
-        [lines[0], *(_TABLE_ROW_PREFIX + line for line in lines[1:])]
+        [header, *(_TABLE_ROW_PREFIX + line for line in table_lines)]
     )
 
 
@@ -1840,19 +2016,25 @@ def _main_unsafe() -> int:
     # main()'s except clause — silently degrading to the fallback header.
     tool_use_positions = main_cum.get("tool_use_positions")
     agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
-    # Task 4 — breakdown-table refactor: pass the three cum_* values
-    # directly to render (no `total` field in main_cum anymore). render
-    # applies format_tokens to each cell; we hand it raw ints. The start_*
-    # triple (first-message breakdown, the "start:" row) rides along the
-    # same main_cum dict; `or 0` guards pre-upgrade caches.
-    cum_in = main_cum.get("cum_in", 0)
-    cum_out = main_cum.get("cum_out", 0)
-    cum_cache_read = main_cum.get("cum_cache_read", 0)
+    # Task 4 — model/cost columns: render_output consumes the per-model
+    # dict (the main row's totals are the sum of its records; cum_in /
+    # cum_out / cum_cache_read are no longer passed flat). prices/host
+    # wiring is the Task 5 orchestrator work — until then the hook
+    # renders the no-prices layout. `or 0` / `or {}` guard pre-upgrade
+    # caches.
     start_in = int(main_cum.get("start_in") or 0)
     start_out = int(main_cum.get("start_out") or 0)
     start_cached = int(main_cum.get("start_cached") or 0)
+    main_models = main_cum.get("per_model") or {}
     output = render_output(
-        header, start_in, start_out, start_cached, cum_in, cum_out, cum_cache_read, agents
+        header,
+        start_in,
+        start_out,
+        start_cached,
+        main_models,
+        agents,
+        prices=None,
+        host="",
     )
     print(output)
     return 0
