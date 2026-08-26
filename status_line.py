@@ -1422,19 +1422,31 @@ def _cache_path(data_dir: Path | None, name: str, session_id: str) -> Path:
 
 
 def _compute_agents(
-    session_dir: Path,
+    session_dirs: Path | list[Path],
     agents_cache_path: Path,
     task_notifications: dict[str, str] | None = None,
 ) -> list:
-    """Build per-agent snapshots for every agent-*.jsonl under session_dir,
-    using agents_cache_path as the source of stale cache entries.
+    """Build per-agent snapshots for every agent-*.jsonl under each session
+    directory, using agents_cache_path as the source of stale cache entries.
 
-    After building all snapshots, apply the orchestrator-level queue override:
-    for each agent whose `agentId` (with the `agent-` prefix stripped)
-    appears in `task_notifications` (extracted from the main jsonl's
-    queue-operation events), set `status` to the notification value — BUT
-    only when the current status is not already `err` or `stop` (those win
-    by priority; see module docstring + CLAUDE.md "Status priority and overrides").
+    `session_dirs` accepts a single Path (backward-compatible call shape) or
+    a list of Paths — ALL directories CC created for this session id (see
+    `find_session_dirs` / `_resolve_session_dirs`): the main checkout and a
+    worktree copy each hold part of the session's `subagents/` tree, so the
+    directories are scanned in list order and the results merged. Dedup is
+    by agentId (the jsonl stem) at the PATH level, BEFORE calling
+    compute_agent_snapshot: an agentId already produced by an earlier
+    directory is skipped, so the first directory wins and a duplicate is
+    never parsed twice. A directory without `subagents/` is skipped (the
+    rest of the list still runs); an empty list → [].
+
+    After building all snapshots, apply the orchestrator-level queue override
+    to the MERGED list: for each agent whose `agentId` (with the `agent-`
+    prefix stripped) appears in `task_notifications` (extracted from the
+    main jsonl's queue-operation events), set `status` to the notification
+    value — BUT only when the current status is not already `err` or `stop`
+    (those win by priority; see module docstring + CLAUDE.md "Status
+    priority and overrides").
 
     [deviation] The override lives here rather than inside
     compute_agent_snapshot because the queue signal originates in the main
@@ -1443,25 +1455,32 @@ def _compute_agents(
     its narrow contract and makes it easy to cache.
 
     Args:
-        session_dir: session directory; `<sid>/subagents/agent-*.jsonl` files
-            live under it.
+        session_dirs: session directory or list of them; each dir's
+            `<dir>/subagents/agent-*.jsonl` files are scanned.
         agents_cache_path: cache file holding previous per-agent snapshots,
             used to short-circuit re-parse when file mtimes haven't changed.
         task_notifications: dict mapping `<task-id>` → one of {"ok","kill","err"}
             (extracted from `<task-notification>` queue-operation events in the
             main jsonl by compute_main_cum). May be empty or None.
     """
+    dirs = [session_dirs] if isinstance(session_dirs, Path) else session_dirs
     agents: list = []
     agents_cache = _load_dict_cache(agents_cache_path)
-    subagents_dir = session_dir / "subagents"
-    if not subagents_dir.exists():
-        return agents
-    for jsonl_path in sorted(subagents_dir.glob("agent-*.jsonl")):
-        agent_id = jsonl_path.stem
-        meta_path = jsonl_path.parent / f"{agent_id}.meta.json"
-        cache_entry = agents_cache.get(agent_id)
-        snapshot = compute_agent_snapshot(jsonl_path, meta_path, cache_entry)
-        agents.append(snapshot)
+    seen_agent_ids: set[str] = set()
+    for session_dir in dirs:
+        subagents_dir = session_dir / "subagents"
+        if not subagents_dir.exists():
+            continue
+        for jsonl_path in sorted(subagents_dir.glob("agent-*.jsonl")):
+            agent_id = jsonl_path.stem
+            if agent_id in seen_agent_ids:
+                # first dir wins; skip before parsing (dedup at path level)
+                continue
+            seen_agent_ids.add(agent_id)
+            meta_path = jsonl_path.parent / f"{agent_id}.meta.json"
+            cache_entry = agents_cache.get(agent_id)
+            snapshot = compute_agent_snapshot(jsonl_path, meta_path, cache_entry)
+            agents.append(snapshot)
 
     # Orchestrator-level queue override (with err/stop guard). See [deviation]
     # note above for why this lives here, not in compute_agent_snapshot.

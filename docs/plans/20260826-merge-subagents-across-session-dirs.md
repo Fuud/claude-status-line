@@ -154,16 +154,16 @@ projects_root=None) -> list[Path]`
 - Modify: `status_line.py`
 - Modify: `tests/test_compute_agent_snapshot.py`
 
-- [ ] TDD: написать тесты: агенты распределены по двум session-каталогам
+- [x] TDD: написать тесты: агенты распределены по двум session-каталогам
       (разные agentId) → в результате объединение всех; одинаковый agentId в
       двух каталогах → один снапшот, из первого каталога списка; один `Path`
       вместо списка → поведение как раньше (back-compat); пустой список → `[]`;
       каталог без `subagents/` в списке → пропускается, остальные обрабатываются
-- [ ] убедиться, что новые тесты падают
-- [ ] изменить `_compute_agents`: нормализация аргумента в список, обход
+- [x] убедиться, что новые тесты падают
+- [x] изменить `_compute_agents`: нормализация аргумента в список, обход
       каталогов по порядку, дедуп по `agentId` на уровне путей до
       `compute_agent_snapshot`; orchestrator queue override — без изменений
-- [ ] прогнать `python -m pytest tests/test_compute_agent_snapshot.py` —
+- [x] прогнать `python -m pytest tests/test_compute_agent_snapshot.py` —
       все зелёные (старые вызовы с одним `Path` работают)
 
 ### Task 4: интеграция в _main_unsafe
