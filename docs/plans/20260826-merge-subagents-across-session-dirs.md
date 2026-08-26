@@ -173,7 +173,7 @@ projects_root=None) -> list[Path]`
 - Modify: `status_line.py`
 - Modify: `tests/test_main_integration.py`
 
-- [ ] TDD: написать интеграционный тест: payload с `transcript_path` и
+- [x] TDD: написать интеграционный тест: payload с `transcript_path` и
       `session_id`, два проектных каталога с `<sid>/subagents/` (агенты
       распределены, одинаковый agentId в обоих) → вывод содержит строки всех
       агентов без дублей; кейс «воркtree-каталог первый по алфавиту и пустой»
@@ -183,23 +183,26 @@ projects_root=None) -> list[Path]`
       pre-seed кэша `agents_<sid>.json` значением `{}` (артефакт бага) →
       агенты всё равно рендерятся, кэш перезаписывается непустым
       (self-heal из Solution Overview п. 5)
-- [ ] убедиться, что тесты падают на текущем коде
-- [ ] `_main_unsafe`: заменить `find_session_dir` на `_resolve_session_dirs`,
+- [x] убедиться, что тесты падают на текущем коде
+- [x] `_main_unsafe`: заменить `find_session_dir` на `_resolve_session_dirs`,
       передать список в `_compute_agents`, `dirs[0] if dirs else None` —
       в `_find_main_jsonl`; запись кэша — только если список непуст
-- [ ] прогнать `python -m pytest tests/test_main_integration.py` — зелёные
+- [x] прогнать `python -m pytest tests/test_main_integration.py` — зелёные
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] verify all requirements from Overview are implemented
-- [ ] verify edge cases are handled (дедуп, dirless-сессия, пустой payload)
-- [ ] run full test suite: `python -m pytest tests/`
-- [ ] ручная проверка на реальных данных: прогнать `status_line.py` с
+- [x] verify all requirements from Overview are implemented
+- [x] verify edge cases are handled (дедуп, dirless-сессия, пустой payload)
+- [x] run full test suite: `python -m pytest tests/` — 236 passed
+- [x] ручная проверка на реальных данных: прогнать `status_line.py` с
       payload сессии `eacc81d9-0a13-4f6f-ae40-5ba51190cfd9` → в выводе 18+
-      строк агентов (раньше — ни одной)
-- [ ] замер wall-clock одного прогона на реальном дереве `~/.claude/projects`
+      строк агентов (раньше — ни одной) — 20 строк агентов; старый код
+      (2ad09b9~1) на том же payload — 0 строк, кэш {} vs 20 записей
+- [x] замер wall-clock одного прогона на реальном дереве `~/.claude/projects`
       (до/после) — убедиться, что полный обход дерева glob не замедлил хук
-      патологически
+      патологически — медианы N=5: new 0.40s vs old 0.25s (1.58x, <2x);
+      чистый delta glob-обхода ~0ms (87.9 vs 89.7ms) — остальное это парсинг
+      20 агентов, который старый код пропускал
 
 ### Task 6: [Final] Update documentation
 

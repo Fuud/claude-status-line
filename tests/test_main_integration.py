@@ -432,6 +432,7 @@ def _build_synth_session(
     sid: str,
     main_jsonl_lines: list[str],
     agent_files: list[tuple[str, str, str]],
+    encoded: str = "synthetic-project",
 ) -> None:
     """Populate a synthetic session under tmp_path/.claude/projects/<encoded>/.
 
@@ -440,8 +441,11 @@ def _build_synth_session(
         main_jsonl_lines: list of JSON lines for the main jsonl.
         agent_files: list of (agent_id, jsonl_content, meta_content) tuples;
             each is written into session_dir/subagents/.
+        encoded: encoded project directory name. Defaults to the historical
+            "synthetic-project"; pass a distinct name to build a SECOND
+            project dir for the same sid (duplicate-session-dir layout —
+            see section 11 tests).
     """
-    encoded = "synthetic-project"
     session_dir = (tmp_path / ".claude" / "projects" / encoded / sid)
     subagents = session_dir / "subagents"
     subagents.mkdir(parents=True)
@@ -902,3 +906,158 @@ def test_no_jsonl_anywhere_still_header_only(tmp_path: Path) -> None:
     lines = result.stdout.decode("utf-8").splitlines()
     assert len(lines) == 1, f"header-only expected, got: {lines!r}"
     assert lines[0].endswith("| Context: 0K (0%)"), f"header: {lines[0]!r}"
+
+
+# ---------------------------------------------------------------------------
+# 11. Duplicate session dirs (2026-08-26, plan
+#     20260826-merge-subagents-across-session-dirs) — the same session id can
+#     legitimately live in TWO encoded project dirs (main checkout + worktree
+#     copy); agents must merge across both, dedup by agentId, and the empty
+#     worktree dir sorting first (bug eacc81d9) must not hide agents.
+# ---------------------------------------------------------------------------
+
+MERGE_SID = "51f0c0de-1111-4222-8333-444444444444"
+SPLIT_SID = "62a1d1ef-2222-4333-8444-555555555555"
+
+# Single assistant end_turn event — minimal main jsonl (no queue events, no
+# tool_use positions; every agent sorts via the sentinel, order irrelevant).
+_SPLIT_MAIN_LINES = [
+    '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a"}],"model":"x","stop_reason":"end_turn","usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":10}},"uuid":"m1","sessionId":"x","timestamp":"2026-08-26T10:00:00.000Z"}',
+]
+
+
+def _ok_agent_jsonl() -> str:
+    """Agent transcript ending in end_turn → detect_status says [ok]."""
+    return (
+        '{"type":"user","message":{"role":"user","content":"x"},"uuid":"u1","sessionId":"x","timestamp":"2026-08-26T10:00:00.000Z"}\n'
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"model":"x","stop_reason":"end_turn","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}},"uuid":"a1","sessionId":"x","timestamp":"2026-08-26T10:00:00.500Z"}'
+    )
+
+
+def _agent_meta(description: str, tool_use_id: str) -> str:
+    return json.dumps({
+        "agentType": "general-purpose",
+        "description": description,
+        "toolUseId": tool_use_id,
+        "spawnDepth": 1,
+    })
+
+
+def _build_split_session(tmp_path: Path, sid: str) -> Path:
+    """Build the eacc81d9 bug layout: a worktree project dir whose name sorts
+    FIRST ('-' prefix < any letter) holding only tool-results/ (no
+    subagents/), plus the real project dir with the agents and main jsonl.
+
+    Returns the main jsonl path (for the payload's transcript_path)."""
+    worktree_session = (
+        tmp_path / ".claude" / "projects" / "-worktree-copy-first" / sid
+    )
+    (worktree_session / "tool-results").mkdir(parents=True)
+    _build_synth_session(
+        tmp_path,
+        sid,
+        _SPLIT_MAIN_LINES,
+        [
+            ("agent-real111", _ok_agent_jsonl(), _agent_meta("Real: first agent", "tr1")),
+            ("agent-real222", _ok_agent_jsonl(), _agent_meta("Real: second agent", "tr2")),
+        ],
+        encoded="real-project",
+    )
+    return tmp_path / ".claude" / "projects" / "real-project" / f"{sid}.jsonl"
+
+
+def test_merge_agents_across_duplicate_session_dirs(tmp_path: Path) -> None:
+    """Two project dirs both carry <sid>/subagents/; agents are split across
+    them and one agentId exists in BOTH → output has every agent exactly once;
+    the shared agentId resolves to the transcript dir's copy (first dir wins).
+    """
+    _build_synth_session(
+        tmp_path,
+        MERGE_SID,
+        _SPLIT_MAIN_LINES,
+        [
+            ("agent-main111", _ok_agent_jsonl(), _agent_meta("Main: only here", "tm1")),
+            ("agent-shared", _ok_agent_jsonl(), _agent_meta("Shared: main dir wins", "tm2")),
+        ],
+        encoded="merge-main-project",
+    )
+    _build_synth_session(
+        tmp_path,
+        MERGE_SID,
+        _SPLIT_MAIN_LINES,
+        [
+            ("agent-copy111", _ok_agent_jsonl(), _agent_meta("Copy: only here", "tc1")),
+            ("agent-shared", _ok_agent_jsonl(), _agent_meta("Shared: copy loses", "tc2")),
+        ],
+        encoded="merge-copy-project",
+    )
+    transcript = (
+        tmp_path / ".claude" / "projects" / "merge-main-project" / f"{MERGE_SID}.jsonl"
+    )
+    stdin = json.dumps({
+        "session_id": MERGE_SID,
+        "model": {"display_name": "X"},
+        "transcript_path": str(transcript),
+    })
+
+    result = _run_main(stdin, tmp_path)
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    output = result.stdout.decode("utf-8")
+    lines = output.splitlines()
+    # header + table header + start + sum + main + 3 agents = 8
+    assert len(lines) == 8, f"expected 8 lines (3 agents), got {len(lines)}: {lines!r}"
+    assert "Main: only here" in output, f"main-dir agent missing:\n{output!r}"
+    assert "Copy: only here" in output, f"copy-dir agent missing:\n{output!r}"
+    # Shared agentId: the transcript dir's copy wins, appears exactly once.
+    assert "Shared: main dir wins" in output, f"shared agent should come from main dir:\n{output!r}"
+    assert "Shared: copy loses" not in output, f"copy dir must lose the dedup:\n{output!r}"
+    assert output.count("Shared:") == 1, f"shared agent rendered more than once:\n{output!r}"
+
+
+def test_empty_worktree_dir_sorts_first_agents_still_render(tmp_path: Path) -> None:
+    """Bug eacc81d9 repro: the worktree project dir sorts FIRST (its encoded
+    name starts with '-') and contains only tool-results/ — no subagents/.
+    Agents from the real dir must still render."""
+    transcript = _build_split_session(tmp_path, SPLIT_SID)
+    stdin = json.dumps({
+        "session_id": SPLIT_SID,
+        "model": {"display_name": "X"},
+        "transcript_path": str(transcript),
+    })
+
+    result = _run_main(stdin, tmp_path)
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    output = result.stdout.decode("utf-8")
+    lines = output.splitlines()
+    # header + table header + start + sum + main + 2 agents = 7
+    assert len(lines) == 7, f"expected 7 lines (2 agents), got {len(lines)}: {lines!r}"
+    assert "Real: first agent" in output, f"real-dir agents missing:\n{output!r}"
+    assert "Real: second agent" in output, f"real-dir agents missing:\n{output!r}"
+
+
+def test_stale_empty_agents_cache_self_heals(tmp_path: Path) -> None:
+    """The buggy code wrote agents_<sid>.json = {} for sessions whose only
+    found dir was an empty worktree copy. Pre-seed that artifact and verify
+    the fixed run still renders agents AND rewrites the cache non-empty."""
+    transcript = _build_split_session(tmp_path, SPLIT_SID)
+    data_dir = tmp_path / ".claude" / "status_line" / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    agents_cache_path = data_dir / f"agents_{SPLIT_SID}.json"
+    agents_cache_path.write_text("{}", encoding="utf-8")
+
+    stdin = json.dumps({
+        "session_id": SPLIT_SID,
+        "model": {"display_name": "X"},
+        "transcript_path": str(transcript),
+    })
+    result = _run_main(stdin, tmp_path)
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    output = result.stdout.decode("utf-8")
+    assert "Real: first agent" in output, f"agents must render despite empty cache:\n{output!r}"
+    assert "Real: second agent" in output, f"agents must render despite empty cache:\n{output!r}"
+    loaded = json.loads(agents_cache_path.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    assert len(loaded) == 2, f"cache must be rewritten non-empty, got: {loaded!r}"

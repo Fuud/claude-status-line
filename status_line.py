@@ -1522,14 +1522,23 @@ def _main_unsafe() -> int:
         print(_build_header(parsed, _context_segment(parsed, None)))
         return 0
 
-    session_dir = find_session_dir(session_id)
-    # main jsonl: transcript_path payload → session_dir sibling → projects
-    # glob (see _find_main_jsonl). The session dir itself is NOT a gate —
-    # CC only materializes `<sid>/` once the session spawns its first
-    # subagent, and a subagentless session still deserves its main-row
-    # table + jsonl-derived Context.
+    # All session dirs CC created for this id (usually 1; a resumed-in-
+    # worktree session splits across the main checkout and the worktree
+    # copy — see _resolve_session_dirs). The transcript dir leads the
+    # list, which both anchors agent-id dedup (first dir wins) and feeds
+    # _find_main_jsonl below.
+    session_dirs = _resolve_session_dirs(
+        parsed.get("transcript_path", ""), session_id
+    )
+    # main jsonl: transcript_path payload → first session dir's sibling →
+    # projects glob (see _find_main_jsonl). The session dirs are NOT a
+    # gate — CC only materializes `<sid>/` once the session spawns its
+    # first subagent, and a subagentless session still deserves its
+    # main-row table + jsonl-derived Context.
     main_jsonl = _find_main_jsonl(
-        parsed.get("transcript_path", ""), session_id, session_dir
+        parsed.get("transcript_path", ""),
+        session_id,
+        session_dirs[0] if session_dirs else None,
     )
     if main_jsonl is None:
         # no main jsonl anywhere → header only (payload context)
@@ -1554,13 +1563,20 @@ def _main_unsafe() -> int:
     task_notifications = main_cum.get("task_notifications", {})
 
     agents: list = []
-    if session_dir is not None:
-        agents = _compute_agents(session_dir, agents_cache, task_notifications)
+    if session_dirs:
+        # Scan EVERY session dir's subagents/ tree (a worktree-resumed
+        # session holds part of its agents in the copy's dir) and merge
+        # with agent-id dedup — see _compute_agents.
+        agents = _compute_agents(session_dirs, agents_cache, task_notifications)
         _write_agents_cache(agents_cache, agents)
-    # else: no session dir → no subagents ever spawned → agents stays [].
-    # The agents cache write is skipped too: there is nothing to cache,
-    # and writing an empty dict would litter data/ with agents_<sid>.json
-    # files for every dirless session.
+    # else: no session dirs at all → no subagents ever spawned → agents
+    # stays []. The agents cache write is skipped too: there is nothing to
+    # cache, and writing an empty dict would litter data/ with
+    # agents_<sid>.json files for every dirless session. Note the write
+    # DOES happen when dirs exist but a dir has no subagents/ — the cache
+    # is then legitimately empty (or holds only the other dirs' agents),
+    # and rewriting it is what self-heals the stale `{}` artifacts the
+    # pre-merge code left behind (see _write_agents_cache).
 
     # sort_agents calls .get(...) on the second argument, so it MUST be a
     # dict. A malformed cache (e.g. tool_use_positions accidentally written
