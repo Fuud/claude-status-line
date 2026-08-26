@@ -116,18 +116,18 @@ Option A+ (согласовано в брейншторме):
 - Modify: `status_line.py`
 - Modify: `tests/test_find_session_dir.py`
 
-- [ ] TDD: написать тесты `find_session_dirs`: два одноимённых каталога в
+- [x] TDD: написать тесты `find_session_dirs`: два одноимённых каталога в
       разных проектах → оба в результате; один каталог → список из одного;
       несуществующий sid → `[]`; пустой sid → `[]`; несуществующий
       projects_root → `[]`; файлы (не каталоги) с именем sid игнорируются
-- [ ] убедиться, что новые тесты падают (функции ещё нет)
-- [ ] реализовать `find_session_dirs` в `status_line.py` (glob `**/<sid>`,
+- [x] убедиться, что новые тесты падают (функции ещё нет)
+- [x] реализовать `find_session_dirs` в `status_line.py` (glob `**/<sid>`,
       фильтр `is_dir()`, список в порядке glob)
-- [ ] переписать `find_session_dir` как обёртку: первый элемент
+- [x] переписать `find_session_dir` как обёртку: первый элемент
       `find_session_dirs` или `None` (докстринг обновить; заодно модульный
       докстринг `tests/test_find_session_dir.py` — «returns the first match»
       больше не вся правда)
-- [ ] прогнать `python -m pytest tests/test_find_session_dir.py` — все
+- [x] прогнать `python -m pytest tests/test_find_session_dir.py` — все
       (старые + новые) зелёные
 
 ### Task 2: _resolve_session_dirs — приоритет transcript_path

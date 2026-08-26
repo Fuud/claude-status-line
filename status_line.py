@@ -894,17 +894,25 @@ def _jsonl_mtime(jsonl_path: Path) -> float:
 
 
 # ---------------------------------------------------------------------------
-# find_session_dir
+# find_session_dir(s)
 # ---------------------------------------------------------------------------
 
-def find_session_dir(
+def find_session_dirs(
     session_id: str, projects_root: Path | None = None
-) -> Path | None:
-    """Locate the directory for `session_id` under `projects_root`.
+) -> list[Path]:
+    """Locate ALL directories named `session_id` under `projects_root`.
 
-    Walks `<projects_root>/**/<session_id>` and returns the first matching
-    *directory* as a Path. Returns None if `session_id` is empty, if
-    `projects_root` does not exist, or if no matching directory is found.
+    Walks `<projects_root>/**/<session_id>` and returns every matching
+    *directory* as a list of Paths, in glob order (OS-dependent, but stable
+    per tree). Returns [] if `session_id` is empty, if `projects_root` does
+    not exist, or if no matching directory is found.
+
+    The same session id can legitimately live in more than one encoded
+    project directory — e.g. the main checkout and a worktree copy of the
+    same repo, each with its own `subagents/` tree. Callers that need the
+    complete picture (agents, tokens) must merge results across ALL of
+    these directories, which is why this exists alongside the historical
+    single-match `find_session_dir`.
 
     If `projects_root` is None, defaults to `<home>/.claude/projects`.
 
@@ -915,11 +923,11 @@ def find_session_dir(
     test-only parameter.
     """
     if not session_id:
-        return None
+        return []
     if projects_root is None:
         projects_root = Path.home() / ".claude" / "projects"
     if not projects_root.exists():
-        return None
+        return []
     # glob for a directory whose name matches session_id anywhere under
     # projects_root. We use **/<session_id> (not the bare name) so we
     # also pick up project-name directories nested one level deep
@@ -927,12 +935,26 @@ def find_session_dir(
     # recurse_symlinks=False avoids following symlinked project trees into
     # infinite loops or surprising locations; glob ordering is OS-
     # dependent but stable per tree on the same kernel.
-    for candidate in projects_root.glob(
-        f"**/{session_id}"
-    ):  # default follows filesystem order; we don't depend on it
-        if candidate.is_dir():
-            return candidate
-    return None
+    return [
+        candidate
+        for candidate in projects_root.glob(f"**/{session_id}")
+        if candidate.is_dir()
+    ]
+
+
+def find_session_dir(
+    session_id: str, projects_root: Path | None = None
+) -> Path | None:
+    """Locate the FIRST directory named `session_id` under `projects_root`.
+
+    Thin wrapper over `find_session_dirs`: returns the first element of
+    its result (glob order), or None when the list is empty — `session_id`
+    is empty, `projects_root` does not exist, or nothing matches. See
+    `find_session_dirs` for the all-matches variant and the rationale for
+    needing more than one directory per session id.
+    """
+    dirs = find_session_dirs(session_id, projects_root=projects_root)
+    return dirs[0] if dirs else None
 
 
 # ---------------------------------------------------------------------------
