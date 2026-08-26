@@ -7,13 +7,22 @@ across main checkout / worktree copies), but puts
 exists — transcript_path is CC's authoritative statement of where the
 session lives (same priority logic as _find_main_jsonl), and the first
 entry wins agent dedup downstream. If glob already returned that dir, it
-is moved to the front, never duplicated. Empty transcript_path, or one
-whose sibling session dir does not exist, degrades to pure glob order.
+is moved to the front, never duplicated — matched by FILESYSTEM IDENTITY
+(os.path.samefile), not path spelling: under the cygwin production
+interpreter glob results are /cygdrive/... (or /tmp/...) rooted while CC's
+transcript_path spells the same directory Windows-style (C:\\...), and
+PurePath equality would never see them as the same dir. Empty
+transcript_path, or one whose sibling session dir does not exist,
+degrades to pure glob order.
 """
 from __future__ import annotations
 
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 
+import pytest
+
+import status_line
 from status_line import _resolve_session_dirs, find_session_dirs
 
 
@@ -144,15 +153,20 @@ def test_empty_session_id_returns_empty_list(tmp_path: Path) -> None:
     assert result == []
 
 
-def test_windows_backslash_transcript_path_keeps_dir_priority(tmp_path: Path) -> None:
+def test_windows_backslash_transcript_path_keeps_dir_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Windows CC sends backslash-separated transcript paths; under cygwin
     python (the production hook interpreter) posixpath treats such a string
     as ONE opaque component, so Path(...).parent degenerates to "." and the
     transcript dir silently loses its priority to pure glob order. The
     backslashes must be normalized so the transcript dir still comes first,
-    without duplicating it. (On Windows-native python this test is green
-    either way — WindowsPath understands backslashes natively; the red
-    demonstration is on posixpath, i.e. cygwin/WSL-style interpreters.)"""
+    without duplicating it.
+
+    To bite on EVERY interpreter (not just posix-flavoured ones — Windows-
+    native python parses backslashes natively and would be green either
+    way), `status_line.Path` is replaced with a posixpath-flavoured
+    stand-in for the duration of the test."""
     projects_root = _make_projects(tmp_path)
     dup_a = projects_root / "projA" / SID
     dup_b = projects_root / "projB" / SID
@@ -160,6 +174,16 @@ def test_windows_backslash_transcript_path_keeps_dir_priority(tmp_path: Path) ->
     dup_b.mkdir(parents=True)
     transcript = dup_b.parent / f"{SID}.jsonl"
     transcript.write_text("{}")
+
+    class _PosixPathStandIn(PurePosixPath):
+        """posixpath-flavoured Path: a backslash string is one opaque
+        component. is_dir is delegated to os.path.isdir (what cygwin's
+        Path.is_dir does underneath); PurePosixPath itself has none."""
+
+        def is_dir(self) -> bool:
+            return os.path.isdir(str(self))
+
+    monkeypatch.setattr(status_line, "Path", _PosixPathStandIn)
     # simulate CC's Windows-style payload: every separator is a backslash
     windows_style = str(transcript).replace("/", "\\")
 
@@ -169,3 +193,88 @@ def test_windows_backslash_transcript_path_keeps_dir_priority(tmp_path: Path) ->
     assert result[0] == dup_b
     assert len(result) == len(glob_order), "preferred dir must not be duplicated"
     assert sorted(result) == sorted(glob_order)
+
+
+def test_same_dir_two_spellings_not_duplicated(tmp_path: Path) -> None:
+    """The transcript dir and a glob entry can spell the SAME physical
+    directory differently (production: /cygdrive/... vs C:/...). Spelling
+    inequality must not duplicate the dir — the glob-spelling twin moves to
+    the front instead. Reproduced portably (any interpreter) with a
+    `<detour>/../` base: pathlib keeps `..` verbatim, so the paths are
+    PurePath-unequal yet resolve to the same directories on every syscall."""
+    projects_root = _make_projects(tmp_path)
+    dup_a = projects_root / "projA" / SID
+    dup_b = projects_root / "projB" / SID
+    dup_a.mkdir(parents=True)
+    dup_b.mkdir(parents=True)
+    transcript = dup_b.parent / f"{SID}.jsonl"
+    transcript.write_text("{}")
+    detour = tmp_path / "detour"
+    detour.mkdir()
+    alias_root = detour / ".." / ".claude" / "projects"
+
+    result = _resolve_session_dirs(str(transcript), SID, alias_root)
+
+    glob_order = find_session_dirs(SID, alias_root)
+    assert len(glob_order) == 2
+    assert len(result) == 2, (
+        f"same physical dir entered the list twice: {[str(p) for p in result]}"
+    )
+    assert os.path.samefile(result[0], dup_b), "transcript dir must lead"
+    for i, first in enumerate(result):
+        for other in result[i + 1:]:
+            assert not os.path.samefile(first, other), (
+                f"physical dir duplicated: {[str(p) for p in result]}"
+            )
+
+
+def test_windows_spelling_transcript_vs_posix_glob_no_duplicate(
+    tmp_path: Path,
+) -> None:
+    """The exact production flavor combination, executed for real under the
+    cygwin hook interpreter: glob matches rooted at the posix /tmp mount
+    while transcript_path arrives Windows-spelled with backslashes
+    (C:\\cygwin64\\tmp\\...). The transcript dir must lead exactly once.
+    Skipped where the interpreter cannot address one tree through both
+    spellings (e.g. Windows-native python, where /tmp does not exist)."""
+    win_tmp = os.environ.get("TMP") or os.environ.get("TEMP") or ""
+    looks_like_windows_drive = len(win_tmp) >= 3 and win_tmp[1:3] == ":\\" and win_tmp[0].isalpha()
+    if not (looks_like_windows_drive and str(tmp_path).startswith("/tmp")):
+        pytest.skip("interpreter does not expose /tmp and C:\\... spellings of one tree")
+    projects_root = _make_projects(tmp_path)
+    dup_a = projects_root / "projA" / SID
+    dup_b = projects_root / "projB" / SID
+    dup_a.mkdir(parents=True)
+    dup_b.mkdir(parents=True)
+    transcript = dup_b.parent / f"{SID}.jsonl"
+    transcript.write_text("{}")
+    windows_style = win_tmp + str(transcript)[len("/tmp"):].replace("/", "\\")
+    if not os.path.isfile(windows_style):
+        pytest.skip("TMP is not the Windows spelling of /tmp on this host")
+
+    result = _resolve_session_dirs(windows_style, SID, projects_root)
+
+    glob_order = find_session_dirs(SID, projects_root)
+    assert len(glob_order) == 2
+    assert len(result) == 2, (
+        f"transcript dir duplicated across spellings: {[str(p) for p in result]}"
+    )
+    assert os.path.samefile(result[0], dup_b), "transcript dir must lead"
+
+
+def test_sibling_session_name_is_file_returns_pure_glob(tmp_path: Path) -> None:
+    """`parent / session_id` exists as a FILE (not a dir) next to the
+    transcript → no preferred dir, pure glob order. Pins that the check is
+    is_dir(), not exists(): a stray <sid> file must not become the dedup
+    priority."""
+    projects_root = _make_projects(tmp_path)
+    (projects_root / "projA" / SID).mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / SID).write_text("a file named like the session dir")
+    transcript = elsewhere / f"{SID}.jsonl"
+    transcript.write_text("{}")
+
+    result = _resolve_session_dirs(str(transcript), SID, projects_root)
+
+    assert result == find_session_dirs(SID, projects_root)

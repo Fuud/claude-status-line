@@ -776,6 +776,22 @@ def test_compute_agents_single_path_back_compat(tmp_path: Path) -> None:
     ]
 
 
+def test_compute_agents_single_str_path_is_normalized(tmp_path: Path) -> None:
+    """A bare str path (easy call-site mistake: `str(path)`) is normalized
+    to a one-element list instead of being iterated character by character
+    — which would silently yield [] (every 1-char "dir" fails the
+    subagents/ existence check) and make the agents vanish."""
+    session_dir, agents_cache, _ = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+
+    agents = _compute_agents(str(session_dir), agents_cache)
+
+    assert len(agents) == 1
+    assert agents[0]["agentId"] == "agent-test"
+    assert agents[0]["status"] == "run"
+
+
 def test_compute_agents_empty_dirs_list_returns_empty(tmp_path: Path) -> None:
     """An empty list of session dirs → no agents (no crash, no fs access)."""
     agents_cache = tmp_path / "agents_cache.json"
@@ -798,6 +814,31 @@ def test_compute_agents_skips_dir_without_subagents(
 
     assert [a["agentId"] for a in agents] == ["agent-test"]
     assert agents[0]["status"] == "run"
+
+
+def test_compute_agents_queue_override_reaches_second_dir_agent(
+    tmp_path: Path,
+) -> None:
+    """The orchestrator queue override applies AFTER the merge, to agents
+    from EVERY directory — an agent living only in the second dir must be
+    overridden just like a first-dir agent (a refactor moving the override
+    into the per-dir loop would otherwise drop or mis-apply it)."""
+    dir_a = tmp_path / "project-main" / "session-abc"
+    dir_b = tmp_path / "project-worktree" / "session-abc"
+    _add_agent_to_session(dir_a, "agent-aaa", AGENT_RUNNING, META_NORMAL)
+    _add_agent_to_session(dir_b, "agent-bbb", AGENT_RUNNING, META_NORMAL)
+    agents_cache = tmp_path / "agents_cache.json"
+
+    agents = _compute_agents(
+        [dir_a, dir_b], agents_cache, task_notifications={"bbb": "kill"}
+    )
+
+    statuses = {a["agentId"]: a["status"] for a in agents}
+    assert statuses["agent-bbb"] == "kill", (
+        f"override must reach second-dir agents; got {statuses!r}"
+    )
+    # the notification targets only bbb — aaa keeps its snapshot status
+    assert statuses["agent-aaa"] == "run"
 
 
 # ---------------------------------------------------------------------------

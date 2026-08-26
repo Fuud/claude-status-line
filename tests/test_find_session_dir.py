@@ -1,10 +1,11 @@
 """Tests for session-dir lookup under projects_root.
 
-find_session_dirs(session_id, projects_root=None) walks a tree under
-`<projects_root>/**/<session_id>` and returns ALL matching directories as
-a list of Paths, in glob (OS-dependent) order. The same session id can
-exist in more than one encoded project dir (main checkout + worktree
-copy), and callers merge agents across all of them.
+find_session_dirs(session_id, projects_root=None) globs
+`<projects_root>/*/<session_id>` (one level, plus a root-level <sid>
+check) and returns ALL matching directories as a list of Paths, in glob
+(OS-dependent) order. The same session id can exist in more than one
+encoded project dir (main checkout + worktree copy), and callers merge
+agents across all of them.
 
 find_session_dir(session_id, projects_root=None) is a thin wrapper over
 find_session_dirs that returns the first match as a Path (or None) — the
@@ -172,18 +173,35 @@ def test_find_session_dirs_single_match(tmp_path: Path) -> None:
     assert result == [target]
 
 
-def test_find_session_dirs_glob_order_is_stable(tmp_path: Path) -> None:
-    """Result order is the glob order — deterministic across calls (though
-    OS-dependent across platforms, so we only pin stability, not content)."""
+def test_find_session_dirs_nested_depth_not_searched(tmp_path: Path) -> None:
+    """[deviation] The glob is one level (`*/<sid>`), not recursive: the
+    on-disk convention is `<encoded-project>/<sid>/` (verified on the real
+    tree — every session dir sits at depth 1), and a recursive walk would
+    descend into every session dir's subagents/ and tool-results/ subtrees
+    (~110ms vs ~6ms per hook invocation). A deeper-nested <sid> dir is
+    therefore NOT found — this pins that contract."""
     projects_root = tmp_path / ".claude" / "projects"
-    for proj in ("projA", "projB", "projC"):
-        (projects_root / proj / "sid-order").mkdir(parents=True)
+    (projects_root / "projA" / "sub" / "sid-deep").mkdir(parents=True)
+    # depth-1 dirs still found next to it
+    (projects_root / "projB" / "sid-deep").mkdir(parents=True)
 
-    result = find_session_dirs("sid-order", projects_root=projects_root)
-    result2 = find_session_dirs("sid-order", projects_root=projects_root)
+    result = find_session_dirs("sid-deep", projects_root=projects_root)
 
-    assert len(result) == 3
-    assert result == result2
+    assert result == [projects_root / "projB" / "sid-deep"]
+
+
+def test_find_session_dirs_root_level_dir_found(tmp_path: Path) -> None:
+    """A <sid> dir directly under projects_root (the zero-directory case a
+    recursive `**/<sid>` glob also matched) is still found — kept so the
+    one-level glob is a strict subset of the old `**` behavior, not a loss."""
+    projects_root = tmp_path / ".claude" / "projects"
+    root_level = projects_root / "sid-root"
+    root_level.mkdir(parents=True)
+    (projects_root / "projA" / "sid-root").mkdir(parents=True)
+
+    result = find_session_dirs("sid-root", projects_root=projects_root)
+
+    assert sorted(result) == sorted([root_level, projects_root / "projA" / "sid-root"])
 
 
 def test_find_session_dirs_nonexistent_sid(tmp_path: Path) -> None:

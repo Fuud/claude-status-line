@@ -902,10 +902,11 @@ def find_session_dirs(
 ) -> list[Path]:
     """Locate ALL directories named `session_id` under `projects_root`.
 
-    Walks `<projects_root>/**/<session_id>` and returns every matching
-    *directory* as a list of Paths, in glob order (OS-dependent, but stable
-    per tree). Returns [] if `session_id` is empty, if `projects_root` does
-    not exist, or if no matching directory is found.
+    Globs `<projects_root>/*/<session_id>` (one level, plus a root-level
+    check — see below) and returns every matching *directory* as a list
+    of Paths, in glob order (OS-dependent, but stable per tree). Returns
+    [] if `session_id` is empty, if `projects_root` does not exist, or if
+    no matching directory is found.
 
     The same session id can legitimately live in more than one encoded
     project directory — e.g. the main checkout and a worktree copy of the
@@ -928,18 +929,23 @@ def find_session_dirs(
         projects_root = Path.home() / ".claude" / "projects"
     if not projects_root.exists():
         return []
-    # glob for a directory whose name matches session_id anywhere under
-    # projects_root. We use **/<session_id> (not the bare name) so we
-    # also pick up project-name directories nested one level deep
-    # (the convention is `<encoded-project>/<session_id>/`).
-    # recurse_symlinks=False avoids following symlinked project trees into
-    # infinite loops or surprising locations; glob ordering is OS-
-    # dependent but stable per tree on the same kernel.
-    return [
-        candidate
-        for candidate in projects_root.glob(f"**/{session_id}")
-        if candidate.is_dir()
-    ]
+    # [deviation] The glob is one level (`*/`), not recursive (`**/`):
+    # the on-disk convention is `<encoded-project>/<session_id>/` with
+    # encoded project dirs as direct children of projects/ (verified on
+    # the real tree: every session dir sits at depth 1), and a recursive
+    # walk would descend into every session dir's `subagents/` and
+    # `tool-results/` subtrees for matches the convention never produces
+    # — ~110ms vs ~6ms per hook invocation on the real tree. The bare
+    # root-level check below covers the zero-directory case that `**`
+    # additionally matched (`<projects_root>/<session_id>`). A one-level
+    # glob also never follows directory symlinks, keeping the old
+    # "no symlinked project trees" property for free.
+    matches: list[Path] = []
+    root_level = projects_root / session_id
+    if root_level.is_dir():
+        matches.append(root_level)
+    matches.extend(d for d in projects_root.glob(f"*/{session_id}") if d.is_dir())
+    return matches
 
 
 def find_session_dir(
@@ -968,12 +974,13 @@ def _resolve_session_dirs(
 ) -> list[Path]:
     """Resolve ALL session dirs for `session_id`, transcript dir first.
 
-    Starts from `find_session_dirs` (every `**/<session_id>` directory under
+    Starts from `find_session_dirs` (every `*/<session_id>` directory under
     `projects_root`) and, when `transcript_path` is non-empty and
     `Path(transcript_path).parent / session_id` is an existing directory,
     moves that directory to the front of the list (without duplicating it
-    if glob already returned it). Backslashes in `transcript_path` are
-    normalized to forward slashes first: Windows CC sends `C:\...` paths,
+    if glob already returned it — matched by filesystem identity, not path
+    spelling; see `_same_file`). Backslashes in `transcript_path` are
+    normalized to forward slashes first: Windows CC sends `C:\\...` paths,
     and under a posix-flavoured python (cygwin) posixpath would otherwise
     treat the whole string as one component, making `.parent` degenerate
     to "." and the priority below silently never engage.
@@ -1005,9 +1012,40 @@ def _resolve_session_dirs(
     preferred = Path(normalized).parent / session_id
     if not preferred.is_dir():
         return dirs
-    # only the sibling dir's existence matters, not the transcript file
-    # itself — a cleaned-up jsonl with a surviving session dir still wins
-    return [preferred] + [d for d in dirs if d != preferred]
+    # The transcript dir may already be among the glob matches under a
+    # DIFFERENT spelling: under the cygwin production interpreter glob
+    # results are rooted at Path.home() (/cygdrive/c/Users/...) while the
+    # normalized transcript path spells the same directory C:/Users/...
+    # PurePath equality compares spellings, so the two never compare equal
+    # — match by filesystem identity instead and move the glob-spelling
+    # twin to the front (one entry per physical directory, spelled the
+    # glob way — the spelling every downstream scan already exercised).
+    twin = next((d for d in dirs if _same_file(d, preferred)), None)
+    if twin is None:
+        # only reachable when the transcript dir sits outside the globbed
+        # tree — no twin to reorder, so prepend the transcript spelling
+        return [preferred] + dirs
+    return [twin] + [d for d in dirs if d is not twin]
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """True when `a` and `b` name the same existing filesystem object.
+
+    Spelling equality is checked first (cheap, no syscalls); otherwise
+    os.path.samefile resolves both through the OS — under the cygwin
+    production interpreter it sees through /cygdrive/c/... vs C:/...
+    spellings of the same directory. NOTE: Path.resolve()/realpath is NOT
+    a usable canonicalization here — posixpath treats "C:/..." as
+    relative and would prepend the CWD to it.
+    """
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        # either path vanished between the caller's is_dir()/glob() check
+        # and now — treat as different rather than crash the hook
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1035,8 +1073,9 @@ def _find_main_jsonl(
     the on-disk convention is `<encoded-project>/<sid>.jsonl` with encoded
     project dirs as direct children of `projects/`, and a recursive walk
     would descend into every session dir (incl. `subagents/` trees) for
-    no gain. `find_session_dir` above stays recursive for directories —
-    its historical contract.
+    no gain. `find_session_dirs` above uses the same one-level shape for
+    its `*/<sid>` directory glob (same convention, same reason — it was
+    briefly recursive and walked the whole tree at ~20x the cost).
 
     Returns None when `session_id` is empty or nothing matches — the
     orchestrator then degrades to a header-only line.
@@ -1422,17 +1461,18 @@ def _cache_path(data_dir: Path | None, name: str, session_id: str) -> Path:
 
 
 def _compute_agents(
-    session_dirs: Path | list[Path],
+    session_dirs: Path | str | list[Path],
     agents_cache_path: Path,
     task_notifications: dict[str, str] | None = None,
 ) -> list:
     """Build per-agent snapshots for every agent-*.jsonl under each session
     directory, using agents_cache_path as the source of stale cache entries.
 
-    `session_dirs` accepts a single Path (backward-compatible call shape) or
-    a list of Paths — ALL directories CC created for this session id (see
-    `find_session_dirs` / `_resolve_session_dirs`): the main checkout and a
-    worktree copy each hold part of the session's `subagents/` tree, so the
+    `session_dirs` accepts a single directory (Path/str — the
+    backward-compatible call shape) or a list of Paths — ALL directories CC
+    created for this session id (see `find_session_dirs` /
+    `_resolve_session_dirs`): the main checkout and a worktree copy each
+    hold part of the session's `subagents/` tree, so the
     directories are scanned in list order and the results merged. Dedup is
     by agentId (the jsonl stem) at the PATH level, BEFORE calling
     compute_agent_snapshot: an agentId already produced by an earlier
@@ -1445,8 +1485,8 @@ def _compute_agents(
     prefix stripped) appears in `task_notifications` (extracted from the
     main jsonl's queue-operation events), set `status` to the notification
     value — BUT only when the current status is not already `err` or `stop`
-    (those win by priority; see module docstring + CLAUDE.md "Status
-    priority and overrides").
+    (those win by priority; see the module docstring's invariant on the
+    orchestrator override).
 
     [deviation] The override lives here rather than inside
     compute_agent_snapshot because the queue signal originates in the main
@@ -1456,14 +1496,21 @@ def _compute_agents(
 
     Args:
         session_dirs: session directory or list of them; each dir's
-            `<dir>/subagents/agent-*.jsonl` files are scanned.
+            `<dir>/subagents/agent-*.jsonl` files are scanned. A single
+            directory may be a Path, a str, or any os.PathLike (all are
+            normalized to a one-element list — a bare str would otherwise
+            be iterated character by character and silently yield no
+            agents).
         agents_cache_path: cache file holding previous per-agent snapshots,
             used to short-circuit re-parse when file mtimes haven't changed.
         task_notifications: dict mapping `<task-id>` → one of {"ok","kill","err"}
             (extracted from `<task-notification>` queue-operation events in the
             main jsonl by compute_main_cum). May be empty or None.
     """
-    dirs = [session_dirs] if isinstance(session_dirs, Path) else session_dirs
+    if isinstance(session_dirs, (str, os.PathLike)):
+        dirs = [Path(session_dirs)]
+    else:
+        dirs = list(session_dirs)
     agents: list = []
     agents_cache = _load_dict_cache(agents_cache_path)
     seen_agent_ids: set[str] = set()
@@ -1570,13 +1617,10 @@ def _main_unsafe() -> int:
         agents = _compute_agents(session_dirs, agents_cache, task_notifications)
         _write_agents_cache(agents_cache, agents)
     # else: no session dirs at all → no subagents ever spawned → agents
-    # stays []. The agents cache write is skipped too: there is nothing to
-    # cache, and writing an empty dict would litter data/ with
-    # agents_<sid>.json files for every dirless session. Note the write
-    # DOES happen when dirs exist but a dir has no subagents/ — the cache
-    # is then legitimately empty (or holds only the other dirs' agents),
-    # and rewriting it is what self-heals the stale `{}` artifacts the
-    # pre-merge code left behind (see _write_agents_cache).
+    # stays [] and the cache write is skipped (an empty write would only
+    # litter data/ for dirless sessions). With dirs present the write
+    # happens even at 0 agents — that is what rewrites stale `{}` cache
+    # artifacts (see "Edge cases" in README).
 
     # sort_agents calls .get(...) on the second argument, so it MUST be a
     # dict. A malformed cache (e.g. tool_use_positions accidentally written

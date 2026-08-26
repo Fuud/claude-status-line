@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1061,3 +1062,126 @@ def test_stale_empty_agents_cache_self_heals(tmp_path: Path) -> None:
     loaded = json.loads(agents_cache_path.read_text(encoding="utf-8"))
     assert isinstance(loaded, dict)
     assert len(loaded) == 2, f"cache must be rewritten non-empty, got: {loaded!r}"
+
+
+def _build_merge_layout(tmp_path: Path, sid: str) -> Path:
+    """Two project dirs carrying the same <sid>/subagents/ trees: agents
+    split across them, one agentId in BOTH (transcript dir's copy must win
+    the dedup). Returns the main dir's transcript jsonl path."""
+    _build_synth_session(
+        tmp_path,
+        sid,
+        _SPLIT_MAIN_LINES,
+        [
+            ("agent-main111", _ok_agent_jsonl(), _agent_meta("Main: only here", "tm1")),
+            ("agent-shared", _ok_agent_jsonl(), _agent_meta("Shared: main dir wins", "tm2")),
+        ],
+        encoded="merge-main-project",
+    )
+    _build_synth_session(
+        tmp_path,
+        sid,
+        _SPLIT_MAIN_LINES,
+        [
+            ("agent-copy111", _ok_agent_jsonl(), _agent_meta("Copy: only here", "tc1")),
+            ("agent-shared", _ok_agent_jsonl(), _agent_meta("Shared: copy loses", "tc2")),
+        ],
+        encoded="merge-copy-project",
+    )
+    return tmp_path / ".claude" / "projects" / "merge-main-project" / f"{sid}.jsonl"
+
+
+def test_merge_agents_without_transcript_path(tmp_path: Path) -> None:
+    """Older CC payloads carry no transcript_path → dir resolution is pure
+    glob; the cross-dir merge must still happen (a regression merging only
+    when transcript_path is present would otherwise pass the suite).
+    main jsonl is located via the first glob dir's sibling."""
+    _build_merge_layout(tmp_path, MERGE_SID)
+    stdin = json.dumps({"session_id": MERGE_SID, "model": {"display_name": "X"}})
+
+    result = _run_main(stdin, tmp_path)
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    output = result.stdout.decode("utf-8")
+    lines = output.splitlines()
+    # header + table header + start + sum + main + 3 agents = 8
+    assert len(lines) == 8, f"expected 8 lines (3 agents), got {len(lines)}: {lines!r}"
+    assert "Main: only here" in output, f"main-dir agent missing:\n{output!r}"
+    assert "Copy: only here" in output, f"copy-dir agent missing:\n{output!r}"
+    # shared agentId rendered exactly once (either copy — no transcript
+    # anchor here, glob order decides; the dedup itself is what matters)
+    assert output.count("Shared:") == 1, f"shared agent rendered more than once:\n{output!r}"
+
+
+def test_merge_session_second_call_uses_persisted_cache(tmp_path: Path) -> None:
+    """The hook's dominant real-world mode is cache-hit: the SECOND
+    invocation must re-read the MERGED snapshot set (persisted across two
+    dirs, incl. the same-agentId dedup choice) and render identically."""
+    transcript = _build_merge_layout(tmp_path, MERGE_SID)
+    stdin = json.dumps({
+        "session_id": MERGE_SID,
+        "model": {"display_name": "X"},
+        "transcript_path": str(transcript),
+    })
+    agents_cache_path = (
+        tmp_path / ".claude" / "status_line" / "data" / f"agents_{MERGE_SID}.json"
+    )
+
+    first = _run_main(stdin, tmp_path)
+    assert first.returncode == 0, first.stderr.decode("utf-8", "replace")
+    assert first.stdout.decode("utf-8").count("Shared:") == 1
+    assert agents_cache_path.exists(), "merged agents cache must be written"
+    loaded = json.loads(agents_cache_path.read_text(encoding="utf-8"))
+    assert len(loaded) == 3, f"cache must hold the merged set, got: {sorted(loaded)!r}"
+
+    second = _run_main(stdin, tmp_path)
+
+    assert second.returncode == 0, second.stderr.decode("utf-8", "replace")
+    assert second.stdout == first.stdout, (
+        "cache-hit invocation must render identically:\n"
+        f"first={first.stdout.decode('utf-8')!r}\nsecond={second.stdout.decode('utf-8')!r}"
+    )
+    reloaded = json.loads(agents_cache_path.read_text(encoding="utf-8"))
+    assert len(reloaded) == 3, f"cache must still hold the merged set: {sorted(reloaded)!r}"
+
+
+def test_hook_runtime_smoke_on_multi_project_tree(tmp_path: Path) -> None:
+    """Generous latency canary for the hook's hottest path (plan Task 5
+    budget: <2x the pre-merge runtime, ~0.4s on the real tree). A full
+    invocation over a synthetic multi-project tree must stay far below
+    5s — an accidental return to full-tree recursive globbing or per-dir
+    rescanning would blow past it. Absolute bound (not a ratio) on
+    purpose: ratios are flaky on shared machines; 5s is ~10x the
+    observed worst case, so it only trips on real regressions."""
+    target_sid = "cccc0000-3000-4000-8000-00000000000c"
+    for proj in range(25):
+        encoded = f"smoke-project-{proj:02d}"
+        for s in range(4):
+            sid = target_sid if s == 0 else f"cccc{proj:02d}{s:02d}-3000-4000-8000-{proj:012d}"
+            session_dir = tmp_path / ".claude" / "projects" / encoded / sid
+            subagents = session_dir / "subagents"
+            subagents.mkdir(parents=True)
+            (session_dir / "tool-results").mkdir()
+            main_jsonl = session_dir.parent / f"{sid}.jsonl"
+            main_jsonl.write_text("\n".join(_SPLIT_MAIN_LINES) + "\n")
+            for a in range(3):
+                (subagents / f"agent-smoke{a}.jsonl").write_text(_ok_agent_jsonl())
+                (subagents / f"agent-smoke{a}.meta.json").write_text(
+                    _agent_meta(f"Smoke {proj}-{s}-{a}", f"ts{proj}{s}{a}")
+                )
+    stdin = json.dumps({
+        "session_id": target_sid,
+        "model": {"display_name": "X"},
+        "transcript_path": str(
+            tmp_path / ".claude" / "projects" / "smoke-project-00" / f"{target_sid}.jsonl"
+        ),
+    })
+
+    start = time.monotonic()
+    result = _run_main(stdin, tmp_path)
+    elapsed = time.monotonic() - start
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    output = result.stdout.decode("utf-8")
+    assert "Smoke 0-0-1" in output, f"target session's agents must render:\n{output!r}"
+    assert elapsed < 5.0, f"hook invocation took {elapsed:.2f}s on the synthetic tree (>5s budget)"
