@@ -50,6 +50,7 @@ def _write_main_cache(
     start_cached: int = 0,
     context_tokens: int = 0,
     total: int | None = None,
+    per_model: dict | None = None,
     last_uuid: str = MAIN_NORMAL_LAST_UUID,
     mtime_jsonl: float | None = None,
 ) -> dict:
@@ -59,6 +60,7 @@ def _write_main_cache(
     `total=None` omits the legacy `total` key; pass an int to include it.
     `context_tokens` and the `start_*` fields default to 0 — PRESENT
     (possibly zero) fields; the cache-hit guard checks presence, not value.
+    Same for `per_model` (defaults to a present-but-arbitrary dict).
     `mtime_jsonl=None` reads the current MAIN_NORMAL mtime so the cache hit
     succeeds (compute_main_cum's cache key is `(last_uuid, mtime_jsonl)`).
     Shared by the "no total key" and "legacy total field" tests so the
@@ -77,6 +79,7 @@ def _write_main_cache(
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime_jsonl,
         "tool_use_positions": {},
+        "per_model": per_model if per_model is not None else {"sentinel-model": {"in": 1, "out": 2, "cached": 3}},
     }
     if total is not None:
         payload["total"] = total
@@ -212,6 +215,7 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
     sentinel_positions = {"sentinel_tool_id": 0}
     sentinel_context = 424_242
     sentinel_start = 434_343
+    sentinel_per_model = {"sentinel-model": {"in": 7, "out": 8, "cached": 9}}
     cached = {
         "cum_in": sentinel_cum_in,
         "cum_out": 2,
@@ -224,6 +228,7 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
         "last_uuid": "66666666-6666-6666-6666-666666666666",  # matches main_with_tool_use tail
         "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
         "tool_use_positions": sentinel_positions,
+        "per_model": sentinel_per_model,
     }
     cache.write_text(json.dumps(cached))
 
@@ -234,6 +239,7 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
     assert result["tool_use_positions"] == sentinel_positions
     assert result["context_tokens"] == sentinel_context
     assert result["start_in"] == sentinel_start
+    assert result["per_model"] == sentinel_per_model
     assert result["last_uuid"] == "66666666-6666-6666-6666-666666666666"
 
 
@@ -445,6 +451,7 @@ def test_cache_hit_preserves_task_notifications(tmp_path: Path) -> None:
         "tool_use_positions": {},
         "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
         "task_notifications": {"sentinel-agent": "ok"},
+        "per_model": {"sentinel-model": {"in": 1, "out": 1, "cached": 1}},
     }
     cache.write_text(json.dumps(cached))
 
@@ -515,6 +522,7 @@ def test_cache_hit_preserves_mtime_jsonl_field(tmp_path: Path) -> None:
         "tool_use_positions": {},
         "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
         "task_notifications": {},
+        "per_model": {},
     }
     cache.write_text(json.dumps(cached))
 
@@ -818,3 +826,160 @@ def test_cache_hit_requires_start_fields(tmp_path: Path) -> None:
     # Cache rewritten in the new shape.
     on_disk = json.loads(cache.read_text())
     assert on_disk["start_in"] == 100
+
+
+# ---------------------------------------------------------------------------
+# per_model accumulation (plan 20260826-status-line-model-cost-columns, Task 2)
+# ---------------------------------------------------------------------------
+
+def test_per_model_single_model(tmp_path: Path) -> None:
+    """All assistant events share one model → per_model has a single entry
+    with the per-model sums of in/out/cached (cache_read; cache_creation is
+    never surfaced, matching the cached-column semantics).
+
+    main_normal.jsonl: 3 assistant events, all model "claude-opus-4-1":
+      in  = 100+150+200 = 450, out = 30+80+120 = 230, cached = 200+500+700 = 1400
+    """
+    cache = tmp_path / "main_pm.json"
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    assert result["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
+
+
+def test_per_model_model_change_mid_jsonl(tmp_path: Path) -> None:
+    """Model switch mid-session → one per_model entry per model, each summing
+    only its own events. Key order follows FIRST APPEARANCE in the scan
+    (render relies on dict insertion order for the model-row order)."""
+    jsonl = tmp_path / "multi_model.jsonl"
+    jsonl.write_text(
+        '{"type":"assistant","message":{"model":"glm-5.3","usage":{"input_tokens":10,'
+        '"cache_creation_input_tokens":5,"cache_read_input_tokens":100,"output_tokens":2}},'
+        '"uuid":"u1"}\n'
+        '{"type":"assistant","message":{"model":"kimi-k3","usage":{"input_tokens":20,'
+        '"cache_creation_input_tokens":1,"cache_read_input_tokens":200,"output_tokens":4}},'
+        '"uuid":"u2"}\n'
+        '{"type":"assistant","message":{"model":"glm-5.3","usage":{"input_tokens":1,'
+        '"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}},'
+        '"uuid":"u3"}\n'
+    )
+    cache = tmp_path / "main_pm_multi.json"
+    result = compute_main_cum(jsonl, cache)
+
+    per_model = result["per_model"]
+    # glm-5.3 sums events u1+u3; kimi-k3 sums u2. cache_creation (5/1/0)
+    # is NOT part of any per-model record.
+    assert per_model == {
+        "glm-5.3": {"in": 11, "out": 3, "cached": 100},
+        "kimi-k3": {"in": 20, "out": 4, "cached": 200},
+    }
+    # First-appearance order: glm-5.3 was seen before kimi-k3.
+    assert list(per_model.keys()) == ["glm-5.3", "kimi-k3"]
+    # Totals unchanged — per_model is an additional breakdown, not a replacement.
+    assert result["cum_in"] == 31
+    assert result["cum_out"] == 7
+    assert result["cum_cache_read"] == 300
+
+
+def test_per_model_only_synthetic_keeps_zero_record(tmp_path: Path) -> None:
+    """A jsonl whose assistant events are all <synthetic> (zero usage) keeps
+    the zero-valued record in per_model. Filtering of zero-token rows is a
+    RENDER concern; the scan must not lose the knowledge that the model
+    occurred at all."""
+    jsonl = tmp_path / "synthetic_only.jsonl"
+    jsonl.write_text(
+        '{"type":"assistant","message":{"model":"<synthetic>","usage":{"input_tokens":0,'
+        '"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}},'
+        '"uuid":"u1"}\n'
+        '{"type":"assistant","message":{"model":"<synthetic>","usage":{"input_tokens":0,'
+        '"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}},'
+        '"uuid":"u2"}\n'
+    )
+    cache = tmp_path / "main_pm_synth.json"
+    result = compute_main_cum(jsonl, cache)
+
+    assert result["per_model"] == {
+        "<synthetic>": {"in": 0, "out": 0, "cached": 0}
+    }
+
+
+def test_per_model_assistant_without_usage_not_recorded(tmp_path: Path) -> None:
+    """An assistant event with NO usage block contributes nothing to
+    per_model (same gate as the cum_* sums) — no model entry, not even a
+    zero record, because the scan cannot even know tokens existed."""
+    jsonl = tmp_path / "no_usage_model.jsonl"
+    jsonl.write_text(
+        '{"type":"assistant","message":{"model":"glm-5.3","content":[]},"uuid":"u1"}\n'
+    )
+    cache = tmp_path / "main_pm_nu.json"
+    result = compute_main_cum(jsonl, cache)
+
+    assert result["per_model"] == {}
+
+
+def test_per_model_persisted_to_cache(tmp_path: Path) -> None:
+    """Fresh compute persists per_model to the cache file; a second call
+    (cache hit) returns it without re-scanning."""
+    cache = tmp_path / "main_pm_disk.json"
+    compute_main_cum(MAIN_NORMAL, cache)
+
+    on_disk = json.loads(cache.read_text())
+    assert on_disk["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
+
+    result2 = compute_main_cum(MAIN_NORMAL, cache)
+    assert result2["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
+
+
+def test_cache_hit_requires_per_model_field(tmp_path: Path) -> None:
+    """Pre-model-column cache shape: both key parts match AND the dict has
+    context_tokens + start_*, but LACKS per_model. The field-presence guard
+    must treat it as a MISS and recompute (else the model/cost columns would
+    render from an empty dict for one cycle after upgrade). Mirrors the
+    context_tokens / start_* guard tests above."""
+    cache = tmp_path / "main_old_schema_no_pm.json"
+    # Intentionally WITHOUT "per_model" (but WITH context_tokens and the
+    # start_* fields, so only the per_model guard can trigger the miss).
+    cached = {
+        "cum_in": 111,
+        "cum_out": 222,
+        "cum_cache_create": 333,
+        "cum_cache_read": 444,
+        "start_in": 100,
+        "start_out": 30,
+        "start_cached": 200,
+        "context_tokens": 1050,
+        "last_uuid": MAIN_NORMAL_LAST_UUID,
+        "mtime_jsonl": MAIN_NORMAL.stat().st_mtime,
+        "tool_use_positions": {},
+        "task_notifications": {},
+    }
+    cache.write_text(json.dumps(cached))
+
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    # Recomputed, not the stale sentinels.
+    assert result["cum_in"] == 450
+    assert result["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
+    # Cache rewritten in the new shape.
+    on_disk = json.loads(cache.read_text())
+    assert on_disk["per_model"] == result["per_model"]
+
+
+def test_missing_jsonl_per_model_empty(tmp_path: Path) -> None:
+    """Missing jsonl → the _EMPTY_MAIN_RESULT copy must carry an (empty)
+    per_model dict — the orchestrator must not KeyError on the race path
+    where the jsonl disappears between the existence check and the scan."""
+    jsonl = tmp_path / "does_not_exist.jsonl"
+    cache = tmp_path / "main_pm_missing.json"
+
+    result = compute_main_cum(jsonl, cache)
+
+    assert result["per_model"] == {}
+    assert isinstance(result["per_model"], dict)

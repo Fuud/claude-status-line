@@ -227,10 +227,10 @@ agents, prices=None, host="")` — плоская тройка main заменя
 - Modify: `status_line.py`
 - Modify: `tests/test_compute_main_cum.py`
 
-- [ ] красные тесты: одна модель; смена модели посреди jsonl (две записи per_model); только `<synthetic>` (запись с нулями остаётся в dict); main-кэш старой формы (без `per_model`) с совпадающим `last_uuid` → miss и перезапись
-- [ ] `_scan_main_jsonl` копит `per_model` в том же проходе
-- [ ] `compute_main_cum` пробрасывает `per_model` в результат и кэш; cache-hit требует наличия поля; `"per_model": {}` добавляется в `_EMPTY_MAIN_RESULT` (race-путь «jsonl исчез между проверками» не должен ронять оркестратор)
-- [ ] зелёные тесты, прогон всей suite
+- [x] красные тесты: одна модель; смена модели посреди jsonl (две записи per_model); только `<synthetic>` (запись с нулями остаётся в dict); main-кэш старой формы (без `per_model`) с совпадающим `last_uuid` → miss и перезапись
+- [x] `_scan_main_jsonl` копит `per_model` в том же проходе
+- [x] `compute_main_cum` пробрасывает `per_model` в результат и кэш; cache-hit требует наличия поля; `"per_model": {}` добавляется в `_EMPTY_MAIN_RESULT` (race-путь «jsonl исчез между проверками» не должен ронять оркестратор)
+- [x] зелёные тесты, прогон всей suite
 
 ### Task 3: compute_agent_snapshot → один forward-scan, кумулятив + models
 

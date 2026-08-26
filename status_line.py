@@ -591,12 +591,21 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
             queue-operation content to one of the in-vocabulary statuses
             `{"ok", "kill", "err"}`; unknown statuses are omitted.
             Last-wins on duplicate task-id (resume scenario).
+        per_model — model_id → {"in", "out", "cached"} token sums over that
+            model's assistant events WITH a usage block (model id from
+            message.model; `""` when the event carries no model field).
+            Zero-token records — including `<synthetic>` — are KEPT here;
+            skipping zero rows is a render concern (see render_output).
+            Key order follows first appearance in the scan. `cached` is
+            cache_read only — cache_creation is never surfaced, matching
+            the cached-column semantics of every other row.
     """
     cum_in = cum_out = cum_cache_create = cum_cache_read = 0
     start_in = start_out = start_cached = 0
     context_tokens = 0
     tool_use_positions: dict[str, int] = {}
     task_notifications: dict[str, str] = {}
+    per_model: dict[str, dict[str, int]] = {}
     last_uuid = ""
     seen_first_usage = False
 
@@ -637,6 +646,19 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
                         start_in = in_v
                         start_out = out_v
                         start_cached = cache_read_v
+                    # Per-model breakdown (model/cost columns). Same gate
+                    # as the cum_* sums: only assistant events with a usage
+                    # block. setdefault keeps the FIRST-appearance key
+                    # order render relies on; zero-token models (including
+                    # <synthetic>) stay in the dict — the render layer
+                    # decides which rows to show.
+                    model_id = str(msg.get("model") or "")
+                    model_rec = per_model.setdefault(
+                        model_id, {"in": 0, "out": 0, "cached": 0}
+                    )
+                    model_rec["in"] += in_v
+                    model_rec["out"] += out_v
+                    model_rec["cached"] += cache_read_v
                     # Context-window occupancy at THIS api call — overwrite on
                     # every assistant event so the scan ends holding the LAST
                     # one. Same formula as the payload's
@@ -690,6 +712,7 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
         "tool_use_positions": tool_use_positions,
         "last_uuid": last_uuid,
         "task_notifications": task_notifications,
+        "per_model": per_model,
     }
 
 
@@ -738,6 +761,7 @@ _EMPTY_MAIN_RESULT: dict = {
     "mtime_jsonl": 0.0,
     "tool_use_positions": {},
     "task_notifications": {},
+    "per_model": {},
 }
 
 
@@ -757,7 +781,8 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     Returns a dict with keys:
         cum_in, cum_out, cum_cache_create, cum_cache_read,
         start_in, start_out, start_cached, context_tokens,
-        last_uuid, mtime_jsonl, tool_use_positions, task_notifications
+        last_uuid, mtime_jsonl, tool_use_positions, task_notifications,
+        per_model
 
     context_tokens is the context-window occupancy at the LAST assistant
     event (input + cache_creation + cache_read) — the header's "Context:"
@@ -783,6 +808,14 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     present: pre-start-row caches lack them and would render a zeroed
     "start:" row for one cycle after upgrade. Same guard pattern as the
     context_tokens check above.
+
+    [deviation] Cache hit likewise requires `per_model` to be present:
+    pre-model-column caches lack it and would render empty model/cost
+    columns for one cycle after upgrade. Same field-presence guard pattern
+    as the context_tokens / start_* checks above.
+
+    per_model is the per-model token breakdown feeding the table's model
+    and cost columns (see _scan_main_jsonl for the accumulation rules).
 
     [deviation] The legacy `total` field was removed in Task 2 of the
     breakdown-table plan. The total is now derived by render from the three
@@ -812,9 +845,9 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     mtime_jsonl = _jsonl_mtime(jsonl_path)
 
     # Cache hit? Both last_uuid AND mtime_jsonl must match — otherwise stale.
-    # `context_tokens` and the `start_*` fields' presence are part of the
-    # hit check (see [deviation]s in the docstring): pre-upgrade caches
-    # lack them.
+    # `context_tokens`, the `start_*` fields and `per_model` presence are
+    # part of the hit check (see [deviation]s in the docstring): pre-upgrade
+    # caches lack them.
     if (
         cache is not None
         and scan["last_uuid"]
@@ -822,6 +855,7 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
         and cache.get("mtime_jsonl") == mtime_jsonl
         and "context_tokens" in cache
         and all(f in cache for f in ("start_in", "start_out", "start_cached"))
+        and "per_model" in cache
     ):
         return cache
 
