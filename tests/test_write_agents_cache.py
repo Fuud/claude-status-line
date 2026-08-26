@@ -34,6 +34,7 @@ def _snapshot(agent_id: str, **overrides) -> dict:
         "tokens_in": 0,
         "tokens_out": 0,
         "tokens_cached": 0,
+        "models": {},
         "description": f"desc-{agent_id}",
         "toolUseId": f"toolu_{agent_id}",
         "last_uuid": f"uuid-{agent_id}",
@@ -83,6 +84,32 @@ def test_empty_agents_writes_empty_dict(tmp_path: Path) -> None:
     assert cache.exists()
     on_disk = json.loads(cache.read_text())
     assert on_disk == {}
+
+
+# ---------------------------------------------------------------------------
+# models persistence (20260826 Task 3)
+# ---------------------------------------------------------------------------
+
+def test_models_field_round_trips(tmp_path: Path) -> None:
+    """The per-model breakdown must survive the cache round-trip: a
+    snapshot with a multi-model `models` dict persists it verbatim so a
+    cache-hit render can rebuild the agent's model/cost rows without
+    re-parsing the jsonl."""
+    cache = tmp_path / "agents_models.json"
+    models = {
+        "kimi-k3": {"in": 30, "out": 13, "cached": 300},
+        "glm-5.3": {"in": 30, "out": 12, "cached": 300},
+    }
+    agents = [_snapshot("agent-a", models=models)]
+
+    _write_agents_cache(cache, agents)
+
+    on_disk = json.loads(cache.read_text())
+    assert on_disk["agent-a"]["models"] == models, (
+        f"models should persist verbatim, got: {on_disk['agent-a']['models']!r}"
+    )
+    # Key order survives json round-trip (dicts preserve insertion order).
+    assert list(on_disk["agent-a"]["models"].keys()) == ["kimi-k3", "glm-5.3"]
 
 
 # ---------------------------------------------------------------------------

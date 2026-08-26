@@ -240,11 +240,11 @@ agents, prices=None, host="")` — плоская тройка main заменя
 - Modify: `tests/test_compute_agent_snapshot.py`
 - Create: `tests/fixtures/` — маленькие handcrafted jsonl/meta при необходимости
 
-- [ ] красные тесты: кумулятивные тоталы по нескольким событиям; агент сменил модель (две записи в `models`); агент без assistant-событий (нули, `models` пуст, err/stop override); старый agents-кэш без `models` → miss; `detect_status`-кейсы (interrupt после последнего assistant и т.п.) не регрессировали
-- [ ] переписать существующие ассерты `tokens_*` с last-event на кумулятивные
-- [ ] реализовать forward-scan (тоталы, per-model, последний assistant uuid, последние события для статуса); `_read_last_event` удалить, если других вызывающих нет (проверить grep'ом); задокументировать парсинг-trade-off в `[decision]`-комментарии (см. Данные)
-- [ ] `_AGENT_CACHE_FIELDS` += `"models"`; cache-hit требует `models`; тест в `tests/test_write_agents_cache.py`, что `models` персистится
-- [ ] зелёные тесты, прогон всей suite
+- [x] красные тесты: кумулятивные тоталы по нескольким событиям; агент сменил модель (две записи в `models`); агент без assistant-событий (нули, `models` пуст, err/stop override); старый agents-кэш без `models` → miss; `detect_status`-кейсы (interrupt после последнего assistant и т.п.) не регрессировали
+- [x] переписать существующие ассерты `tokens_*` с last-event на кумулятивные
+- [x] реализовать forward-scan (тоталы, per-model, последний assistant uuid, последние события для статуса); `_read_last_event` удалить, если других вызывающих нет (проверить grep'ом); задокументировать парсинг-trade-off в `[decision]`-комментарии (см. Данные)
+- [x] `_AGENT_CACHE_FIELDS` += `"models"`; cache-hit требует `models`; тест в `tests/test_write_agents_cache.py`, что `models` персистится
+- [x] зелёные тесты, прогон всей suite
 
 ### Task 4: render_table + render_output с колонками model/cost
 
