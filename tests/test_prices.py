@@ -20,6 +20,7 @@ import pytest
 
 from status_line import (
     _PRICES_PATH,
+    _is_num,
     compute_cost,
     format_cost,
     load_prices,
@@ -73,7 +74,7 @@ def test_load_prices_missing_file(tmp_path) -> None:
 
 def test_load_prices_broken_json(tmp_path) -> None:
     p = tmp_path / "prices.json"
-    p.write_text("[{not json")
+    _write(p, "[{not json")
     assert load_prices(p) is None
 
 
@@ -111,7 +112,7 @@ def test_load_prices_rejects_non_finite_numbers(tmp_path, entry) -> None:
     # reject them explicitly — a NaN `per` (NaN <= 0 is False) would
     # otherwise flow into format_cost and render "$nan".
     p = tmp_path / "prices.json"
-    p.write_text(json.dumps([entry]))
+    _write(p, [entry])
     assert load_prices(p) is None
 
 
@@ -119,8 +120,6 @@ def test_load_prices_rejects_non_finite_numbers(tmp_path, entry) -> None:
     "per", [float("nan"), float("inf"), float("-inf")]
 )
 def test_is_num_rejects_non_finite(per: float) -> None:
-    from status_line import _is_num
-
     assert not _is_num(per)
 
 
@@ -248,7 +247,11 @@ def test_prices_path_is_home_bound() -> None:
 # price_for
 # ---------------------------------------------------------------------------
 
-_PRICES = {
+# Named for its distinguishing feature: unlike the two-key _PRICES in
+# test_render_output.py, this one also carries the PLAIN "glm-5.3" key
+# the fallback-chain tests need (same-named constants with different
+# contents in sibling files would be a drift trap).
+_PRICES_WITH_PLAIN_FALLBACK = {
     "glm-5.3@api.z.ai": {"in": 6.9, "out": 24.0, "cache": 1.7,
                          "per": 10000, "units": "credits"},
     "glm-5.3": {"in": 1.0, "out": 2.0, "cache": 0.5, "per": 1000, "units": "$"},
@@ -258,19 +261,28 @@ _PRICES = {
 
 
 def test_price_for_prefers_host_key() -> None:
-    assert price_for("glm-5.3", _PRICES, "api.z.ai") is _PRICES["glm-5.3@api.z.ai"]
+    assert (
+        price_for("glm-5.3", _PRICES_WITH_PLAIN_FALLBACK, "api.z.ai")
+        is _PRICES_WITH_PLAIN_FALLBACK["glm-5.3@api.z.ai"]
+    )
 
 
 def test_price_for_falls_back_to_plain_model() -> None:
-    assert price_for("kimi-k3", _PRICES, "api.z.ai") is _PRICES["kimi-k3"]
+    assert (
+        price_for("kimi-k3", _PRICES_WITH_PLAIN_FALLBACK, "api.z.ai")
+        is _PRICES_WITH_PLAIN_FALLBACK["kimi-k3"]
+    )
 
 
 def test_price_for_unknown_model() -> None:
-    assert price_for("MiniMax-M3", _PRICES, "api.z.ai") is None
+    assert price_for("MiniMax-M3", _PRICES_WITH_PLAIN_FALLBACK, "api.z.ai") is None
 
 
 def test_price_for_empty_host_uses_plain_key() -> None:
-    assert price_for("glm-5.3", _PRICES, "") is _PRICES["glm-5.3"]
+    assert (
+        price_for("glm-5.3", _PRICES_WITH_PLAIN_FALLBACK, "")
+        is _PRICES_WITH_PLAIN_FALLBACK["glm-5.3"]
+    )
 
 
 def test_price_for_no_prices() -> None:

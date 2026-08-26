@@ -37,6 +37,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -167,7 +168,7 @@ def _is_num(value: object) -> bool:
     )
 
 
-def load_prices(path: Path) -> "dict[str, dict] | None":
+def load_prices(path: Path) -> dict[str, dict] | None:
     """Read prices.json → {key: price} or None.
 
     A price entry is {"in": float, "out": float, "cache": float,
@@ -209,7 +210,9 @@ def load_prices(path: Path) -> "dict[str, dict] | None":
     return prices
 
 
-def price_for(model: str, prices: "dict[str, dict] | None", host: str) -> "dict | None":
+def price_for(
+    model: str, prices: dict[str, dict] | None, host: str
+) -> dict | None:
     """Price entry for a model id, or None when no price is known.
 
     Lookup chain: when host != "" try "model@host" first, then the bare
@@ -546,15 +549,35 @@ def _to_int(value: object) -> int:
         return 0
 
 
-def _iter_events(jsonl_path: Path):
+def _accumulate_model(
+    target: dict, msg: dict, in_v: int, out_v: int, cached_v: int
+) -> None:
+    """Accumulate one assistant event's usage into a per-model dict.
+
+    Shared by both jsonl scans: the model id comes from message.model
+    ("" when the event carries no model field); setdefault keeps the
+    FIRST-appearance key order the render relies on; zero-token records
+    (including <synthetic>) stay in the dict — the render layer decides
+    which rows to show.
+    """
+    model_id = str(msg.get("model") or "")
+    model_rec = target.setdefault(model_id, {"in": 0, "out": 0, "cached": 0})
+    model_rec["in"] += in_v
+    model_rec["out"] += out_v
+    model_rec["cached"] += cached_v
+
+
+def _iter_events(jsonl_path: Path) -> Iterator[tuple[int, dict]]:
     """Yield (index, event) for every parsable dict event in a jsonl file.
 
     Shared parse scaffold for the main and agent scans: blank lines and
     half-written lines (JSONDecodeError — race with the writer appending)
     are skipped, non-dict payloads are skipped. `index` counts ALL lines
     (pre-filter), matching the historical enumerate-based event indices
-    recorded in tool_use_positions. OSError propagates to the consumer —
-    each scan handles it per its own degradation contract.
+    recorded in tool_use_positions. OSError propagates to the consumer:
+    the agent scan catches it and degrades to the empty scan, while the
+    main scan does not catch it — it bubbles up to main()'s catch-all
+    safety net.
     """
     with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
         for index, raw_line in enumerate(f):
@@ -643,18 +666,9 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
                     start_cached = cache_read_v
                 # Per-model breakdown (model/cost columns). Same gate
                 # as the start/context captures: only assistant events
-                # with a usage block. setdefault keeps the
-                # FIRST-appearance key order render relies on;
-                # zero-token models (including <synthetic>) stay in
-                # the dict — the render layer decides which rows to
-                # show.
-                model_id = str(msg.get("model") or "")
-                model_rec = per_model.setdefault(
-                    model_id, {"in": 0, "out": 0, "cached": 0}
-                )
-                model_rec["in"] += in_v
-                model_rec["out"] += out_v
-                model_rec["cached"] += cache_read_v
+                # with a usage block; the setdefault/zero-record rules
+                # live in _accumulate_model.
+                _accumulate_model(per_model, msg, in_v, out_v, cache_read_v)
                 # Context-window occupancy at THIS api call — overwrite on
                 # every assistant event so the scan ends holding the LAST
                 # one. Same formula as the payload's
@@ -914,7 +928,9 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
               including <synthetic> — are KEPT here; skipping zero rows
               is a render concern. Key order follows first appearance.
         last_uuid — uuid field of the LAST assistant event, None when
-              there is no assistant event (or it carries no uuid).
+              there is no assistant event (or it carries no usable
+              uuid — the same non-str/empty guard the main scan applies
+              to its last_uuid).
         last_assistant — the last assistant event dict itself, or None.
         last_event — the very last parsable event of ANY type, or None —
               feeds detect_status (e.g. a user "[Request interrupted by
@@ -948,15 +964,9 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
             tokens_in += in_v
             tokens_out += out_v
             tokens_cached += cached_v
-            # Same gate and setdefault-first-appearance pattern as
-            # _scan_main_jsonl's per_model; zero-token models stay.
-            model_id = str(msg.get("model") or "")
-            model_rec = models.setdefault(
-                model_id, {"in": 0, "out": 0, "cached": 0}
-            )
-            model_rec["in"] += in_v
-            model_rec["out"] += out_v
-            model_rec["cached"] += cached_v
+            # Per-model breakdown — the same accumulation as the main
+            # scan's per_model (see _accumulate_model).
+            _accumulate_model(models, msg, in_v, out_v, cached_v)
     except OSError:
         return {
             "tokens_in": 0,
@@ -967,14 +977,20 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
             "last_assistant": None,
             "last_event": None,
         }
+    # Same non-str guard as the main scan's last_uuid: a corrupt uuid
+    # must not leak into the snapshot, the agents cache and the
+    # cache-key equality check.
+    last_uuid = None
+    if last_assistant is not None:
+        uuid = last_assistant.get("uuid")
+        if isinstance(uuid, str) and uuid:
+            last_uuid = uuid
     return {
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "tokens_cached": tokens_cached,
         "models": models,
-        "last_uuid": (
-            last_assistant.get("uuid") if last_assistant is not None else None
-        ),
+        "last_uuid": last_uuid,
         "last_assistant": last_assistant,
         "last_event": last_event,
     }
@@ -1462,9 +1478,7 @@ def render_table(columns: list, rows: list) -> list:
     return lines
 
 
-def _cost_cell(
-    model: str, rec: dict, prices: "dict | None", host: str
-) -> str:
+def _cost_cell(model: str, rec: dict, prices: dict | None, host: str) -> str:
     """Cost cell for one per-model row: the formatted number when a price
     is found, "n/a" when the model is known but unpriced, "" when there
     is no model at all (the start row and the zero-fallback rows — no
@@ -1477,44 +1491,63 @@ def _cost_cell(
     return format_cost(compute_cost(rec, price), price.get("units", ""))
 
 
-def _models_total(models: "dict | None") -> tuple:
+def _coerce_record(rec: object) -> dict | None:
+    """Coerce one per-model record to {"in","out","cached"} ints, or None.
+
+    Per-model dicts come from the scans or from a cache file, so every
+    consumer sits at an untrusted-data boundary: a non-dict record is
+    rejected (None) and non-numeric values coerce to 0 via _to_int — a
+    hand-corrupted cache must degrade the one bad record, not crash the
+    whole render.
+    """
+    if not isinstance(rec, dict):
+        return None
+    return {
+        "in": _to_int(rec.get("in")),
+        "out": _to_int(rec.get("out")),
+        "cached": _to_int(rec.get("cached")),
+    }
+
+
+def _models_total(models: dict | None) -> tuple[int, int, int]:
     """(in, out, cached) summed over a per-model dict's records.
 
-    The per-model dicts come from the scans or from a cache file, so this
-    is an untrusted-data boundary: non-dict records are skipped and
-    non-numeric values coerce to 0 via _to_int (a hand-corrupted cache
-    must degrade the one bad record, not crash the whole render)."""
+    Records are coerced via _coerce_record (cache-sourced inputs —
+    non-dict records are skipped, non-numeric values coerce to 0)."""
     total_in = total_out = total_cached = 0
     for rec in (models or {}).values():
-        if not isinstance(rec, dict):
+        coerced = _coerce_record(rec)
+        if coerced is None:
             continue
-        total_in += _to_int(rec.get("in"))
-        total_out += _to_int(rec.get("out"))
-        total_cached += _to_int(rec.get("cached"))
+        total_in += coerced["in"]
+        total_out += coerced["out"]
+        total_cached += coerced["cached"]
     return total_in, total_out, total_cached
 
 
 def _merge_models(sources: list) -> dict:
     """Merge per-model dicts into one, summing per model (no cross-model
     aggregation). Key order = first appearance across `sources` — pass
-    them in render order (main first, then agents). Same corrupt-record
-    tolerance as _models_total (cache-sourced inputs)."""
+    them in render order (main first, then agents). Records are coerced
+    via _coerce_record (same corrupt-record tolerance as _models_total —
+    cache-sourced inputs)."""
     merged: dict = {}
     for source in sources:
         if not isinstance(source, dict):
             continue
         for model, rec in source.items():
-            if not isinstance(rec, dict):
+            coerced = _coerce_record(rec)
+            if coerced is None:
                 continue
             acc = merged.setdefault(model, {"in": 0, "out": 0, "cached": 0})
-            acc["in"] += _to_int(rec.get("in"))
-            acc["out"] += _to_int(rec.get("out"))
-            acc["cached"] += _to_int(rec.get("cached"))
+            acc["in"] += coerced["in"]
+            acc["out"] += coerced["out"]
+            acc["cached"] += coerced["cached"]
     return merged
 
 
 def _group_model_rows(
-    label: str, models: "dict | None", prices: "dict | None", host: str
+    label: str, models: dict | None, prices: dict | None, host: str
 ) -> list:
     """Wide rows (label, model, in, out, cached, cost) for one group.
 
@@ -1525,19 +1558,16 @@ def _group_model_rows(
     model cell — groups are never skipped (the "agents never skipped"
     invariant, extended to main and sum).
 
-    Records are coerced ONCE here (the untrusted-cache boundary) and the
-    coerced values are what both the token cells and the cost cell
-    consume — a None/non-numeric field must not raise from compute_cost.
+    Records are coerced ONCE via _coerce_record (the untrusted-cache
+    boundary) and the coerced values are what both the token cells and
+    the cost cell consume — a None/non-numeric field must not raise from
+    compute_cost.
     """
     rows: list = []
     for model, rec in (models or {}).items():
-        if not isinstance(rec, dict):
+        coerced = _coerce_record(rec)
+        if coerced is None:
             continue
-        coerced = {
-            "in": _to_int(rec.get("in")),
-            "out": _to_int(rec.get("out")),
-            "cached": _to_int(rec.get("cached")),
-        }
         if not (coerced["in"] or coerced["out"] or coerced["cached"]):
             continue
         rows.append(
@@ -1556,6 +1586,37 @@ def _group_model_rows(
     return rows
 
 
+def _token_columns(cached_gap: str) -> list[dict]:
+    """The in/out/cached column specs shared by both render_output layouts.
+
+    All three are right-aligned with the _TOKEN_COLUMN_WIDTH floor;
+    `cached_gap` separates the token block from whatever follows it —
+    the plain single space when nothing follows (the prices=None layout,
+    matching render_table's default) and _DESC_TOKEN_GAP when the cost
+    column follows (the prices layout).
+    """
+    return [
+        {
+            "label": "in",
+            "align": "right",
+            "floor": _TOKEN_COLUMN_WIDTH,
+            "gap": " ",
+        },
+        {
+            "label": "out",
+            "align": "right",
+            "floor": _TOKEN_COLUMN_WIDTH,
+            "gap": " ",
+        },
+        {
+            "label": "cached",
+            "align": "right",
+            "floor": _TOKEN_COLUMN_WIDTH,
+            "gap": cached_gap,
+        },
+    ]
+
+
 def render_output(
     header: str,
     start_in: int,
@@ -1563,7 +1624,7 @@ def render_output(
     start_cached: int,
     main_models: dict,
     agents: list,
-    prices: "dict | None" = None,
+    prices: dict | None = None,
     host: str = "",
 ) -> str:
     """Build the multi-line status line string with a tabular breakdown.
@@ -1653,12 +1714,7 @@ def render_output(
     rows: list = []
     if prices is None:
         # Today's layout: one row per group, the group's totals.
-        columns = [
-            label_column,
-            {"label": "in", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": " "},
-            {"label": "out", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": " "},
-            {"label": "cached", "align": "right", "floor": _TOKEN_COLUMN_WIDTH},
-        ]
+        columns = [label_column, *_token_columns(" ")]
         main_in, main_out, main_cached = _models_total(main_models)
         rows.append(
             [
@@ -1700,10 +1756,13 @@ def render_output(
         # the extra columns read as additions to the old layout).
         columns = [
             label_column,
-            {"label": "model", "align": "left", "floor": 0, "gap": _DESC_TOKEN_GAP},
-            {"label": "in", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": " "},
-            {"label": "out", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": " "},
-            {"label": "cached", "align": "right", "floor": _TOKEN_COLUMN_WIDTH, "gap": _DESC_TOKEN_GAP},
+            {
+                "label": "model",
+                "align": "left",
+                "floor": 0,
+                "gap": _DESC_TOKEN_GAP,
+            },
+            *_token_columns(_DESC_TOKEN_GAP),
             {"label": "cost", "align": "right", "floor": 0},
         ]
         rows.append(

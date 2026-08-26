@@ -332,6 +332,37 @@ def test_malformed_token_values_coerce_to_zero_not_raise(tmp_path: Path) -> None
     assert result["models"] == {"glm-5.3": {"in": 0, "out": 3, "cached": 0}}
 
 
+def test_non_str_uuid_yields_none_not_raw_value(tmp_path: Path) -> None:
+    """[review follow-up] A corrupt uuid (non-str) on the last assistant
+    event must yield last_uuid=None, not the raw value — last_uuid flows
+    into the snapshot, the agents cache and the cache-key equality
+    check, and the main scan already applies the same isinstance guard.
+    """
+    jsonl = tmp_path / "agent-bad-uuid.jsonl"
+    jsonl.write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": "hi"}],
+                "model": "glm-5.3",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 0,
+                },
+            },
+            "uuid": 12345,
+        })
+        + "\n"
+    )
+
+    result = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert result["tokens_in"] == 7
+    assert result["last_uuid"] is None
+
+
 def test_assistant_event_without_model_field_uses_empty_key(tmp_path: Path) -> None:
     """An assistant event WITH usage but NO model field accumulates under
     the "" key in `models` (mirrors _scan_main_jsonl) — the render layer
