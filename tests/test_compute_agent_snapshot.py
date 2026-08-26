@@ -530,15 +530,11 @@ def _make_session_with_agent(
 
     Returns (session_dir, agents_cache_path, agent_id) where agent_id is the
     canonical stem ("agent-test") — callers use it to derive the join key.
+    The fixture-pair copy itself lives in `_add_agent_to_session` below.
     """
     session_dir = tmp_path / "session-abc"
-    subagents_dir = session_dir / "subagents"
-    subagents_dir.mkdir(parents=True)
     agent_id = "agent-test"
-    dst_jsonl = subagents_dir / f"{agent_id}.jsonl"
-    dst_meta = subagents_dir / f"{agent_id}.meta.json"
-    dst_jsonl.write_bytes(src_jsonl.read_bytes())
-    dst_meta.write_bytes(src_meta.read_bytes())
+    _add_agent_to_session(session_dir, agent_id, src_jsonl, src_meta)
     agents_cache = tmp_path / "agents_cache.json"
     return session_dir, agents_cache, agent_id
 

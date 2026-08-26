@@ -2,10 +2,10 @@
 
 find_session_dirs(session_id, projects_root=None) globs
 `<projects_root>/*/<session_id>` (one level, plus a root-level <sid>
-check) and returns ALL matching directories as a list of Paths, in glob
-(OS-dependent) order. The same session id can exist in more than one
-encoded project dir (main checkout + worktree copy), and callers merge
-agents across all of them.
+check) and returns ALL matching directories as a list of Paths —
+root-level match first, then glob (OS-dependent) order. The same session
+id can exist in more than one encoded project dir (main checkout +
+worktree copy), and callers merge agents across all of them.
 
 find_session_dir(session_id, projects_root=None) is a thin wrapper over
 find_session_dirs that returns the first match as a Path (or None) — the
@@ -178,8 +178,9 @@ def test_find_session_dirs_nested_depth_not_searched(tmp_path: Path) -> None:
     on-disk convention is `<encoded-project>/<sid>/` (verified on the real
     tree — every session dir sits at depth 1), and a recursive walk would
     descend into every session dir's subagents/ and tool-results/ subtrees
-    (~110ms vs ~6ms per hook invocation). A deeper-nested <sid> dir is
-    therefore NOT found — this pins that contract."""
+    (see find_session_dirs' [deviation] note for the measured cost). A
+    deeper-nested <sid> dir is therefore NOT found — this pins that
+    contract."""
     projects_root = tmp_path / ".claude" / "projects"
     (projects_root / "projA" / "sub" / "sid-deep").mkdir(parents=True)
     # depth-1 dirs still found next to it

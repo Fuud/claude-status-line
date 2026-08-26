@@ -967,14 +967,13 @@ def _build_split_session(tmp_path: Path, sid: str) -> Path:
     return tmp_path / ".claude" / "projects" / "real-project" / f"{sid}.jsonl"
 
 
-def test_merge_agents_across_duplicate_session_dirs(tmp_path: Path) -> None:
-    """Two project dirs both carry <sid>/subagents/; agents are split across
-    them and one agentId exists in BOTH → output has every agent exactly once;
-    the shared agentId resolves to the transcript dir's copy (first dir wins).
-    """
+def _build_merge_layout(tmp_path: Path, sid: str) -> Path:
+    """Two project dirs carrying the same <sid>/subagents/ trees: agents
+    split across them, one agentId in BOTH (transcript dir's copy must win
+    the dedup). Returns the main dir's transcript jsonl path."""
     _build_synth_session(
         tmp_path,
-        MERGE_SID,
+        sid,
         _SPLIT_MAIN_LINES,
         [
             ("agent-main111", _ok_agent_jsonl(), _agent_meta("Main: only here", "tm1")),
@@ -984,7 +983,7 @@ def test_merge_agents_across_duplicate_session_dirs(tmp_path: Path) -> None:
     )
     _build_synth_session(
         tmp_path,
-        MERGE_SID,
+        sid,
         _SPLIT_MAIN_LINES,
         [
             ("agent-copy111", _ok_agent_jsonl(), _agent_meta("Copy: only here", "tc1")),
@@ -992,9 +991,15 @@ def test_merge_agents_across_duplicate_session_dirs(tmp_path: Path) -> None:
         ],
         encoded="merge-copy-project",
     )
-    transcript = (
-        tmp_path / ".claude" / "projects" / "merge-main-project" / f"{MERGE_SID}.jsonl"
-    )
+    return tmp_path / ".claude" / "projects" / "merge-main-project" / f"{sid}.jsonl"
+
+
+def test_merge_agents_across_duplicate_session_dirs(tmp_path: Path) -> None:
+    """Two project dirs both carry <sid>/subagents/; agents are split across
+    them and one agentId exists in BOTH → output has every agent exactly once;
+    the shared agentId resolves to the transcript dir's copy (first dir wins).
+    """
+    transcript = _build_merge_layout(tmp_path, MERGE_SID)
     stdin = json.dumps({
         "session_id": MERGE_SID,
         "model": {"display_name": "X"},
@@ -1062,33 +1067,6 @@ def test_stale_empty_agents_cache_self_heals(tmp_path: Path) -> None:
     loaded = json.loads(agents_cache_path.read_text(encoding="utf-8"))
     assert isinstance(loaded, dict)
     assert len(loaded) == 2, f"cache must be rewritten non-empty, got: {loaded!r}"
-
-
-def _build_merge_layout(tmp_path: Path, sid: str) -> Path:
-    """Two project dirs carrying the same <sid>/subagents/ trees: agents
-    split across them, one agentId in BOTH (transcript dir's copy must win
-    the dedup). Returns the main dir's transcript jsonl path."""
-    _build_synth_session(
-        tmp_path,
-        sid,
-        _SPLIT_MAIN_LINES,
-        [
-            ("agent-main111", _ok_agent_jsonl(), _agent_meta("Main: only here", "tm1")),
-            ("agent-shared", _ok_agent_jsonl(), _agent_meta("Shared: main dir wins", "tm2")),
-        ],
-        encoded="merge-main-project",
-    )
-    _build_synth_session(
-        tmp_path,
-        sid,
-        _SPLIT_MAIN_LINES,
-        [
-            ("agent-copy111", _ok_agent_jsonl(), _agent_meta("Copy: only here", "tc1")),
-            ("agent-shared", _ok_agent_jsonl(), _agent_meta("Shared: copy loses", "tc2")),
-        ],
-        encoded="merge-copy-project",
-    )
-    return tmp_path / ".claude" / "projects" / "merge-main-project" / f"{sid}.jsonl"
 
 
 def test_merge_agents_without_transcript_path(tmp_path: Path) -> None:

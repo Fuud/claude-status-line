@@ -902,10 +902,11 @@ def find_session_dirs(
 ) -> list[Path]:
     """Locate ALL directories named `session_id` under `projects_root`.
 
-    Globs `<projects_root>/*/<session_id>` (one level, plus a root-level
-    check — see below) and returns every matching *directory* as a list
-    of Paths, in glob order (OS-dependent, but stable per tree). Returns
-    [] if `session_id` is empty, if `projects_root` does not exist, or if
+    Globs `<projects_root>/*/<session_id>` (one level) plus a root-level
+    `<projects_root>/<session_id>` check, and returns every matching
+    *directory* as a list of Paths — root-level match first, then glob
+    order (OS-dependent, but stable per tree). Returns [] if
+    `session_id` is empty, if `projects_root` does not exist, or if
     no matching directory is found.
 
     The same session id can legitimately live in more than one encoded
@@ -917,8 +918,8 @@ def find_session_dirs(
 
     If `projects_root` is None, defaults to `<home>/.claude/projects`.
 
-    The `projects_root` parameter is preserved for backward compatibility
-    with existing callers; tests can also drive this function via
+    The `projects_root` parameter mirrors `find_session_dir`'s parameter
+    contract; tests can also drive this function via
     `monkeypatch.setattr(Path, "home", lambda: tmp_path)` and pass
     `projects_root=None`, which avoids the public surface carrying a
     test-only parameter.
@@ -937,9 +938,11 @@ def find_session_dirs(
     # `tool-results/` subtrees for matches the convention never produces
     # — ~110ms vs ~6ms per hook invocation on the real tree. The bare
     # root-level check below covers the zero-directory case that `**`
-    # additionally matched (`<projects_root>/<session_id>`). A one-level
-    # glob also never follows directory symlinks, keeping the old
-    # "no symlinked project trees" property for free.
+    # additionally matched (`<projects_root>/<session_id>`). The
+    # one-level glob does not recurse through symlinked subtrees the way
+    # a full `**` walk would, though it does resolve `<session_id>`
+    # through a direct-child symlinked project dir (one level deep, no
+    # further).
     matches: list[Path] = []
     root_level = projects_root / session_id
     if root_level.is_dir():
@@ -954,7 +957,8 @@ def find_session_dir(
     """Locate the FIRST directory named `session_id` under `projects_root`.
 
     Thin wrapper over `find_session_dirs`: returns the first element of
-    its result (glob order), or None when the list is empty — `session_id`
+    its result (root-level match first, then glob order), or None when
+    the list is empty — `session_id`
     is empty, `projects_root` does not exist, or nothing matches. See
     `find_session_dirs` for the all-matches variant and the rationale for
     needing more than one directory per session id.
@@ -992,7 +996,8 @@ def _resolve_session_dirs(
     ordering would put an empty worktree copy first (the bug this fixes).
 
     Degradations: empty `transcript_path`, or one whose sibling session dir
-    does not exist on disk, yields the pure glob order unchanged. Empty
+    does not exist on disk, yields the pure `find_session_dirs` order
+    unchanged. Empty
     `session_id` → [] (no filesystem statement to trust, and the glob has
     nothing to match).
 
@@ -1069,13 +1074,13 @@ def _find_main_jsonl(
            `main()` used to derive the jsonl exclusively this way).
         3. One-level glob `<projects_root>/*/<session_id>.jsonl`.
 
-    [deviation] The glob is one level (`*/`), not recursive (`**/`):
-    the on-disk convention is `<encoded-project>/<sid>.jsonl` with encoded
+    [deviation] The glob is one level (`*/`), not recursive (`**/`), for
+    the same reason as `find_session_dirs`' `*/<sid>` glob above — the
+    on-disk convention is `<encoded-project>/<sid>.jsonl` with encoded
     project dirs as direct children of `projects/`, and a recursive walk
     would descend into every session dir (incl. `subagents/` trees) for
-    no gain. `find_session_dirs` above uses the same one-level shape for
-    its `*/<sid>` directory glob (same convention, same reason — it was
-    briefly recursive and walked the whole tree at ~20x the cost).
+    no gain; see that function's `[deviation]` note for the measured
+    cost of the recursive variant.
 
     Returns None when `session_id` is empty or nothing matches — the
     orchestrator then degrades to a header-only line.
@@ -1461,7 +1466,7 @@ def _cache_path(data_dir: Path | None, name: str, session_id: str) -> Path:
 
 
 def _compute_agents(
-    session_dirs: Path | str | list[Path],
+    session_dirs: Path | str | os.PathLike | list[Path],
     agents_cache_path: Path,
     task_notifications: dict[str, str] | None = None,
 ) -> list:
@@ -1562,6 +1567,7 @@ def _main_unsafe() -> int:
     See main() docstring for the never-crash contract."""
     parsed = parse_stdin(sys.stdin.read())
     session_id = parsed.get("session_id", "") or ""
+    transcript_path = parsed.get("transcript_path", "") or ""
 
     if not session_id:
         # empty session_id → header only, exit 0. Context segment still
@@ -1574,16 +1580,14 @@ def _main_unsafe() -> int:
     # copy — see _resolve_session_dirs). The transcript dir leads the
     # list, which both anchors agent-id dedup (first dir wins) and feeds
     # _find_main_jsonl below.
-    session_dirs = _resolve_session_dirs(
-        parsed.get("transcript_path", ""), session_id
-    )
+    session_dirs = _resolve_session_dirs(transcript_path, session_id)
     # main jsonl: transcript_path payload → first session dir's sibling →
     # projects glob (see _find_main_jsonl). The session dirs are NOT a
     # gate — CC only materializes `<sid>/` once the session spawns its
     # first subagent, and a subagentless session still deserves its
     # main-row table + jsonl-derived Context.
     main_jsonl = _find_main_jsonl(
-        parsed.get("transcript_path", ""),
+        transcript_path,
         session_id,
         session_dirs[0] if session_dirs else None,
     )
