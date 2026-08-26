@@ -283,9 +283,9 @@ agents, prices=None, host="")` — плоская тройка main заменя
 
 - Modify: `README.md`
 
-- [ ] пример вывода с колонками model/cost (мульти-модельная сессия)
-- [ ] секция prices.json: формат, `model@host` из `ANTHROPIC_BASE_URL`, нет файла → нет колонок, `n/a`, `prices.example.json`
-- [ ] обновить описание семантики строк агентов (кумулятивно), Runtime dependencies (env `ANTHROPIC_BASE_URL` опционально)
+- [x] пример вывода с колонками model/cost (мульти-модельная сессия)
+- [x] секция prices.json: формат, `model@host` из `ANTHROPIC_BASE_URL`, нет файла → нет колонок, `n/a`, `prices.example.json`
+- [x] обновить описание семантики строк агентов (кумулятивно), Runtime dependencies (env `ANTHROPIC_BASE_URL` опционально)
 
 ### Task 7: Verify acceptance criteria
 
