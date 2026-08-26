@@ -4,6 +4,9 @@ Module-level invariants:
 - format_tokens handles non-negative ints; negative values clamp to "0".
 - detect_status returns one of {"err", "stop", "ok", "run"}.
 - parse_stdin never raises; it returns a dict with all keys present.
+- provider_host / load_prices never raise: an unset or malformed
+  ANTHROPIC_BASE_URL yields "" and an unreadable/invalid prices.json
+  yields None (treated as "no prices" — no cost columns).
 - compute_main_cum / compute_agent_snapshot never raise; OSError is
   swallowed so the hook cannot crash the parent session.
 - The orchestrator override in _compute_agents may additionally set
@@ -20,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +115,134 @@ def format_context(context_tokens: int, limit: int) -> str:
     k = round(context_tokens / 1_000)
     pct = round(context_tokens * 100 / limit) if limit > 0 else 0
     return f"{k}K ({pct}%)"
+
+
+# ---------------------------------------------------------------------------
+# prices.json: load / lookup / compute / format
+# ---------------------------------------------------------------------------
+
+# [decision] Bound to HOME (not to __file__): in production the module lives
+# in ~/.claude/status_line/ anyway, but the HOME binding is what makes the
+# subprocess integration tests hermetic — a fake HOME isolates the test from
+# the user's real prices.json (monkeypatching cannot reach a child process).
+_PRICES_PATH = Path.home() / ".claude" / "status_line" / "prices.json"
+
+
+def provider_host() -> str:
+    """Hostname of ANTHROPIC_BASE_URL, or "" when unset/invalid/non-str.
+
+    The hook distinguishes providers by base-URL host (the shell wrappers
+    like zai-glm-5.2-1m / claude-kimi-k3 differ by host), e.g.
+    "https://api.z.ai/api/anthropic" → "api.z.ai". Any error → "".
+    """
+    raw = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if not isinstance(raw, str):
+        return ""
+    try:
+        return urllib.parse.urlparse(raw).hostname or ""
+    except ValueError:
+        return ""
+
+
+def _is_num(value: object) -> bool:
+    """True for int/float but not bool (JSON `true` is not a price)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def load_prices(path: Path) -> "dict[str, dict] | None":
+    """Read prices.json → {key: price} or None.
+
+    A price entry is {"in": float, "out": float, "cache": float,
+    "per": int|float, "units": str}. None (the file is then treated as
+    absent — no cost column) when: the file is missing, the JSON is
+    broken, the payload is not a list, an element is not a dict, `model`
+    is not a non-empty string, `per` is missing / non-numeric / <= 0, or
+    a present in/out/cache price is non-numeric. Missing in/out/cache
+    default to 0; missing (or non-str) units default to "". Duplicate
+    keys: the last entry wins. Never raises, never writes to stderr.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, list):
+        return None
+    prices: dict = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return None
+        model = entry.get("model")
+        per = entry.get("per")
+        if not isinstance(model, str) or not model:
+            return None
+        if not _is_num(per) or per <= 0:
+            return None
+        record: dict = {"per": per, "units": entry.get("units", "")}
+        if not isinstance(record["units"], str):
+            record["units"] = ""
+        for key in ("in", "out", "cache"):
+            value = entry.get(key, 0)
+            if not _is_num(value):
+                return None
+            record[key] = float(value)
+        prices[model] = record
+    return prices
+
+
+def price_for(model: str, prices: "dict[str, dict] | None", host: str) -> "dict | None":
+    """Price entry for a model id, or None when no price is known.
+
+    Lookup chain: when host != "" try "model@host" first, then the bare
+    "model", then give up. Callers map "price found → number, model
+    known but no price → n/a".
+    """
+    if not prices:
+        return None
+    if host:
+        entry = prices.get(f"{model}@{host}")
+        if entry is not None:
+            return entry
+    return prices.get(model)
+
+
+def compute_cost(tokens: dict, price: dict) -> float:
+    """cost = (in·p_in + out·p_out + cached·p_cache) / per.
+
+    `tokens` is a per-model accumulation record ({"in", "out", "cached"}
+    token counts); `price` a load_prices record. cache_creation is
+    deliberately not part of the formula (it is not displayed anywhere).
+    """
+    return (
+        tokens.get("in", 0) * price.get("in", 0.0)
+        + tokens.get("out", 0) * price.get("out", 0.0)
+        + tokens.get("cached", 0) * price.get("cache", 0.0)
+    ) / price["per"]
+
+
+def format_cost(value: float, units: str) -> str:
+    """Format a cost for the table's cost cell.
+
+    Precision buckets: >= 1e6 → "X.XM"; >= 1000 → "X.Xk";
+    0.1 <= v < 1000 → one decimal with a trailing ".0" stripped ("402");
+    < 0.1 → two decimals ("0.04"). Units whose first char is not alnum
+    glue as a prefix ("$8.1"); otherwise they append after a space
+    ("402 credits"); empty units → the bare number.
+    """
+    if value >= 1_000_000:
+        num = f"{value / 1_000_000:.1f}M"
+    elif value >= 1000:
+        num = f"{value / 1_000:.1f}k"
+    elif value >= 0.1:
+        num = f"{value:.1f}"
+        if num.endswith(".0"):
+            num = num[:-2]
+    else:
+        num = f"{value:.2f}"
+    if not units:
+        return num
+    if units[0].isalnum():
+        return f"{num} {units}"
+    return f"{units}{num}"
 
 
 # ---------------------------------------------------------------------------

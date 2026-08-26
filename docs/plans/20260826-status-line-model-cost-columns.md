@@ -215,10 +215,10 @@ agents, prices=None, host="")` — плоская тройка main заменя
 - Modify: `status_line.py`
 - Create: `tests/test_prices.py`
 
-- [ ] красные тесты: `provider_host` (env есть / нет / битый URL / не-str), `load_prices` (нет файла / битый JSON / не список / нет model / per≤0 / не-числовые цены / partial-поля / валидный / дубли ключей), `price_for` (цепочка `model@host` → `model` → `None`; host=""), `compute_cost` (точные значения, нулевые компоненты), `format_cost` (M/k/1 знак без хвостового .0/2 знака <0.1; префикс `$` / суффикс `credits` / пустые units)
-- [ ] `_PRICES_PATH` = `Path.home()/.claude/status_line/prices.json` (см. Technical Details — привязка к HOME, не к `__file__`); `import urllib.parse`
-- [ ] реализовать пять чистых функций по Technical Details
-- [ ] зелёные тесты, прогон всей suite
+- [x] красные тесты: `provider_host` (env есть / нет / битый URL / не-str), `load_prices` (нет файла / битый JSON / не список / нет model / per≤0 / не-числовые цены / partial-поля / валидный / дубли ключей), `price_for` (цепочка `model@host` → `model` → `None`; host=""), `compute_cost` (точные значения, нулевые компоненты), `format_cost` (M/k/1 знак без хвостового .0/2 знака <0.1; префикс `$` / суффикс `credits` / пустые units)
+- [x] `_PRICES_PATH` = `Path.home()/.claude/status_line/prices.json` (см. Technical Details — привязка к HOME, не к `__file__`); `import urllib.parse`
+- [x] реализовать пять чистых функций по Technical Details
+- [x] зелёные тесты, прогон всей suite
 
 ### Task 2: per-model накопление в _scan_main_jsonl + bump main-кэша
 
