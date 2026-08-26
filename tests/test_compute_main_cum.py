@@ -1,22 +1,26 @@
 """Tests for compute_main_cum.
 
-compute_main_cum(jsonl_path, cache_path) reads a main session jsonl and returns
-cumulative token counters (input/output/cache_creation/cache_read), the
-first-message breakdown (start_in/start_out/start_cached — the table's
-"start:" row), plus a map of tool_use ids to their event indices in the
-jsonl. Results are cached in `cache_path` keyed by the last assistant
-event's uuid — if the jsonl tail hasn't changed, the cached values are
-returned without re-scanning.
+compute_main_cum(jsonl_path, cache_path) reads a main session jsonl and
+returns the per-model token breakdown (per_model — the model/cost columns'
+data), the first-message breakdown (start_in/start_out/start_cached — the
+table's "start:" row), the last assistant event's context occupancy
+(context_tokens), plus a map of tool_use ids to their event indices in the
+jsonl. Results are cached in `cache_path` keyed by (last assistant uuid,
+jsonl mtime) — if neither changed, the cached values are returned without
+re-scanning.
 
 Cache semantics:
-- If `cache_path` exists, load and compare `last_uuid` to the jsonl's last
-  assistant uuid. If equal → return cached values.
+- If `cache_path` exists, load and compare `last_uuid` + `mtime_jsonl` to
+  the jsonl's state. If equal → return cached values.
 - If the cache file is malformed (JSONDecodeError) → delete it, recompute.
 - The write is atomic: write to `<cache_path>.tmp`, then `os.replace()`.
 
-Spec: see docs/plans/20260824-token-breakdown-table.md (Task 2).
-After Task 2: the `total` key is no longer in the result dict (it was dead
-after the breakdown-table refactor and is fully removed now).
+Spec: see docs/plans/20260824-token-breakdown-table.md (Task 2) and
+docs/plans/20260826-status-line-model-cost-columns.md (Task 2).
+Removed fields: `total` (breakdown-table refactor) and the flat
+`cum_in`/`cum_out`/`cum_cache_create`/`cum_cache_read` sums (model-columns
+refactor — render derives group totals from per_model). Both may still
+appear in PRE-upgrade cache files; the cache-hit path ignores extra keys.
 """
 from __future__ import annotations
 
@@ -41,10 +45,6 @@ MAIN_NORMAL_LAST_UUID = "77777777-7777-7777-7777-777777777777"
 def _write_main_cache(
     cache_path: Path,
     *,
-    cum_in: int,
-    cum_out: int,
-    cum_cache_create: int,
-    cum_cache_read: int,
     start_in: int = 0,
     start_out: int = 0,
     start_cached: int = 0,
@@ -53,6 +53,7 @@ def _write_main_cache(
     per_model: dict | None = None,
     last_uuid: str = MAIN_NORMAL_LAST_UUID,
     mtime_jsonl: float | None = None,
+    extra: dict | None = None,
 ) -> dict:
     """Write a main-cache payload (the same shape compute_main_cum
     writes to disk) and return the dict.
@@ -63,15 +64,13 @@ def _write_main_cache(
     Same for `per_model` (defaults to a present-but-arbitrary dict).
     `mtime_jsonl=None` reads the current MAIN_NORMAL mtime so the cache hit
     succeeds (compute_main_cum's cache key is `(last_uuid, mtime_jsonl)`).
+    `extra` merges additional (legacy) keys into the payload — used to
+    prove the cache-hit path tolerates pre-upgrade fields.
     Shared by the "no total key" and "legacy total field" tests so the
     cache-payload literal lives in one place."""
     if mtime_jsonl is None:
         mtime_jsonl = MAIN_NORMAL.stat().st_mtime
     payload: dict = {
-        "cum_in": cum_in,
-        "cum_out": cum_out,
-        "cum_cache_create": cum_cache_create,
-        "cum_cache_read": cum_cache_read,
         "start_in": start_in,
         "start_out": start_out,
         "start_cached": start_cached,
@@ -83,6 +82,8 @@ def _write_main_cache(
     }
     if total is not None:
         payload["total"] = total
+    if extra:
+        payload.update(extra)
     cache_path.write_text(json.dumps(payload))
     return payload
 
@@ -99,10 +100,7 @@ def test_empty_jsonl_returns_zeros(tmp_path: Path) -> None:
 
     result = compute_main_cum(jsonl, cache)
 
-    assert result["cum_in"] == 0
-    assert result["cum_out"] == 0
-    assert result["cum_cache_create"] == 0
-    assert result["cum_cache_read"] == 0
+    assert result["per_model"] == {}
     assert result["tool_use_positions"] == {}
     # last_uuid is "" (empty string) per spec — code never returns None.
     assert result["last_uuid"] == ""
@@ -111,19 +109,16 @@ def test_empty_jsonl_returns_zeros(tmp_path: Path) -> None:
     # fresh compute → cache file should exist and be valid JSON
     assert cache.exists()
     on_disk = json.loads(cache.read_text())
-    assert on_disk["cum_in"] == 0
-    assert on_disk["cum_out"] == 0
+    assert on_disk["per_model"] == {}
+    assert on_disk["context_tokens"] == 0
 
 
 def test_no_assistant_events_returns_empty(tmp_path: Path) -> None:
-    """Jsonl that contains only user events → zero cum_* and empty positions."""
+    """Jsonl that contains only user events → empty per_model/positions."""
     cache = tmp_path / "main_no_assist.json"
     result = compute_main_cum(FIXTURES_DIR / "agent_no_assistant.jsonl", cache)
 
-    assert result["cum_in"] == 0
-    assert result["cum_out"] == 0
-    assert result["cum_cache_create"] == 0
-    assert result["cum_cache_read"] == 0
+    assert result["per_model"] == {}
     assert result["tool_use_positions"] == {}
     # No assistant event exists → last_uuid is "" (empty string).
     assert result["last_uuid"] == ""
@@ -135,24 +130,23 @@ def test_no_assistant_events_returns_empty(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def test_main_normal_sums_usage(tmp_path: Path) -> None:
-    """Sum input/output/cache_creation/cache_read across all assistant events
-    in main_normal.jsonl.
+    """Per-model sums over all assistant events in main_normal.jsonl.
 
-    main_normal.jsonl has 3 assistant events with usage:
+    main_normal.jsonl has 3 assistant events with usage (all model
+    "claude-opus-4-1"):
       event 1: input=100, cache_creation=50,  cache_read=200, output=30
       event 2: input=150, cache_creation=100, cache_read=500, output=80
       event 3: input=200, cache_creation=150, cache_read=700, output=120
 
-    Sums:
-      cum_in = 450, cum_out = 230, cum_cache_create = 300, cum_cache_read = 1400
+    per_model (cache_read only — cache_creation is never surfaced):
+      in = 450, out = 230, cached = 1400
     """
     cache = tmp_path / "main_normal.json"
     result = compute_main_cum(MAIN_NORMAL, cache)
 
-    assert result["cum_in"] == 450
-    assert result["cum_out"] == 230
-    assert result["cum_cache_create"] == 300
-    assert result["cum_cache_read"] == 1400
+    assert result["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
     # Last assistant uuid from main_normal.jsonl is the 3rd assistant event.
     assert result["last_uuid"] == "77777777-7777-7777-7777-777777777777"
     # No tool_use blocks in main_normal → empty positions.
@@ -202,25 +196,20 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
     """Pre-write a cache file whose last_uuid matches the jsonl tail →
     compute_main_cum returns the cached values without re-scanning.
 
-    Verification: write a sentinel value for `cum_in` (999_999_999) that the
-    real jsonl could never produce. If the result equals the sentinel, the
-    cache was used.
+    Verification: write sentinel values (per_model context=424_242,
+    start_in=434_343, ...) that the real jsonl could never produce. If the
+    result equals the sentinels, the cache was used.
 
     Cache key is now (last_uuid, mtime_jsonl) — the cached entry must include
     both for a hit. mtime_jsonl is read from the jsonl on disk; we use its
     current value here so the cache hit succeeds.
     """
     cache = tmp_path / "main_hit.json"
-    sentinel_cum_in = 999_999_999
     sentinel_positions = {"sentinel_tool_id": 0}
     sentinel_context = 424_242
     sentinel_start = 434_343
     sentinel_per_model = {"sentinel-model": {"in": 7, "out": 8, "cached": 9}}
     cached = {
-        "cum_in": sentinel_cum_in,
-        "cum_out": 2,
-        "cum_cache_create": 3,
-        "cum_cache_read": 4,
         "start_in": sentinel_start,
         "start_out": 0,
         "start_cached": 0,
@@ -235,7 +224,6 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
     result = compute_main_cum(MAIN_TOOL_USE, cache)
 
     # If cache was used, these values must match the sentinel.
-    assert result["cum_in"] == sentinel_cum_in
     assert result["tool_use_positions"] == sentinel_positions
     assert result["context_tokens"] == sentinel_context
     assert result["start_in"] == sentinel_start
@@ -248,23 +236,26 @@ def test_cache_miss_recomputes(tmp_path: Path) -> None:
     overwriting the cache."""
     cache = tmp_path / "main_miss.json"
     stale = {
-        "cum_in": 0,
-        "cum_out": 0,
-        "cum_cache_create": 0,
-        "cum_cache_read": 0,
+        "start_in": 0,
+        "start_out": 0,
+        "start_cached": 0,
+        "context_tokens": 0,
         "last_uuid": "stale-uuid-from-old-session",
         "tool_use_positions": {},
+        "per_model": {},
     }
     cache.write_text(json.dumps(stale))
 
     result = compute_main_cum(MAIN_NORMAL, cache)
 
     # Recomputed values from main_normal, not the stale zeros.
-    assert result["cum_in"] == 450
+    assert result["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
     # Cache file on disk should now reflect fresh values.
     on_disk = json.loads(cache.read_text())
-    assert on_disk["cum_in"] == 450
-    assert on_disk["cum_out"] == 230
+    assert on_disk["per_model"] == result["per_model"]
+    assert on_disk["context_tokens"] == 1050
 
 
 # ---------------------------------------------------------------------------
@@ -279,12 +270,14 @@ def test_broken_cache_recovered(tmp_path: Path) -> None:
     result = compute_main_cum(MAIN_NORMAL, cache)
 
     # Result is the recomputed values from main_normal.
-    assert result["cum_in"] == 450
+    assert result["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
     # Cache file was deleted (during the JSONDecodeError branch) and then
     # rewritten with fresh content — content must now be valid JSON.
     assert cache.exists()
     parsed = json.loads(cache.read_text())
-    assert parsed["cum_in"] == 450
+    assert parsed["per_model"] == result["per_model"]
     assert parsed["last_uuid"] == "77777777-7777-7777-7777-777777777777"
 
 
@@ -296,11 +289,13 @@ def test_broken_cache_non_dict_recovered(tmp_path: Path) -> None:
 
     result = compute_main_cum(MAIN_NORMAL, cache)
 
-    assert result["cum_in"] == 450
+    assert result["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
     assert cache.exists()
     parsed = json.loads(cache.read_text())
     assert isinstance(parsed, dict)
-    assert parsed["cum_in"] == 450
+    assert parsed["per_model"] == result["per_model"]
 
 
 # ---------------------------------------------------------------------------
@@ -333,10 +328,7 @@ def test_missing_jsonl_returns_zeros(tmp_path: Path) -> None:
 
     result = compute_main_cum(jsonl, cache)
 
-    assert result["cum_in"] == 0
-    assert result["cum_out"] == 0
-    assert result["cum_cache_create"] == 0
-    assert result["cum_cache_read"] == 0
+    assert result["per_model"] == {}
     assert result["tool_use_positions"] == {}
     assert result["last_uuid"] == ""
     # task_notifications should be present (empty dict) and mtime_jsonl == 0.0
@@ -438,10 +430,6 @@ def test_cache_hit_preserves_task_notifications(tmp_path: Path) -> None:
     correctly."""
     cache = tmp_path / "main_hit_tn.json"
     cached = {
-        "cum_in": 1,
-        "cum_out": 2,
-        "cum_cache_create": 3,
-        "cum_cache_read": 4,
         "start_in": 0,
         "start_out": 0,
         "start_cached": 0,
@@ -481,15 +469,15 @@ def test_cache_invalidates_on_mtime_change(tmp_path: Path) -> None:
     # Pre-write cache with an obviously STALE mtime (1.0 — Jan 1970).
     cache = tmp_path / "main_mtime.json"
     stale_cached = {
-        "cum_in": 0,
-        "cum_out": 0,
-        "cum_cache_create": 0,
-        "cum_cache_read": 0,
-        "total": 0,
+        "start_in": 0,
+        "start_out": 0,
+        "start_cached": 0,
+        "context_tokens": 0,
         "last_uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",  # matches fixture tail
         "tool_use_positions": {},
         "mtime_jsonl": 1.0,  # intentionally stale
         "task_notifications": {"stale-agent": "ok"},  # stale sentinel
+        "per_model": {},
     }
     cache.write_text(json.dumps(stale_cached))
 
@@ -509,15 +497,10 @@ def test_cache_hit_preserves_mtime_jsonl_field(tmp_path: Path) -> None:
     rely on this being populated."""
     cache = tmp_path / "main_mt2.json"
     cached = {
-        "cum_in": 0,
-        "cum_out": 0,
-        "cum_cache_create": 0,
-        "cum_cache_read": 0,
         "start_in": 0,
         "start_out": 0,
         "start_cached": 0,
         "context_tokens": 0,
-        "total": 0,
         "last_uuid": "66666666-6666-6666-6666-666666666666",
         "tool_use_positions": {},
         "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
@@ -551,15 +534,15 @@ def test_atomic_write_contains_new_fields(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 2: drop `total` from the result dict
+# Task 2: drop `total` from the result dict; review follow-up: drop the flat
+# cum_* sums too (render derives group totals from per_model)
 # ---------------------------------------------------------------------------
 
 def test_result_has_no_total_key(tmp_path: Path) -> None:
     """compute_main_cum returns a dict that does NOT contain the `total` key.
 
-    After Task 2, `total` is removed: render gets the three breakdown values
-    directly (cum_in / cum_out / cum_cache_read) and sums them itself. The
-    dead `total` field is gone.
+    After Task 2, `total` is removed: render sums the breakdown values
+    itself. The dead `total` field is gone.
     """
     cache = tmp_path / "main_no_total.json"
     result = compute_main_cum(MAIN_NORMAL, cache)
@@ -570,9 +553,36 @@ def test_result_has_no_total_key(tmp_path: Path) -> None:
     )
 
 
+def test_result_has_no_flat_cum_keys(tmp_path: Path) -> None:
+    """[review follow-up] The flat cum_in / cum_out / cum_cache_create /
+    cum_cache_read sums were removed together with the model columns —
+    their last production reader was the render refactor. per_model now
+    carries the same information (partitioned by model)."""
+    cache = tmp_path / "main_no_cum.json"
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    for key in ("cum_in", "cum_out", "cum_cache_create", "cum_cache_read"):
+        assert key not in result, (
+            f"`{key}` should not be present in compute_main_cum result, "
+            f"got: {sorted(result.keys())}"
+        )
+        on_disk = json.loads(cache.read_text())
+        assert key not in on_disk, (
+            f"`{key}` must not be persisted to the cache either, "
+            f"got keys: {sorted(on_disk.keys())}"
+        )
+    # Sanity: the surviving keys ARE present.
+    for key in (
+        "start_in", "start_out", "start_cached", "context_tokens",
+        "last_uuid", "mtime_jsonl", "tool_use_positions",
+        "task_notifications", "per_model",
+    ):
+        assert key in result, f"`{key}` missing from result: {sorted(result.keys())}"
+
+
 def test_empty_main_result_has_no_total_key(tmp_path: Path) -> None:
     """For a missing jsonl, compute_main_cum returns _EMPTY_MAIN_RESULT (a copy).
-    That copy must also NOT contain `total`.
+    That copy must also NOT contain `total` or the removed cum_* keys.
     """
     jsonl = tmp_path / "does_not_exist.jsonl"
     cache = tmp_path / "main_missing_no_total.json"
@@ -583,13 +593,14 @@ def test_empty_main_result_has_no_total_key(tmp_path: Path) -> None:
         f"_EMPTY_MAIN_RESULT (returned when jsonl missing) must not have "
         f"`total`, got: {sorted(result.keys())}"
     )
+    assert not any(k.startswith("cum_") for k in result), (
+        f"_EMPTY_MAIN_RESULT must not carry removed cum_* keys, "
+        f"got: {sorted(result.keys())}"
+    )
     # Sanity: the other expected keys ARE present.
-    assert "cum_in" in result
-    assert "cum_out" in result
-    assert "cum_cache_create" in result
-    assert "cum_cache_read" in result
     assert "last_uuid" in result
     assert "tool_use_positions" in result
+    assert "per_model" in result
 
 
 def test_cached_payload_has_no_total_key(tmp_path: Path) -> None:
@@ -610,48 +621,43 @@ def test_cached_payload_has_no_total_key(tmp_path: Path) -> None:
     # accepted (we don't fail closed on missing `total` because the field
     # is simply absent on the new schema — the old "total present" check
     # would have made every existing live cache invalidate forever).
-    _write_main_cache(
-        cache,
-        cum_in=11,
-        cum_out=22,
-        cum_cache_create=33,
-        cum_cache_read=44,
-    )
+    _write_main_cache(cache)
     result2 = compute_main_cum(MAIN_NORMAL, cache)
-    assert result2["cum_in"] == 11  # cache hit succeeded
+    assert result2["per_model"]["sentinel-model"]["in"] == 1  # cache hit
     assert "total" not in result2
 
 
 def test_cache_hit_accepts_legacy_total_field(tmp_path: Path) -> None:
-    """Pre-upgrade caches from the old schema include a `total` key (cum_in
-    + cum_out + cum_cache_create + cum_cache_read). The cache-hit branch
-    must ignore that extra field — `total` is not consulted anywhere —
-    so the cache still returns the cached cum_* values intact. This is
-    the upgrade-path guarantee: an existing live cache with `total`
-    continues to feed correct values to render on first run after upgrade,
-    until the cache is rewritten by a real recompute.
+    """Pre-upgrade caches from the old schema include a `total` key (and,
+    after this branch, the removed cum_* sums). The cache-hit branch must
+    ignore those extra fields — none is consulted anywhere — so the cache
+    still returns the cached values intact. This is the upgrade-path
+    guarantee: an existing live cache continues to feed correct values to
+    render on first run after upgrade, until the cache is rewritten by a
+    real recompute.
     """
     cache = tmp_path / "main_with_legacy_total.json"
     cached = _write_main_cache(
         cache,
-        cum_in=100,
-        cum_out=50,
-        cum_cache_create=25,
-        cum_cache_read=200,
-        total=100 + 50 + 25 + 200,  # legacy field, would be re-derived
+        total=375,  # legacy field, would be re-derived
+        extra={
+            "cum_in": 100,
+            "cum_out": 50,
+            "cum_cache_create": 25,
+            "cum_cache_read": 200,
+        },
     )
 
     result = compute_main_cum(MAIN_NORMAL, cache)
 
-    # Cache hit: cum_in/out/cache_create/cache_read preserved.
-    assert result["cum_in"] == 100
-    assert result["cum_out"] == 50
-    assert result["cum_cache_create"] == 25
-    assert result["cum_cache_read"] == 200
-    # The legacy `total` is left untouched on the cached dict (we never
-    # strip it — render doesn't read it, and stripping would invalidate
-    # every existing live cache on first run after upgrade).
-    assert result.get("total") == cached["total"]
+    # Cache hit: the live fields come back from the cache...
+    assert result["per_model"] == cached["per_model"]
+    # ...and the legacy extras are left untouched on the cached dict (we
+    # never strip them — render doesn't read them, and stripping would
+    # invalidate every existing live cache on first run after upgrade).
+    assert result.get("total") == 375
+    assert result.get("cum_in") == 100
+    assert result.get("cum_cache_read") == 200
 
 
 # ---------------------------------------------------------------------------
@@ -660,15 +666,14 @@ def test_cache_hit_accepts_legacy_total_field(tmp_path: Path) -> None:
 
 def test_context_tokens_is_last_assistant_not_cumulative(tmp_path: Path) -> None:
     """context_tokens must reflect the LAST assistant event's occupancy,
-    not the cumulative sums. main_normal's 3rd event: 200+150+700 = 1050
-    (while cum_in+cum_create+cum_read would be 450+300+1400 = 2150)."""
+    not a cumulative sum. main_normal's 3rd event: 200+150+700 = 1050
+    (while the per-model sums over all events are in=450, cached=1400)."""
     cache = tmp_path / "main_ctx.json"
     result = compute_main_cum(MAIN_NORMAL, cache)
 
     assert result["context_tokens"] == 1050
-    assert result["context_tokens"] != (
-        result["cum_in"] + result["cum_cache_create"] + result["cum_cache_read"]
-    )
+    rec = result["per_model"]["claude-opus-4-1"]
+    assert result["context_tokens"] != rec["in"] + rec["cached"]
     # Persisted to the cache file too.
     on_disk = json.loads(cache.read_text())
     assert on_disk["context_tokens"] == 1050
@@ -701,21 +706,23 @@ def test_cache_hit_requires_context_tokens_field(tmp_path: Path) -> None:
     cache = tmp_path / "main_old_schema.json"
     # Intentionally WITHOUT "context_tokens".
     cached = {
-        "cum_in": 111,
-        "cum_out": 222,
-        "cum_cache_create": 333,
-        "cum_cache_read": 444,
+        "start_in": 0,
+        "start_out": 0,
+        "start_cached": 0,
         "last_uuid": MAIN_NORMAL_LAST_UUID,
         "mtime_jsonl": MAIN_NORMAL.stat().st_mtime,
         "tool_use_positions": {},
         "task_notifications": {},
+        "per_model": {"stale-model": {"in": 111, "out": 222, "cached": 333}},
     }
     cache.write_text(json.dumps(cached))
 
     result = compute_main_cum(MAIN_NORMAL, cache)
 
     # Recomputed, not the stale sentinels.
-    assert result["cum_in"] == 450
+    assert result["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
     assert result["context_tokens"] == 1050
     # Cache rewritten in the new shape.
     on_disk = json.loads(cache.read_text())
@@ -736,11 +743,12 @@ def test_start_values_from_first_assistant_event(tmp_path: Path) -> None:
     assert result["start_in"] == 100
     assert result["start_out"] == 30
     assert result["start_cached"] == 200
-    # Distinct from both the cumulative sums (450/230/1400) and the last
-    # event's occupancy (context_tokens=1050).
-    assert result["start_in"] != result["cum_in"]
-    assert result["start_out"] != result["cum_out"]
-    assert result["start_cached"] != result["cum_cache_read"]
+    # Distinct from both the whole-session per-model sums (450/230/1400)
+    # and the last event's occupancy (context_tokens=1050).
+    rec = result["per_model"]["claude-opus-4-1"]
+    assert result["start_in"] != rec["in"]
+    assert result["start_out"] != rec["out"]
+    assert result["start_cached"] != rec["cached"]
 
 
 def test_start_persisted_to_cache(tmp_path: Path) -> None:
@@ -804,22 +812,21 @@ def test_cache_hit_requires_start_fields(tmp_path: Path) -> None:
     # Intentionally WITHOUT the start_* fields (but WITH context_tokens,
     # so only the start guard can trigger the miss).
     cached = {
-        "cum_in": 111,
-        "cum_out": 222,
-        "cum_cache_create": 333,
-        "cum_cache_read": 444,
         "context_tokens": 1050,
         "last_uuid": MAIN_NORMAL_LAST_UUID,
         "mtime_jsonl": MAIN_NORMAL.stat().st_mtime,
         "tool_use_positions": {},
         "task_notifications": {},
+        "per_model": {"stale-model": {"in": 111, "out": 222, "cached": 333}},
     }
     cache.write_text(json.dumps(cached))
 
     result = compute_main_cum(MAIN_NORMAL, cache)
 
     # Recomputed, not the stale sentinels.
-    assert result["cum_in"] == 450
+    assert result["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
     assert result["start_in"] == 100
     assert result["start_out"] == 30
     assert result["start_cached"] == 200
@@ -876,10 +883,6 @@ def test_per_model_model_change_mid_jsonl(tmp_path: Path) -> None:
     }
     # First-appearance order: glm-5.3 was seen before kimi-k3.
     assert list(per_model.keys()) == ["glm-5.3", "kimi-k3"]
-    # Totals unchanged — per_model is an additional breakdown, not a replacement.
-    assert result["cum_in"] == 31
-    assert result["cum_out"] == 7
-    assert result["cum_cache_read"] == 300
 
 
 def test_per_model_only_synthetic_keeps_zero_record(tmp_path: Path) -> None:
@@ -945,10 +948,6 @@ def test_cache_hit_requires_per_model_field(tmp_path: Path) -> None:
     # Intentionally WITHOUT "per_model" (but WITH context_tokens and the
     # start_* fields, so only the per_model guard can trigger the miss).
     cached = {
-        "cum_in": 111,
-        "cum_out": 222,
-        "cum_cache_create": 333,
-        "cum_cache_read": 444,
         "start_in": 100,
         "start_out": 30,
         "start_cached": 200,
@@ -963,7 +962,6 @@ def test_cache_hit_requires_per_model_field(tmp_path: Path) -> None:
     result = compute_main_cum(MAIN_NORMAL, cache)
 
     # Recomputed, not the stale sentinels.
-    assert result["cum_in"] == 450
     assert result["per_model"] == {
         "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
     }
@@ -983,3 +981,50 @@ def test_missing_jsonl_per_model_empty(tmp_path: Path) -> None:
 
     assert result["per_model"] == {}
     assert isinstance(result["per_model"], dict)
+
+
+# ---------------------------------------------------------------------------
+# malformed token values (review follow-up: the forward scans used to raise
+# ValueError out of int('abc') on ANY corrupt usage value, degrading the
+# whole status line to the fallback header via main()'s catch-all)
+# ---------------------------------------------------------------------------
+
+def test_malformed_token_values_coerce_to_zero_not_raise(tmp_path: Path) -> None:
+    """A corrupt jsonl whose usage fields are non-numeric strings must not
+    raise out of compute_main_cum (the module invariant "never raises"):
+    _to_int coerces each bad value to 0 and the scan keeps going."""
+    jsonl = tmp_path / "bad_tokens.jsonl"
+    jsonl.write_text(
+        '{"type":"assistant","message":{"model":"glm-5.3","usage":'
+        '{"input_tokens":"abc","output_tokens":3,'
+        '"cache_creation_input_tokens":null,"cache_read_input_tokens":"7"}},'
+        '"uuid":"u1"}\n'
+    )
+    cache = tmp_path / "main_bad_tokens.json"
+
+    result = compute_main_cum(jsonl, cache)  # must not raise
+
+    assert result["per_model"] == {
+        "glm-5.3": {"in": 0, "out": 3, "cached": 7}
+    }
+    # context = in(0) + cache_creation(None→0) + cache_read(7)
+    assert result["context_tokens"] == 7
+    assert result["start_in"] == 0
+    assert result["start_cached"] == 7
+
+
+def test_assistant_event_without_model_field_uses_empty_key(tmp_path: Path) -> None:
+    """An assistant event WITH usage but NO model field accumulates under
+    the "" key (model = str(msg.get("model") or "")) — the render layer
+    then shows the tokens with empty model/cost cells."""
+    jsonl = tmp_path / "no_model.jsonl"
+    jsonl.write_text(
+        '{"type":"assistant","message":{"usage":{"input_tokens":100,'
+        '"cache_creation_input_tokens":0,"cache_read_input_tokens":5,'
+        '"output_tokens":10}},"uuid":"u1"}\n'
+    )
+    cache = tmp_path / "main_no_model.json"
+
+    result = compute_main_cum(jsonl, cache)
+
+    assert result["per_model"] == {"": {"in": 100, "out": 10, "cached": 5}}

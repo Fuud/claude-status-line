@@ -299,8 +299,9 @@ agents, prices=None, host="")` — плоская тройка main заменя
 - [x] сверить README с реальным выводом `render_output` (оба примера —
       с prices и без — побайтово совпадают с выводом реальной
       `render_output` для реконструированного сценария; suite 300 passed)
-- [x] план перенесён в `docs/plans/completed/` (skipped - move deferred
-      to harness finalization; план остаётся на месте)
+- [x] план остаётся на месте; перенос в `docs/plans/completed/` отложен
+      на шаг финализации харнесса (чекбокс отмечает, что решение
+      зафиксировано, а не что перенос уже выполнен)
 
 ## Post-Completion
 

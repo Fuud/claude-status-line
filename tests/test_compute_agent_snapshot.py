@@ -297,6 +297,72 @@ def test_synthetic_zero_usage_event_keeps_model_record(tmp_path: Path) -> None:
     assert result["tokens_cached"] == 0
 
 
+def test_malformed_token_values_coerce_to_zero_not_raise(tmp_path: Path) -> None:
+    """[review follow-up] A corrupt usage value (non-numeric string / None)
+    must not raise out of compute_agent_snapshot — the forward scan
+    converts EVERY event's usage, so one bad mid-file value used to raise
+    ValueError (int('abc')) and degrade the whole status line to the
+    fallback header via main()'s catch-all, violating the documented
+    "compute_agent_snapshot never raises" invariant. _to_int coerces to 0.
+    """
+    jsonl = tmp_path / "agent-bad-tokens.jsonl"
+    jsonl.write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": "hi"}],
+                "model": "glm-5.3",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": "abc",
+                    "output_tokens": 3,
+                    "cache_read_input_tokens": None,
+                },
+            },
+            "uuid": "a3000000-0000-0000-0000-000000000001",
+        })
+        + "\n"
+    )
+
+    result = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert result["tokens_in"] == 0
+    assert result["tokens_out"] == 3
+    assert result["tokens_cached"] == 0
+    assert result["models"] == {"glm-5.3": {"in": 0, "out": 3, "cached": 0}}
+
+
+def test_assistant_event_without_model_field_uses_empty_key(tmp_path: Path) -> None:
+    """An assistant event WITH usage but NO model field accumulates under
+    the "" key in `models` (mirrors _scan_main_jsonl) — the render layer
+    shows the row with empty model/cost cells.
+    """
+    jsonl = tmp_path / "agent-no-model.jsonl"
+    jsonl.write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 5,
+                },
+            },
+            "uuid": "a4000000-0000-0000-0000-000000000001",
+        })
+        + "\n"
+    )
+
+    result = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert result["tokens_in"] == 100
+    assert result["tokens_out"] == 10
+    assert result["tokens_cached"] == 5
+    assert result["models"] == {"": {"in": 100, "out": 10, "cached": 5}}
+
+
 # ---------------------------------------------------------------------------
 # breakdown-field edge cases (per Task 1)
 # ---------------------------------------------------------------------------

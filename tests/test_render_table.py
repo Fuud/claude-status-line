@@ -7,10 +7,15 @@ labels) followed by one line per row, WITHOUT the "| " table-row prefix
 Column width = max(floor, len(label), longest cell in that column across
 all rows). "align" picks ljust ("left") or rjust ("right"). The optional
 "gap" key (default: a single space) is the separator glued after the
-column. Rendered lines never carry trailing whitespace — an empty cell in
-the LAST column leaves no padding spaces at the end of the line.
+column. label/align/floor are REQUIRED and every row must carry exactly
+one cell per column — a mis-shaped row/column raises instead of silently
+rendering blank cells (row-shape bugs surface at the call site).
+Rendered lines never carry trailing whitespace — an empty cell in the
+LAST column leaves no padding spaces at the end of the line.
 """
 from __future__ import annotations
+
+import pytest
 
 from status_line import render_table
 
@@ -135,16 +140,37 @@ def test_empty_last_cell_leaves_no_trailing_whitespace() -> None:
     ]
 
 
-def test_ragged_row_treated_as_empty_cells() -> None:
-    """Defensive: a row with fewer cells than there are columns renders
-    the missing cells as empty."""
+def test_ragged_row_raises_instead_of_rendering_blanks() -> None:
+    """A row with fewer cells than there are columns raises IndexError —
+    render_table intentionally has no ragged-row tolerance: silently
+    rendering blank cells would mask row-shape bugs at the call site."""
     columns = [
         {"label": "model", "align": "left", "floor": 0},
         {"label": "in", "align": "right", "floor": 0},
     ]
     rows = [["glm-5.3"]]  # second cell missing entirely
-    # w_model = max(0, 5, 7) = 7; w_in = max(0, 2, 0) = 2
-    assert render_table(columns, rows) == ["model   in", "glm-5.3"]
+    with pytest.raises(IndexError):
+        render_table(columns, rows)
+
+
+def test_missing_required_column_key_raises() -> None:
+    """label/align/floor are required column keys — an omitted key raises
+    KeyError rather than silently defaulting."""
+    with pytest.raises(KeyError):
+        render_table([{"label": "in", "align": "right"}], [["1"]])  # no floor
+    with pytest.raises(KeyError):
+        render_table([{"label": "in", "floor": 0}], [["1"]])  # no align
+    with pytest.raises(KeyError):
+        render_table([{"align": "right", "floor": 0}], [["1"]])  # no label
+
+
+def test_no_rows_renders_label_row_only() -> None:
+    """An empty rows list renders just the label row (widths fall back to
+    max(floor, len(label), 0))."""
+    columns = [
+        {"label": "in", "align": "right", "floor": 7},
+    ]
+    assert render_table(columns, []) == ["     in"]
 
 
 # ---------------------------------------------------------------------------

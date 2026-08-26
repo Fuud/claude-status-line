@@ -48,16 +48,26 @@ Line layout for a single-agent scenario without prices:
 """
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from status_line import (
     _DESC_TOKEN_GAP,
     _ICON_COL_WIDTH,
     _STATUS_GAP,
     _TABLE_ROW_PREFIX,
     _TOKEN_COLUMN_WIDTH,
-    _col_width,
     format_tokens,
     render_output,
 )
+
+
+def _col_width(values: list, label: str) -> int:
+    """The token-column width formula (former production helper _col_width,
+    inlined here when it lost its last production caller): max of the
+    _TOKEN_COLUMN_WIDTH floor, the label, and the widest formatted cell."""
+    longest_value = max((len(format_tokens(v)) for v in values), default=0)
+    return max(_TOKEN_COLUMN_WIDTH, len(label), longest_value)
 
 
 def _main(in_v: int, out_v: int, cached_v: int) -> dict:
@@ -592,10 +602,11 @@ def test_table_header_row() -> None:
     # column width, padded on the left by `w_desc + _ICON_COL_WIDTH + 4`
     # spaces (the prefix width that agent rows also use, after the icon
     # column is padded to a fixed width). We can verify by reconstructing
-    # what the renderer would produce, using the production _col_width
-    # helper (so the test tracks the formula rather than recomputing it).
-    # The column value lists mirror render_output's: start row + main row
-    # + agent rows.
+    # what the renderer would produce, using the token-column width
+    # formula (former _col_width helper, inlined at the top of this file)
+    # so the test tracks the formula rather than recomputing it. The
+    # column value lists mirror render_output's: start row + main row +
+    # agent rows.
     in_width = _col_width([0, 1000, 50000], "in")
     out_width = _col_width([0, 0, 200], "out")
     cached_width = _col_width([0, 0, 700], "cached")
@@ -1019,3 +1030,212 @@ def test_no_prices_no_model_or_cost_columns() -> None:
     # single main row carrying the summed totals (300/30/13)
     assert lines[3].split() == ["|", "main:", "300", "30", "13"], lines[3]
     assert "glm-5.3" not in out and "kimi-k3" not in out
+
+
+# ---------------------------------------------------------------------------
+# with-prices layout — byte-exact alignment (review follow-up: every other
+# prices test used .split(), which collapses all padding, so a wrong gap,
+# swapped align or wrong floor could regress undetected)
+# ---------------------------------------------------------------------------
+
+def test_prices_layout_byte_exact() -> None:
+    """The full with-prices layout pinned to exact strings: model column
+    LEFT-aligned between the label column and `in` (2-space gaps on both
+    sides), token columns RIGHT-aligned with the _TOKEN_COLUMN_WIDTH floor
+    (single-space separators), cost RIGHT-aligned after `cached` (2-space
+    gap). All rows share the column x-positions computed over every cell,
+    including the label row."""
+    main_models = {"glm-5.3": {"in": 10000, "out": 5000, "cached": 20000}}
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": 2_000_010,
+            "tokens_out": 100_005,
+            "tokens_cached": 2,
+            "description": "a",
+            "models": {
+                "glm-5.3": {"in": 10, "out": 5, "cached": 2},
+                "kimi-k3": {"in": 2_000_000, "out": 100_000, "cached": 0},
+            },
+        },
+    ]
+    out = render_output(
+        "Session: x", 1, 2, 3, main_models, agents,
+        prices=_PRICES, host="api.z.ai",
+    )
+    assert out.split("\n") == [
+        "Session: x",
+        "|            model         in     out  cached          cost",
+        "| start:                    1       2       3",
+        "| sum:       glm-5.3      10k      5k     20k  22.3 credits",
+        "|            kimi-k3     2.0M    100k       0          $7.5",
+        "| main:      glm-5.3      10k      5k     20k  22.3 credits",
+        "| [ok]    a  glm-5.3       10       5       2  0.02 credits",
+        "|            kimi-k3     2.0M    100k       0          $7.5",
+    ], out
+
+
+def test_readme_examples_match_render_output() -> None:
+    """Both README example blocks are pinned byte-for-byte: the documented
+    scenario is reconstructed here, run through the real render_output and
+    diffed against the fenced blocks in README.md. The header line keeps
+    its <sid>/<git-branch>/<model> placeholders — render_output passes the
+    header through verbatim, so it matches too. Guards against example
+    drift (the README example had silently diverged from the real render
+    once before — commit a9cc75a)."""
+    readme_path = Path(__file__).resolve().parent.parent / "README.md"
+    readme = readme_path.read_text(encoding="utf-8")
+    blocks = re.findall(r"```[a-z]*\n(.*?)```", readme, flags=re.DOTALL)
+    with_prices_block = next(b for b in blocks if "| sum:" in b and "cost" in b)
+    no_prices_block = next(b for b in blocks if "| sum:" in b and "cost" not in b)
+
+    header = (
+        "Session: <sid> | Branch: <git-branch> | Model: <model> | "
+        "User: n/a | Context: 215K (107%)"
+    )
+    main_models = {
+        "glm-5.3": {"in": 1_100_000, "out": 30_000, "cached": 50_700_000},
+        "kimi-k3": {"in": 150_000, "out": 40_000, "cached": 3_000_000},
+    }
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": 12_000,
+            "tokens_out": 4_000,
+            "tokens_cached": 100_000,
+            "description": "Review: implementation plan",
+            "models": {"glm-5.3": {"in": 12_000, "out": 4_000, "cached": 100_000}},
+        },
+        {
+            "status": "err",
+            "tokens_in": 500,
+            "tokens_out": 200,
+            "tokens_cached": 3_000,
+            "description": "Review: quality",
+            "models": {"MiniMax-M3": {"in": 500, "out": 200, "cached": 3_000}},
+        },
+        {
+            "status": "run",
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "tokens_cached": 0,
+            "description": "Task 4: MissingGlyphLog",
+            "models": {},
+        },
+    ]
+
+    with_prices = render_output(
+        header, 12_000, 1_000, 0, main_models, agents,
+        prices=_PRICES, host="api.z.ai",
+    )
+    assert with_prices.split("\n") == with_prices_block.rstrip("\n").split("\n"), (
+        "README with-prices example drifted from the real render_output"
+    )
+
+    no_prices = render_output(header, 12_000, 1_000, 0, main_models, agents)
+    assert no_prices.split("\n") == no_prices_block.rstrip("\n").split("\n"), (
+        "README no-prices example drifted from the real render_output"
+    )
+
+
+def test_prices_empty_dict_shows_columns_with_na() -> None:
+    """prices={} (a valid but EMPTY prices file — load_prices returns {}
+    for `[]`) still shows the model/cost columns; every priced-model
+    lookup fails → all cost cells render n/a. Documents the decision that
+    the column gate is `prices is None`, not falsiness."""
+    out = render_output(
+        "Session: x", 0, 0, 0, {"glm-5.3": {"in": 10, "out": 0, "cached": 0}},
+        [], prices={}, host="",
+    )
+    lines = out.split("\n")
+    assert lines[1].split() == ["|", "model", "in", "out", "cached", "cost"], lines[1]
+    assert lines[3].split() == ["|", "main:", "glm-5.3", "10", "0", "0", "n/a"], lines[3]
+
+
+def test_empty_model_key_row_renders_tokens_with_empty_cells() -> None:
+    """An assistant event with usage but NO model field accumulates under
+    the "" key; the row renders the tokens with an EMPTY model cell and an
+    EMPTY cost cell (not n/a — no model means nothing to price)."""
+    out = render_output(
+        "Session: x", 0, 0, 0, {"": {"in": 100, "out": 10, "cached": 5}},
+        [], prices=_PRICES, host="",
+    )
+    lines = out.split("\n")
+    # 100/10/5 cells present, but no model id and no cost between them
+    assert lines[3].split() == ["|", "main:", "100", "10", "5"], lines[3]
+    assert "n/a" not in lines[3], lines[3]
+
+
+def test_sum_row_widens_column_when_its_cell_is_widest() -> None:
+    """[pinned decision] The sum row's cells participate in the column-
+    width computation (unlike the pre-model-columns render, which excluded
+    sum). At extreme totals (sum > every component) the token column
+    widens to the sum cell and all rows right-align to the same edge."""
+    five_g = 5_000_000_000  # format_tokens → "5000.0M" (7 chars)
+    main_models = {"glm-5.3": {"in": five_g, "out": 0, "cached": 0}}
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": five_g,
+            "tokens_out": 0,
+            "tokens_cached": 0,
+            "description": "a",
+            "models": {"glm-5.3": {"in": five_g, "out": 0, "cached": 0}},
+        },
+    ]
+    out = render_output("Session: x", 0, 0, 0, main_models, agents)
+    lines = out.split("\n")
+    # sum in = 10G → "10000.0M" (8 chars) — the widest in-cell → column 8.
+    assert lines[3].split() == ["|", "sum:", "10000.0M", "0", "0"], lines[3]
+    # Every row's in-cell occupies the same 8-char slice (right-aligned
+    # against the sum-widened column): start "       0", sum "10000.0M",
+    # main/agent " 5000.0M". Slice = everything left of the out column:
+    # gap + out(7) + gap + cached(7).
+    tail = _TOKEN_COLUMN_WIDTH * 2 + 2
+    expected_cells = ["       0", "10000.0M", " 5000.0M", " 5000.0M"]
+    for line, expected in zip(lines[2:], expected_cells):
+        in_cell = line[len(line) - tail - 8 : len(line) - tail]
+        assert in_cell == expected, (
+            f"in-column not aligned at width 8: {line!r} cell {in_cell!r}"
+        )
+
+
+def test_corrupt_cache_records_render_without_raising() -> None:
+    """A hand-corrupted cache can put None / non-numeric strings / non-dict
+    values into per-model records. render_output must degrade the bad
+    record (coerce to 0 / skip) instead of raising — an exception here is
+    swallowed by main()'s catch-all and would replace the whole table with
+    the fallback header on EVERY tick (the cache key still matches, so it
+    would never self-heal)."""
+    main_models = {
+        "glm-5.3": None,  # non-dict record → skipped
+        "kimi-k3": {"in": 10, "out": None, "cached": "oops"},  # coerced
+        "bad": "not-a-dict",  # skipped
+    }
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": None,  # flat fields corrupted too
+            "tokens_out": "x",
+            "tokens_cached": 5,
+            "description": "a",
+            "models": {"m": {"in": None, "out": "x", "cached": 5}},
+        },
+    ]
+    out = render_output(
+        "Session: x", 0, 0, 0, main_models, agents, prices=_PRICES, host=""
+    )
+    lines = out.split("\n")
+    # kimi-k3 record survives with coerced zeros; corrupt siblings skipped.
+    assert lines[3].split() == ["|", "sum:", "kimi-k3", "10", "0", "0", "$0.00"], lines[3]
+    assert lines[4].split() == ["|", "m", "0", "0", "5", "n/a"], lines[4]
+    assert "glm-5.3" not in out and "bad" not in out, out
+
+    # The prices=None path (_models_total) must tolerate the same corrupt
+    # records: main totals = 10/0/0 (kimi-k3 only), agent flat fields
+    # coerced from None/"x" to 0.
+    out_flat = render_output("Session: x", 0, 0, 0, main_models, agents)
+    flat_lines = out_flat.split("\n")
+    # sum = main(10/0/0) + agent(0/0/5) = 10/0/5.
+    assert flat_lines[3].split() == ["|", "sum:", "10", "0", "5"], flat_lines[3]
+    assert flat_lines[4].split() == ["|", "main:", "10", "0", "0"], flat_lines[4]

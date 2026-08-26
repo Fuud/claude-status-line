@@ -73,7 +73,10 @@ strips leading whitespace from status-line rows, and the marker keeps the
 all-spaces table-header row aligned with the rows below it.
 
 Each numeric cell is formatted via `format_tokens` (so `1000` renders
-as `1k`, `1_500_000` as `1.5M`).
+as `1k`, `1_500_000` as `1.5M`). Every column's width — including the
+`sum:` row's cells — is the widest cell under it (floored at 7 for the
+token columns), so at extreme totals the columns can be one character
+wider than the other rows suggested.
 
 | Tag      | Meaning                                              |
 | -------- | ---------------------------------------------------- |
@@ -126,20 +129,22 @@ Fields:
   non-alphanumeric glues as a prefix (`$8.1`), anything else appends
   after a space (`402 credits`); empty/missing → the bare number.
 
+Number formatting of the cost cell: `>= 1M` → `X.XM`, `>= 1000` →
+`X.Xk`, `>= 0.1` → one decimal with a trailing `.0` dropped (`402`),
+otherwise two decimals (`0.04`).
+
 Cost of one per-model row =
 `(in·p_in + out·p_out + cached·p_cache) / per`; `cache_creation` is not
 priced (it is not displayed anywhere). The file is re-read on every
-hook invocation.
+hook invocation and must be plain UTF-8 or UTF-8 with BOM.
 
 What happens when parts are missing:
 
-| Situation                                  | Result                                       |
-| ------------------------------------------ | -------------------------------------------- |
-| no `prices.json` / unreadable / bad JSON / | both columns absent — the plain `in / out /` |
-| invalid entry (`per <= 0`, non-numeric     | `cached` layout, one totals row per group    |
-| price, non-list, ...)                      |                                              |
-| model known but not in the price file      | `n/a` in the cost cell                       |
-| group with no models after zero-skip       | one zero row with an empty `model` cell      |
+| Situation                             | Result                                  |
+| ------------------------------------- | --------------------------------------- |
+| no / unreadable / invalid prices file | both columns absent — the plain layout  |
+| model known but not in the price file | `n/a` in the cost cell                  |
+| group with no models after zero-skip  | one zero row with an empty `model` cell |
 
 ## Install
 
@@ -156,8 +161,8 @@ Code's status-line hook configuration.
   returning `branch=""`)
 - **`ANTHROPIC_BASE_URL`** env var (optional): the hook inherits it from
   the Claude Code process and uses its hostname for `model@host` price
-  lookups (see [Costs](#costs-pricesjson)). Unset/invalid → only plain
-  model keys match.
+  lookups (see [Costs](#costs-pricesjson)). Unset, invalid or scheme-less
+  (no `://`) → no host → only plain model keys match.
 - **Read access** to `~/.claude/projects/<encoded>/<sid>/{*.jsonl,subagents/}`
   and (optionally) `~/.claude/status_line/prices.json`
 - **Write access** to `~/.claude/status_line/data/` (auto-created on
@@ -193,7 +198,7 @@ Two cache files are persisted under `~/.claude/status_line/data/`:
 
 | File                | Invalidation key                       | Purpose                                                                          |
 | ------------------- | -------------------------------------- | -------------------------------------------------------------------------------- |
-| `main_<sid>.json`   | `last_uuid` (tail of main jsonl)       | cumulative totals + first-message `start_*` + per-model breakdown + tool_use ids |
+| `main_<sid>.json`   | `(last_uuid, mtime_jsonl)`             | per-model breakdown + first-message `start_*` + context occupancy + tool_use ids |
 | `agents_<sid>.json` | `(last_uuid, mtime_jsonl, mtime_meta)` | per-agent render-ready snapshot dict                                             |
 
 Both main-cache field groups added after the first release

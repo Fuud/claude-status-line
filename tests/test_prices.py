@@ -49,8 +49,13 @@ def test_provider_host_malformed_url(monkeypatch: pytest.MonkeyPatch) -> None:
     assert provider_host() == ""
 
 
-def test_provider_host_non_str_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("os.environ", {"ANTHROPIC_BASE_URL": 123})
+def test_provider_host_scheme_less_value_yields_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A scheme-less value has no netloc for urlparse, so hostname is None
+    # → "" — "@host" price keys never match, plain keys still do. Pinned so
+    # the silent disable is a documented outcome, not a surprise.
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "api.z.ai")
     assert provider_host() == ""
 
 
@@ -70,6 +75,68 @@ def test_load_prices_broken_json(tmp_path) -> None:
     p = tmp_path / "prices.json"
     p.write_text("[{not json")
     assert load_prices(p) is None
+
+
+def test_load_prices_utf8_bom_still_loads(tmp_path) -> None:
+    # Windows editors save "UTF-8 with BOM"; a leading BOM must not break
+    # the JSON parse (which would silently disable the cost columns).
+    p = tmp_path / "prices.json"
+    p.write_bytes(b"\xef\xbb\xbf" + json.dumps(
+        [{"model": "glm-5.3", "per": 1000}]
+    ).encode("utf-8"))
+    assert load_prices(p) == {
+        "glm-5.3": {"in": 0.0, "out": 0.0, "cache": 0.0,
+                    "per": 1000, "units": ""},
+    }
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param({"model": "m", "per": float("nan")}, id="per-nan"),
+        pytest.param({"model": "m", "per": float("inf")}, id="per-inf"),
+        pytest.param(
+            {"model": "m", "per": 1, "in": float("nan")}, id="in-nan"
+        ),
+        pytest.param(
+            {"model": "m", "per": 1, "out": float("-inf")}, id="out-inf"
+        ),
+        pytest.param(
+            {"model": "m", "per": 1, "cache": float("nan")}, id="cache-nan"
+        ),
+    ],
+)
+def test_load_prices_rejects_non_finite_numbers(tmp_path, entry) -> None:
+    # json.loads accepts the NaN/Infinity extensions, so _is_num must
+    # reject them explicitly — a NaN `per` (NaN <= 0 is False) would
+    # otherwise flow into format_cost and render "$nan".
+    p = tmp_path / "prices.json"
+    p.write_text(json.dumps([entry]))
+    assert load_prices(p) is None
+
+
+@pytest.mark.parametrize(
+    "per", [float("nan"), float("inf"), float("-inf")]
+)
+def test_is_num_rejects_non_finite(per: float) -> None:
+    from status_line import _is_num
+
+    assert not _is_num(per)
+
+
+def test_load_prices_negative_price_accepted(tmp_path) -> None:
+    # [pinned decision] The plan only requires prices to be NUMERIC, so a
+    # negative price is accepted and flows into compute_cost/format_cost
+    # as-is ("$-3.0"). Rejecting it would be a spec change; documented by
+    # pinning rather than silently changed.
+    p = tmp_path / "prices.json"
+    _write(p, [{"model": "m", "per": 1, "in": -3, "out": 0, "cache": 0}])
+    assert load_prices(p) == {
+        "m": {"in": -3.0, "out": 0.0, "cache": 0.0, "per": 1, "units": ""},
+    }
+    # -3.0 < 0.1 → the two-decimal bucket → "$-3.00".
+    assert format_cost(compute_cost({"in": 1, "out": 0, "cached": 0},
+                                    {"in": -3.0, "per": 1}), "$") == "$-3.00"
 
 
 def test_load_prices_not_a_list(tmp_path) -> None:
@@ -253,6 +320,10 @@ def test_compute_cost_zero_components() -> None:
         (0.1, "0.1"),
         (42.04, "42"),
         (999.9, "999.9"),
+        # bucket boundary: 999.96 rounds to 3 digits and the ".0" strip
+        # leaves "1000" — no k suffix (the value entered < 1000)
+        (999.96, "1000"),
+        (999.94, "999.9"),
         # < 0.1 → 2 decimals
         (0.04, "0.04"),
         (0.099, "0.10"),

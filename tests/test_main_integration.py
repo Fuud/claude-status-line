@@ -67,12 +67,22 @@ def fake_home_with_real_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     """Build a fake $HOME with .claude/projects/<encoded>/<sid> pointing
     at the real_session fixture, and a writable .claude/status_line/data/.
 
+    Skips (rather than fails) when the gitignored fixture is not
+    populated — same convention as
+    test_real_session_fixture_has_no_subagent_queue_notifications below.
+    Hermetic coverage of the exact per-model/cost arithmetic lives in
+    test_synth_prices_per_model_rows_and_costs, which never depends on
+    the fixture.
+
     Returns (tmp_path, session_id).
     """
     real_session_root = FIXTURES / "real_session"
     real_session_dir = real_session_root / REAL_SESSION_SID
-    assert real_session_root.exists(), "fixtures/real_session missing"
-    assert real_session_dir.exists(), f"real session dir missing: {real_session_dir}"
+    if not real_session_root.exists() or not real_session_dir.exists():
+        pytest.skip(
+            "real_session fixture not populated; see "
+            "tests/fixtures/real_session/README.md"
+        )
 
     projects_root = tmp_path / ".claude" / "projects"
     target = projects_root / ENCODED_PROJECT / REAL_SESSION_SID
@@ -267,19 +277,20 @@ def test_broken_cache_recovery(fake_home_with_real_session) -> None:
     assert isinstance(loaded, dict)
     # The recomputed cache should match real session's main jsonl signature.
     assert "last_uuid" in loaded
-    # [deviation] Task 2 dropped the `total` field from compute_main_cum's
-    # result and from the persisted cache. The breakdown-table refactor
-    # passes cum_in/cum_out/cum_cache_read directly to render; `total` is
-    # dead. Verify the new breakdown keys exist and reflect real usage.
-    assert "cum_in" in loaded
-    assert "cum_out" in loaded
-    assert "cum_cache_read" in loaded
+    # [deviation] Task 2 dropped the `total` field, and the model-columns
+    # refactor dropped the flat cum_* sums — the per-model breakdown
+    # carries the same information. Verify the live keys exist and reflect
+    # real usage.
+    assert "per_model" in loaded
+    assert loaded["per_model"], "per_model should be non-empty for the fixture"
     assert "total" not in loaded, (
         f"`total` must not appear in the persisted cache after Task 2, "
         f"got keys: {sorted(loaded.keys())}"
     )
-    assert loaded["cum_in"] > 0
-    assert loaded["cum_out"] > 0
+    assert not any(k.startswith("cum_") for k in loaded), (
+        f"removed cum_* keys must not be persisted, got: {sorted(loaded.keys())}"
+    )
+    assert loaded["context_tokens"] > 0
 
 
 def test_broken_agents_cache_recovery(fake_home_with_real_session) -> None:
@@ -1353,3 +1364,72 @@ def test_prices_broken_file_no_columns(fake_home_with_real_session) -> None:
     lines = result.stdout.decode("utf-8").splitlines()
     assert len(lines) == _NO_PRICES_LINE_COUNT, f"first 8: {lines[:8]}"
     assert lines[1].split() == ["|", "in", "out", "cached"], f"header: {lines[1]!r}"
+
+
+SYNTH_PRICES_SID = "12345678-1234-1234-1234-123456789012"
+
+
+def test_synth_prices_per_model_rows_and_costs(tmp_path: Path) -> None:
+    """Hermetic end-to-end prices coverage (no real-session fixture): a
+    synthetic multi-model main jsonl + one agent, priced with the
+    example-file numbers. Pins the exact per-model rows, byte-exact
+    layout, and the cost arithmetic — this test cannot break when the
+    gitignored live fixture is extended/re-captured (the fixture-based
+    tests above keep their exact values but skip when it is absent).
+    """
+    main_lines = [
+        # e1 glm-5.3: in=10000 out=5000 cache_read=20000 (also the start row)
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a"}],"model":"glm-5.3","stop_reason":"tool_use","usage":{"input_tokens":10000,"cache_creation_input_tokens":0,"cache_read_input_tokens":20000,"output_tokens":5000}},"uuid":"m1","timestamp":"2026-08-26T20:00:00.000Z"}',
+        # e2 kimi-k3: in=2000000 out=100000 cache_read=0
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"b"}],"model":"kimi-k3","stop_reason":"end_turn","usage":{"input_tokens":2000000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":100000}},"uuid":"m2","timestamp":"2026-08-26T20:00:01.000Z"}',
+    ]
+    agent_jsonl = (
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"model":"glm-5.3","stop_reason":"end_turn","usage":{"input_tokens":12000,"cache_creation_input_tokens":0,"cache_read_input_tokens":100000,"output_tokens":4000}},"uuid":"a1","timestamp":"2026-08-26T20:00:02.000Z"}'
+    )
+    agent_meta = json.dumps({
+        "agentType": "general-purpose",
+        "description": "Synth agent",
+        "toolUseId": "toolu_synth",
+    })
+    _build_synth_session(
+        tmp_path,
+        SYNTH_PRICES_SID,
+        main_lines,
+        [("agent-aaa111", agent_jsonl, agent_meta)],
+    )
+    # Example prices: glm-5.3 in credits (per 10k), kimi-k3 in $ (per 1M).
+    _write_prices(
+        tmp_path,
+        [
+            {"model": "glm-5.3", "in": 6.9, "out": 24, "cache": 1.7,
+             "per": 10000, "units": "credits"},
+            {"model": "kimi-k3", "in": 3, "out": 15, "cache": 0.3,
+             "per": 1000000, "units": "$"},
+        ],
+    )
+
+    stdin = json.dumps({
+        "session_id": SYNTH_PRICES_SID,
+        "model": {"display_name": "X"},
+    })
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, (
+        f"non-zero exit; stderr={result.stderr.decode('utf-8', 'replace')}"
+    )
+    lines = result.stdout.decode("utf-8").splitlines()
+    # header + labels + start + sum(2) + main(2) + agent(1) = 8 lines
+    assert len(lines) == 8, f"first 8: {lines[:8]}"
+    # Byte-exact table (header line skipped — it carries the machine's
+    # branch name). Costs: main glm (10000*6.9+5000*24+20000*1.7)/10000
+    # = 22.3 credits; kimi (2000000*3+100000*15)/1e6 = 7.5 → $7.5; sum
+    # glm (22000*6.9+9000*24+120000*1.7)/10000 = 57.18 → 57.2 credits;
+    # agent glm (12000*6.9+4000*24+100000*1.7)/10000 = 34.88 → 34.9.
+    assert lines[1:] == [
+        "|                      model         in     out  cached          cost",
+        "| start:                            10k      5k     20k",
+        "| sum:                 glm-5.3      22k      9k    120k  57.2 credits",
+        "|                      kimi-k3     2.0M    100k       0          $7.5",
+        "| main:                glm-5.3      10k      5k     20k  22.3 credits",
+        "|                      kimi-k3     2.0M    100k       0          $7.5",
+        "| [ok]    Synth agent  glm-5.3      12k      4k    100k  34.9 credits",
+    ], f"table mismatch:\n" + "\n".join(repr(l) for l in lines[1:])

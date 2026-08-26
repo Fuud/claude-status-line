@@ -30,6 +30,7 @@ Module-level invariants:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -141,15 +142,15 @@ _PRICES_PATH = Path.home() / ".claude" / "status_line" / "prices.json"
 
 
 def provider_host() -> str:
-    """Hostname of ANTHROPIC_BASE_URL, or "" when unset/invalid/non-str.
+    """Hostname of ANTHROPIC_BASE_URL, or "" when unset/invalid.
 
     The hook distinguishes providers by base-URL host (the shell wrappers
     like zai-glm-5.2-1m / claude-kimi-k3 differ by host), e.g.
-    "https://api.z.ai/api/anthropic" → "api.z.ai". Any error → "".
+    "https://api.z.ai/api/anthropic" → "api.z.ai". A scheme-less value
+    ("api.z.ai" with no "://") has no hostname for urlparse → "".
+    Any error → "".
     """
     raw = os.environ.get("ANTHROPIC_BASE_URL", "")
-    if not isinstance(raw, str):
-        return ""
     try:
         return urllib.parse.urlparse(raw).hostname or ""
     except ValueError:
@@ -157,8 +158,13 @@ def provider_host() -> str:
 
 
 def _is_num(value: object) -> bool:
-    """True for int/float but not bool (JSON `true` is not a price)."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """True for finite int/float but not bool (JSON `true` is not a price;
+    the NaN/Infinity json extensions are not prices either)."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
 
 
 def load_prices(path: Path) -> "dict[str, dict] | None":
@@ -172,9 +178,11 @@ def load_prices(path: Path) -> "dict[str, dict] | None":
     a present in/out/cache price is non-numeric. Missing in/out/cache
     default to 0; missing (or non-str) units default to "". Duplicate
     keys: the last entry wins. Never raises, never writes to stderr.
+    The file is read as utf-8-sig: a leading BOM (Windows editors saving
+    "UTF-8 with BOM") is stripped instead of breaking the JSON parse.
     """
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     if not isinstance(raw, list):
@@ -521,13 +529,52 @@ _QUEUE_STATUS_MAP: dict[str, str] = {
 # dict keeps the scan→result handoff self-describing; the only caller is
 # compute_main_cum.
 
+
+def _to_int(value: object) -> int:
+    """Coerce a jsonl/cache value to int; 0 for anything non-numeric.
+
+    Single coercion point for every token count read out of jsonl events
+    or cache files: None → 0, non-numeric strings → 0, numeric strings
+    and floats convert as int() does. Never raises — a corrupt value in
+    one event must not take down the whole scan/render (the "hook must
+    never crash" invariant; previously a malformed token value raised
+    ValueError out of the scan and degraded the entire status line).
+    """
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _iter_events(jsonl_path: Path):
+    """Yield (index, event) for every parsable dict event in a jsonl file.
+
+    Shared parse scaffold for the main and agent scans: blank lines and
+    half-written lines (JSONDecodeError — race with the writer appending)
+    are skipped, non-dict payloads are skipped. `index` counts ALL lines
+    (pre-filter), matching the historical enumerate-based event indices
+    recorded in tool_use_positions. OSError propagates to the consumer —
+    each scan handles it per its own degradation contract.
+    """
+    with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+        for index, raw_line in enumerate(f):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                # partial line — race condition with the writer; skip
+                continue
+            if isinstance(event, dict):
+                yield index, event
+
+
 def _scan_main_jsonl(jsonl_path: Path) -> dict:
-    """Forward-scan a main jsonl summing token usage and extracting tool_use
+    """Forward-scan a main jsonl collecting token usage and tool_use
     positions.
 
     Returns a dict with keys:
-        cum_in, cum_out, cum_cache_create, cum_cache_read
-            — sums of the usage fields across ALL assistant events.
         start_in, start_out, start_cached
             — input_tokens / output_tokens / cache_read_input_tokens of the
               FIRST assistant event that carries a usage block (the table's
@@ -552,8 +599,15 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
             Key order follows first appearance in the scan. `cached` is
             cache_read only — cache_creation is never surfaced, matching
             the cached-column semantics of every other row.
+
+    [deviation vs the pre-model-columns scan] The flat cum_in / cum_out /
+    cum_cache_create / cum_cache_read sums were removed together with the
+    model columns: their only remaining consumer was tests (render derives
+    the main row from per_model, context_tokens is computed inline). Same
+    precedent as the removed legacy `total` field. Persisted cum_* keys in
+    old cache files are harmless — cache-hit returns them unchanged and
+    nothing reads them.
     """
-    cum_in = cum_out = cum_cache_create = cum_cache_read = 0
     start_in = start_out = start_cached = 0
     context_tokens = 0
     tool_use_positions: dict[str, int] = {}
@@ -562,102 +616,83 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
     last_uuid = ""
     seen_first_usage = False
 
-    with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
-        for index, raw_line in enumerate(f):
-            line = raw_line.strip()
-            if not line:
+    for index, event in _iter_events(jsonl_path):
+        if event.get("type") == "assistant":
+            # record uuid for this assistant event
+            uuid = event.get("uuid")
+            if isinstance(uuid, str) and uuid:
+                last_uuid = uuid
+            # usage
+            msg = event.get("message") or {}
+            usage = msg.get("usage") if isinstance(msg, dict) else None
+            if isinstance(usage, dict):
+                in_v = _to_int(usage.get("input_tokens", 0))
+                out_v = _to_int(usage.get("output_tokens", 0))
+                cache_read_v = _to_int(usage.get("cache_read_input_tokens", 0))
+                cache_create_v = _to_int(
+                    usage.get("cache_creation_input_tokens", 0)
+                )
+                # First-message capture — set once, on the first
+                # assistant event that HAS a usage block. A leading
+                # assistant event without usage contributes nothing,
+                # mirroring the context_tokens handling below.
+                if not seen_first_usage:
+                    seen_first_usage = True
+                    start_in = in_v
+                    start_out = out_v
+                    start_cached = cache_read_v
+                # Per-model breakdown (model/cost columns). Same gate
+                # as the start/context captures: only assistant events
+                # with a usage block. setdefault keeps the
+                # FIRST-appearance key order render relies on;
+                # zero-token models (including <synthetic>) stay in
+                # the dict — the render layer decides which rows to
+                # show.
+                model_id = str(msg.get("model") or "")
+                model_rec = per_model.setdefault(
+                    model_id, {"in": 0, "out": 0, "cached": 0}
+                )
+                model_rec["in"] += in_v
+                model_rec["out"] += out_v
+                model_rec["cached"] += cache_read_v
+                # Context-window occupancy at THIS api call — overwrite on
+                # every assistant event so the scan ends holding the LAST
+                # one. Same formula as the payload's
+                # context_window.total_input_tokens (input + cache writes
+                # + cache reads; output excluded), so both sources agree.
+                context_tokens = in_v + cache_create_v + cache_read_v
+            # tool_use positions
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_use":
+                        continue
+                    block_id = block.get("id")
+                    if isinstance(block_id, str) and block_id:
+                        # keep first occurrence only
+                        if block_id not in tool_use_positions:
+                            tool_use_positions[block_id] = index
+        elif event.get("type") == "queue-operation":
+            # Extract <task-id> / <status> from <task-notification> content.
+            # Only "enqueue" operations carry content; "dequeue"/"remove"
+            # are no-ops here. Unknown <status> values are silently dropped.
+            if event.get("operation") != "enqueue":
                 continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                # partial line — race condition with subagent writing; skip
+            content = event.get("content")
+            if not isinstance(content, str):
                 continue
-            if not isinstance(event, dict):
+            m_id = _TASK_ID_RE.search(content)
+            m_status = _STATUS_RE.search(content)
+            if not (m_id and m_status):
                 continue
-            if event.get("type") == "assistant":
-                # record uuid for this assistant event
-                uuid = event.get("uuid")
-                if isinstance(uuid, str) and uuid:
-                    last_uuid = uuid
-                # usage
-                msg = event.get("message") or {}
-                usage = msg.get("usage") if isinstance(msg, dict) else None
-                if isinstance(usage, dict):
-                    in_v = int(usage.get("input_tokens", 0) or 0)
-                    out_v = int(usage.get("output_tokens", 0) or 0)
-                    cache_read_v = int(usage.get("cache_read_input_tokens", 0) or 0)
-                    cum_in += in_v
-                    cum_out += out_v
-                    cum_cache_create += int(usage.get("cache_creation_input_tokens", 0) or 0)
-                    cum_cache_read += cache_read_v
-                    # First-message capture — set once, on the first
-                    # assistant event that HAS a usage block. A leading
-                    # assistant event without usage contributes nothing,
-                    # mirroring the context_tokens handling below.
-                    if not seen_first_usage:
-                        seen_first_usage = True
-                        start_in = in_v
-                        start_out = out_v
-                        start_cached = cache_read_v
-                    # Per-model breakdown (model/cost columns). Same gate
-                    # as the cum_* sums: only assistant events with a usage
-                    # block. setdefault keeps the FIRST-appearance key
-                    # order render relies on; zero-token models (including
-                    # <synthetic>) stay in the dict — the render layer
-                    # decides which rows to show.
-                    model_id = str(msg.get("model") or "")
-                    model_rec = per_model.setdefault(
-                        model_id, {"in": 0, "out": 0, "cached": 0}
-                    )
-                    model_rec["in"] += in_v
-                    model_rec["out"] += out_v
-                    model_rec["cached"] += cache_read_v
-                    # Context-window occupancy at THIS api call — overwrite on
-                    # every assistant event so the scan ends holding the LAST
-                    # one. Same formula as the payload's
-                    # context_window.total_input_tokens (input + cache writes
-                    # + cache reads; output excluded), so both sources agree.
-                    context_tokens = (
-                        in_v
-                        + int(usage.get("cache_creation_input_tokens", 0) or 0)
-                        + cache_read_v
-                    )
-                # tool_use positions
-                content = msg.get("content") if isinstance(msg, dict) else None
-                if isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        if block.get("type") != "tool_use":
-                            continue
-                        block_id = block.get("id")
-                        if isinstance(block_id, str) and block_id:
-                            # keep first occurrence only
-                            if block_id not in tool_use_positions:
-                                tool_use_positions[block_id] = index
-            elif event.get("type") == "queue-operation":
-                # Extract <task-id> / <status> from <task-notification> content.
-                # Only "enqueue" operations carry content; "dequeue"/"remove"
-                # are no-ops here. Unknown <status> values are silently dropped.
-                if event.get("operation") != "enqueue":
-                    continue
-                content = event.get("content")
-                if not isinstance(content, str):
-                    continue
-                m_id = _TASK_ID_RE.search(content)
-                m_status = _STATUS_RE.search(content)
-                if not (m_id and m_status):
-                    continue
-                mapped = _QUEUE_STATUS_MAP.get(m_status.group(1))
-                if mapped:
-                    # last-wins on duplicate task-id (resume scenario)
-                    task_notifications[m_id.group(1)] = mapped
+            mapped = _QUEUE_STATUS_MAP.get(m_status.group(1))
+            if mapped:
+                # last-wins on duplicate task-id (resume scenario)
+                task_notifications[m_id.group(1)] = mapped
 
     return {
-        "cum_in": cum_in,
-        "cum_out": cum_out,
-        "cum_cache_create": cum_cache_create,
-        "cum_cache_read": cum_cache_read,
         "start_in": start_in,
         "start_out": start_out,
         "start_cached": start_cached,
@@ -702,10 +737,6 @@ def _load_dict_cache(path: Path) -> dict:
 
 
 _EMPTY_MAIN_RESULT: dict = {
-    "cum_in": 0,
-    "cum_out": 0,
-    "cum_cache_create": 0,
-    "cum_cache_read": 0,
     "start_in": 0,
     "start_out": 0,
     "start_cached": 0,
@@ -725,14 +756,13 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     On cache hit (cache.last_uuid == current jsonl tail uuid AND
     cache.mtime_jsonl == current jsonl st_mtime), returns the cached dict
     without re-scanning. On cache miss (uuid changed, mtime changed, cache
-    missing, or cache malformed), re-scans the jsonl forward, sums
-    input/output/cache_creation/cache_read across all assistant events,
-    collects tool_use id → event-index positions, extracts task-notification
-    statuses from queue-operation events, and atomically writes the result
-    to `cache_path`.
+    missing, or cache malformed), re-scans the jsonl forward, collects the
+    per-model token breakdown, the first-message start_* triple, tool_use
+    id → event-index positions, task-notification statuses from
+    queue-operation events, and atomically writes the result to
+    `cache_path`.
 
     Returns a dict with keys:
-        cum_in, cum_out, cum_cache_create, cum_cache_read,
         start_in, start_out, start_cached, context_tokens,
         last_uuid, mtime_jsonl, tool_use_positions, task_notifications,
         per_model
@@ -771,11 +801,13 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     and cost columns (see _scan_main_jsonl for the accumulation rules).
 
     [deviation] The legacy `total` field was removed in Task 2 of the
-    breakdown-table plan. The total is now derived by render from the three
-    breakdown values (in + out + cached). Persisted `total` keys in old
-    cache files from before this change are harmless: cache-hit returns
-    the cached dict unchanged, and render ignores the extra field. We do
-    not actively migrate.
+    breakdown-table plan, and the flat `cum_in`/`cum_out`/
+    `cum_cache_create`/`cum_cache_read` sums were removed together with
+    the model columns (their last production reader was this branch's
+    render refactor — totals now derive from `per_model`). Persisted
+    legacy keys in old cache files are harmless: cache-hit returns the
+    cached dict unchanged, and nothing reads the extra fields. We do not
+    actively migrate.
 
     If `jsonl_path` does not exist, returns a zero-valued result without
     writing the cache.
@@ -898,41 +930,33 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
     last_assistant: dict | None = None
     last_event: dict | None = None
     try:
-        with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    # partial line — race with the subagent writing; skip
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                last_event = event
-                if event.get("type") != "assistant":
-                    continue
-                last_assistant = event
-                msg = event.get("message") or {}
-                usage = msg.get("usage") if isinstance(msg, dict) else None
-                if not isinstance(usage, dict):
-                    continue
-                in_v = int(usage.get("input_tokens", 0) or 0)
-                out_v = int(usage.get("output_tokens", 0) or 0)
-                cached_v = int(usage.get("cache_read_input_tokens", 0) or 0)
-                tokens_in += in_v
-                tokens_out += out_v
-                tokens_cached += cached_v
-                # Same gate and setdefault-first-appearance pattern as
-                # _scan_main_jsonl's per_model; zero-token models stay.
-                model_id = str(msg.get("model") or "")
-                model_rec = models.setdefault(
-                    model_id, {"in": 0, "out": 0, "cached": 0}
-                )
-                model_rec["in"] += in_v
-                model_rec["out"] += out_v
-                model_rec["cached"] += cached_v
+        # OSError from _iter_events (unreadable file, error mid-read)
+        # propagates into this loop and is caught below — the degradation
+        # contract of the old _read_last_event helper.
+        for _, event in _iter_events(jsonl_path):
+            last_event = event
+            if event.get("type") != "assistant":
+                continue
+            last_assistant = event
+            msg = event.get("message") or {}
+            usage = msg.get("usage") if isinstance(msg, dict) else None
+            if not isinstance(usage, dict):
+                continue
+            in_v = _to_int(usage.get("input_tokens", 0))
+            out_v = _to_int(usage.get("output_tokens", 0))
+            cached_v = _to_int(usage.get("cache_read_input_tokens", 0))
+            tokens_in += in_v
+            tokens_out += out_v
+            tokens_cached += cached_v
+            # Same gate and setdefault-first-appearance pattern as
+            # _scan_main_jsonl's per_model; zero-token models stay.
+            model_id = str(msg.get("model") or "")
+            model_rec = models.setdefault(
+                model_id, {"in": 0, "out": 0, "cached": 0}
+            )
+            model_rec["in"] += in_v
+            model_rec["out"] += out_v
+            model_rec["cached"] += cached_v
     except OSError:
         return {
             "tokens_in": 0,
@@ -1388,54 +1412,12 @@ _STATUSES = ("ok", "run", "err", "stop", "kill")
 _TABLE_ROW_PREFIX = "| "
 
 
-def _col_width(values: list, label: str) -> int:
-    """Compute a right-aligned column width for a numeric column.
-
-    Width is the maximum of:
-        - _TOKEN_COLUMN_WIDTH (the floor — guarantees readability even
-          for narrow columns),
-        - len(label) (so labels like "cached" don't overflow),
-        - the longest formatted value across `values` (so values like
-          "1.2M" don't overflow).
-
-    Exposed at module scope so tests can mirror the width formula
-    without copying it. `values` is expected to be a list of ints; the
-    `default=0` on the max() handles the empty-list case.
-
-    [decision] Retained (and still exported) after render_table
-    generalized the width computation to arbitrary columns of
-    pre-formatted cells: tests/test_render_output.py imports it to
-    reconstruct expected header strings, and it documents the token-
-    column floor formula (floor _TOKEN_COLUMN_WIDTH, label, widest
-    formatted cell). render_table applies the same max() to its own
-    column specs.
-
-    [deviation] Plan spec (step 2 of the breakdown-table section) wrote
-    this as `max(len(format_tokens(v)) for v in col + [label])` with the
-    floor pulled in separately: `min(_TOKEN_COLUMN_WIDTH, computed)`.
-    Mathematically equivalent — appending `label` to `col` only adds
-    `len(label)` to the candidate set, and the floor is just another
-    `max` operand — but the refactor splits the floor into an explicit
-    named constant so the intent ("never narrower than 7") is visible
-    at the call site rather than buried inside a generator expression.
-    """
-    longest_value = max((len(format_tokens(v)) for v in values), default=0)
-    return max(_TOKEN_COLUMN_WIDTH, len(label), longest_value)
-
-
 # Floor for the label/description column: an agent row's minimum
 # footprint — the icon padded to _ICON_COL_WIDTH plus the status gap.
 # Together with the column's "gap" (the 2-space _DESC_TOKEN_GAP) this
 # reproduces the pre-model-columns header_pad = w_desc + _ICON_COL_WIDTH
 # + 4 exactly, keeping the prices=None layout byte-identical.
 _LABEL_COL_FLOOR = _ICON_COL_WIDTH + len(_STATUS_GAP)
-
-
-def _cell_text(row: list, index: int) -> str:
-    """Cell at `index` of a render_table row as a string — "" for a
-    missing cell (ragged row) or an explicit None."""
-    cell = row[index] if index < len(row) else ""
-    return "" if cell is None else str(cell)
 
 
 def render_table(columns: list, rows: list) -> list:
@@ -1445,36 +1427,32 @@ def render_table(columns: list, rows: list) -> list:
         {"label": str, "align": "left"|"right", "floor": int,
          "gap": str (optional, default " ")}
     `rows` is a list of rows, each a list of pre-formatted (string)
-    cells — render_table does no number formatting of its own.
+    cells — render_table does no number formatting of its own. Rows MUST
+    carry exactly one cell per column (keys label/align/floor are
+    required): a mis-shaped row or column raises IndexError/KeyError
+    instead of silently rendering blank cells, surfacing row-shape bugs
+    at the call site.
 
     The first returned line is the LABEL row built from the columns'
     labels; then one line per row. Column width =
         max(floor, len(label), longest cell in that column).
     Left-aligned cells pad on the right (ljust), right-aligned on the
-    left (rjust); the column's "gap" is glued after it. Ragged rows
-    render missing cells as empty. Every line is right-stripped — an
-    empty cell in the last column leaves no trailing padding spaces
-    (trailing whitespace is never meaningful in this table).
+    left (rjust); the column's "gap" is glued after it. Every line is
+    right-stripped — an empty cell in the last column leaves no trailing
+    padding spaces (trailing whitespace is never meaningful in this
+    table).
     """
     widths = []
     for index, column in enumerate(columns):
-        longest = max(
-            (len(_cell_text(row, index)) for row in rows), default=0
-        )
-        widths.append(
-            max(
-                int(column.get("floor", 0) or 0),
-                len(column.get("label", "")),
-                longest,
-            )
-        )
-    label_row = [column.get("label", "") for column in columns]
+        longest = max((len(row[index]) for row in rows), default=0)
+        widths.append(max(column["floor"], len(column["label"]), longest))
+    label_row = [column["label"] for column in columns]
     lines = []
     for row in [label_row, *rows]:
         parts = []
         for index, column in enumerate(columns):
-            cell = _cell_text(row, index)
-            if column.get("align", "left") == "right":
+            cell = row[index]
+            if column["align"] == "right":
                 cell = cell.rjust(widths[index])
             else:
                 cell = cell.ljust(widths[index])
@@ -1501,21 +1479,26 @@ def _cost_cell(
 
 def _models_total(models: "dict | None") -> tuple:
     """(in, out, cached) summed over a per-model dict's records.
-    Non-dict records are skipped defensively."""
+
+    The per-model dicts come from the scans or from a cache file, so this
+    is an untrusted-data boundary: non-dict records are skipped and
+    non-numeric values coerce to 0 via _to_int (a hand-corrupted cache
+    must degrade the one bad record, not crash the whole render)."""
     total_in = total_out = total_cached = 0
     for rec in (models or {}).values():
         if not isinstance(rec, dict):
             continue
-        total_in += int(rec.get("in") or 0)
-        total_out += int(rec.get("out") or 0)
-        total_cached += int(rec.get("cached") or 0)
+        total_in += _to_int(rec.get("in"))
+        total_out += _to_int(rec.get("out"))
+        total_cached += _to_int(rec.get("cached"))
     return total_in, total_out, total_cached
 
 
 def _merge_models(sources: list) -> dict:
     """Merge per-model dicts into one, summing per model (no cross-model
     aggregation). Key order = first appearance across `sources` — pass
-    them in render order (main first, then agents)."""
+    them in render order (main first, then agents). Same corrupt-record
+    tolerance as _models_total (cache-sourced inputs)."""
     merged: dict = {}
     for source in sources:
         if not isinstance(source, dict):
@@ -1524,9 +1507,9 @@ def _merge_models(sources: list) -> dict:
             if not isinstance(rec, dict):
                 continue
             acc = merged.setdefault(model, {"in": 0, "out": 0, "cached": 0})
-            acc["in"] += int(rec.get("in") or 0)
-            acc["out"] += int(rec.get("out") or 0)
-            acc["cached"] += int(rec.get("cached") or 0)
+            acc["in"] += _to_int(rec.get("in"))
+            acc["out"] += _to_int(rec.get("out"))
+            acc["cached"] += _to_int(rec.get("cached"))
     return merged
 
 
@@ -1541,24 +1524,30 @@ def _group_model_rows(
     left with no rows after the skip renders ONE zero row with an EMPTY
     model cell — groups are never skipped (the "agents never skipped"
     invariant, extended to main and sum).
+
+    Records are coerced ONCE here (the untrusted-cache boundary) and the
+    coerced values are what both the token cells and the cost cell
+    consume — a None/non-numeric field must not raise from compute_cost.
     """
     rows: list = []
     for model, rec in (models or {}).items():
         if not isinstance(rec, dict):
             continue
-        in_v = int(rec.get("in") or 0)
-        out_v = int(rec.get("out") or 0)
-        cached_v = int(rec.get("cached") or 0)
-        if not (in_v or out_v or cached_v):
+        coerced = {
+            "in": _to_int(rec.get("in")),
+            "out": _to_int(rec.get("out")),
+            "cached": _to_int(rec.get("cached")),
+        }
+        if not (coerced["in"] or coerced["out"] or coerced["cached"]):
             continue
         rows.append(
             [
                 label,
                 model,
-                format_tokens(in_v),
-                format_tokens(out_v),
-                format_tokens(cached_v),
-                _cost_cell(model, rec, prices, host),
+                format_tokens(coerced["in"]),
+                format_tokens(coerced["out"]),
+                format_tokens(coerced["cached"]),
+                _cost_cell(model, coerced, prices, host),
             ]
         )
         label = ""
@@ -1620,10 +1609,9 @@ def render_output(
     All padding/alignment is delegated to render_table; the label column
     (label/description/icon) is left-aligned with floor
     _LABEL_COL_FLOOR, token columns right-aligned with floor
-    _TOKEN_COLUMN_WIDTH (= _col_width's floor). Description is truncated
-    to 40 chars with U+2026 (re-applied defensively). Defensive
-    `int(... or 0)` / isinstance handling covers pre-upgrade caches and
-    hand-built snapshots.
+    _TOKEN_COLUMN_WIDTH. Description is truncated to 40 chars with
+    U+2026 (re-applied defensively). Defensive _to_int / isinstance
+    handling covers pre-upgrade caches and hand-corrupted cache files.
     """
     # 1. Project agents into render-ready rows: the group label (icon +
     # status gap + truncated description — only the group's FIRST row
@@ -1644,9 +1632,9 @@ def render_output(
                     f"{icon:<{_ICON_COL_WIDTH}}{_STATUS_GAP}"
                     f"{_truncate_description(a.get('description', '') or '')}"
                 ),
-                "in": int(a.get("tokens_in") or 0),
-                "out": int(a.get("tokens_out") or 0),
-                "cached": int(a.get("tokens_cached") or 0),
+                "in": _to_int(a.get("tokens_in")),
+                "out": _to_int(a.get("tokens_out")),
+                "cached": _to_int(a.get("tokens_cached")),
                 "models": models if isinstance(models, dict) else {},
             }
         )
@@ -2017,15 +2005,15 @@ def _main_unsafe() -> int:
     tool_use_positions = main_cum.get("tool_use_positions")
     agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
     # Task 4/5 — model/cost columns: render_output consumes the per-model
-    # dict (the main row's totals are the sum of its records; cum_in /
-    # cum_out / cum_cache_read are no longer passed flat). prices come from
+    # dict (the main row's totals are the sum of its records — the flat
+    # cum_* sums no longer exist). prices come from
     # ~/.claude/status_line/prices.json (None when missing/invalid → the
     # no-columns layout) and the provider host from ANTHROPIC_BASE_URL (""
-    # when unset — plain keys then match, "@host" keys never do). `or 0` /
-    # `or {}` guard pre-upgrade caches.
-    start_in = int(main_cum.get("start_in") or 0)
-    start_out = int(main_cum.get("start_out") or 0)
-    start_cached = int(main_cum.get("start_cached") or 0)
+    # when unset — plain keys then match, "@host" keys never do). _to_int /
+    # `or {}` guard pre-upgrade and hand-corrupted caches.
+    start_in = _to_int(main_cum.get("start_in"))
+    start_out = _to_int(main_cum.get("start_out"))
+    start_cached = _to_int(main_cum.get("start_cached"))
     main_models = main_cum.get("per_model") or {}
     prices = load_prices(_PRICES_PATH)
     host = provider_host()
