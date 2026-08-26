@@ -137,15 +137,15 @@ Option A+ (согласовано в брейншторме):
 - Modify: `status_line.py`
 - Create: `tests/test_resolve_session_dirs.py`
 
-- [ ] TDD: написать тесты: transcript-каталог существует и есть среди
+- [x] TDD: написать тесты: transcript-каталог существует и есть среди
       glob-совпадений → он первый, без дубля; transcript-каталог существует, но
       glob его не вернул (лежит вне projects_root) → он первый + glob-совпадения
       следом; пустой transcript_path → порядок чистого glob; transcript_path
       указывает на несуществующий файл/каталог → fallback на чистый glob
-- [ ] убедиться, что тесты падают
-- [ ] реализовать `_resolve_session_dirs(transcript_path, session_id,
+- [x] убедиться, что тесты падают
+- [x] реализовать `_resolve_session_dirs(transcript_path, session_id,
 projects_root=None) -> list[Path]`
-- [ ] прогнать `python -m pytest tests/test_resolve_session_dirs.py` — зелёные
+- [x] прогнать `python -m pytest tests/test_resolve_session_dirs.py` — зелёные
 
 ### Task 3: _compute_agents — объединение и дедуп по agentId
 

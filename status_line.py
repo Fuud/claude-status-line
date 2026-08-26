@@ -958,6 +958,59 @@ def find_session_dir(
 
 
 # ---------------------------------------------------------------------------
+# _resolve_session_dirs
+# ---------------------------------------------------------------------------
+
+def _resolve_session_dirs(
+    transcript_path: str,
+    session_id: str,
+    projects_root: Path | None = None,
+) -> list[Path]:
+    """Resolve ALL session dirs for `session_id`, transcript dir first.
+
+    Starts from `find_session_dirs` (every `**/<session_id>` directory under
+    `projects_root`) and, when `transcript_path` is non-empty and
+    `Path(transcript_path).parent / session_id` is an existing directory,
+    moves that directory to the front of the list (without duplicating it
+    if glob already returned it). Backslashes in `transcript_path` are
+    normalized to forward slashes first: Windows CC sends `C:\...` paths,
+    and under a posix-flavoured python (cygwin) posixpath would otherwise
+    treat the whole string as one component, making `.parent` degenerate
+    to "." and the priority below silently never engage.
+
+    Priority rationale: transcript_path is CC's own authoritative statement
+    of where the session lives (the same source `_find_main_jsonl` trusts
+    first). The first entry of the result wins agent-id dedup downstream,
+    so the authoritative directory must lead even when glob's OS-dependent
+    ordering would put an empty worktree copy first (the bug this fixes).
+
+    Degradations: empty `transcript_path`, or one whose sibling session dir
+    does not exist on disk, yields the pure glob order unchanged. Empty
+    `session_id` → [] (no filesystem statement to trust, and the glob has
+    nothing to match).
+
+    Like `find_session_dirs`, `projects_root` defaults to
+    `<home>/.claude/projects` and is injectable for tests.
+    """
+    dirs = find_session_dirs(session_id, projects_root=projects_root)
+    if not (session_id and transcript_path):
+        return dirs
+    # Windows CC sends backslash-separated transcript paths, and the hook
+    # may run under a posix-flavoured python (cygwin): there backslash is
+    # NOT a separator, so PosixPath("C:\\Users\\...") is one opaque
+    # component and .parent degenerates to "." — silently disabling the
+    # priority below. Forward slashes are native on POSIX and equally
+    # valid on Windows python, so normalizing is safe on both.
+    normalized = transcript_path.replace("\\", "/")
+    preferred = Path(normalized).parent / session_id
+    if not preferred.is_dir():
+        return dirs
+    # only the sibling dir's existence matters, not the transcript file
+    # itself — a cleaned-up jsonl with a surviving session dir still wins
+    return [preferred] + [d for d in dirs if d != preferred]
+
+
+# ---------------------------------------------------------------------------
 # _find_main_jsonl
 # ---------------------------------------------------------------------------
 
