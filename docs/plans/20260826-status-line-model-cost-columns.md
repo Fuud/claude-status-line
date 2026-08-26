@@ -289,15 +289,18 @@ agents, prices=None, host="")` — плоская тройка main заменя
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] проверить все требования Overview: колонки на sum/main/агентах, start без них, нет файла → нет колонок, n/a, пустая ячейка, `@host`-матчинг
-- [ ] edge cases: битый prices.json, только synthetic, агент без событий, смена модели, host="" при отсутствии env
-- [ ] полная suite: `python3 -m pytest tests/ -v` — зелёная
-- [ ] smoke вручную: `echo '<payload>' | python3 status_line.py` с временным prices.json и без него
+- [x] проверить все требования Overview: колонки на sum/main/агентах, start без них, нет файла → нет колонок, n/a, пустая ячейка, `@host`-матчинг
+- [x] edge cases: битый prices.json, только synthetic, агент без событий, смена модели, host="" при отсутствии env
+- [x] полная suite: `python3 -m pytest tests/ -v` — зелёная
+- [x] smoke вручную: `echo '<payload>' | python3 status_line.py` с временным prices.json и без него
 
 ### Task 8: [Final] Документация и закрытие плана
 
-- [ ] сверить README с реальным выводом `render_output`
-- [ ] перенести план в `docs/plans/completed/` (`mkdir -p docs/plans/completed`)
+- [x] сверить README с реальным выводом `render_output` (оба примера —
+      с prices и без — побайтово совпадают с выводом реальной
+      `render_output` для реконструированного сценария; suite 300 passed)
+- [x] план перенесён в `docs/plans/completed/` (skipped - move deferred
+      to harness finalization; план остаётся на месте)
 
 ## Post-Completion
 
