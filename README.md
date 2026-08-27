@@ -14,15 +14,15 @@ row per model:
 
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
-|                                      model            in     out  cached          cost
+|                                      model            in     out  cached  cost
 | start:                               glm-5.3         12K      1K       0  10.7 credits
 | sum:                                 glm-5.3        1.1M     34K   50.8M  9.5K credits
-|                                      kimi-k3        150K     40K    3.0M          $1.9
-|                                      MiniMax-M3      500     200      3K           n/a
+|                                      kimi-k3        150K     40K    3.0M  $1.9
+|                                      MiniMax-M3      500     200      3K   n/a
 | main:                                glm-5.3        1.1M     30K   50.7M  9.4K credits
-|                                      kimi-k3        150K     40K    3.0M          $1.9
+|                                      kimi-k3        150K     40K    3.0M  $1.9
 | [ok]    Review: implementation plan  glm-5.3         12K      4K    100K  34.9 credits
-| [err]   Review: quality              MiniMax-M3      500     200      3K           n/a
+| [err]   Review: quality              MiniMax-M3      500     200      3K   n/a
 | [run]   Task 4: MissingGlyphLog                        0       0       0
 ```
 
@@ -127,8 +127,10 @@ Fields:
   cache-read respectively. Missing fields default to 0.
 - `per` — token divisor, required: must be a number > 0.
 - `units` — optional cost label. Its first character decides placement:
-  non-alphanumeric glues as a prefix (`$8.1`), anything else appends
-  after a space (`402 credits`); empty/missing → the bare number.
+  non-alphanumeric glues as a prefix inside the cost cell (`$8.1`);
+  anything else renders in a separate unlabeled column after `cost`
+  (`402` + `crds`), so the cost column's numbers right-align; empty or
+  missing → the bare number.
 
 Number formatting of the cost cell: `>= 1M` → `X.XM`, `>= 1000` →
 `X.XK`, `>= 0.1` → one decimal with a trailing `.0` dropped (`402`),

@@ -1426,11 +1426,11 @@ def test_synth_prices_per_model_rows_and_costs(tmp_path: Path) -> None:
     # glm (22000*6.9+9000*24+120000*1.7)/10000 = 57.18 → 57.2 credits;
     # agent glm (12000*6.9+4000*24+100000*1.7)/10000 = 34.88 → 34.9.
     assert lines[1:] == [
-        "|                      model         in     out  cached          cost",
+        "|                      model         in     out  cached  cost",
         "| start:               glm-5.3      10K      5K     20K  22.3 credits",
         "| sum:                 glm-5.3      22K      9K    120K  57.2 credits",
-        "|                      kimi-k3     2.0M    100K       0          $7.5",
+        "|                      kimi-k3     2.0M    100K       0  $7.5",
         "| main:                glm-5.3      10K      5K     20K  22.3 credits",
-        "|                      kimi-k3     2.0M    100K       0          $7.5",
+        "|                      kimi-k3     2.0M    100K       0  $7.5",
         "| [ok]    Synth agent  glm-5.3      12K      4K    100K  34.9 credits",
     ], f"table mismatch:\n" + "\n".join(repr(l) for l in lines[1:])

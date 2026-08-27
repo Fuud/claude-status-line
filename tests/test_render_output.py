@@ -1065,13 +1065,13 @@ def test_prices_layout_byte_exact() -> None:
     )
     assert out.split("\n") == [
         "Session: x",
-        "|            model         in     out  cached          cost",
+        "|            model         in     out  cached  cost",
         "| start:                    1       2       3",
         "| sum:       glm-5.3      10K      5K     20K  22.3 credits",
-        "|            kimi-k3     2.0M    100K       0          $7.5",
+        "|            kimi-k3     2.0M    100K       0  $7.5",
         "| main:      glm-5.3      10K      5K     20K  22.3 credits",
         "| [ok]    a  glm-5.3       10       5       2  0.02 credits",
-        "|            kimi-k3     2.0M    100K       0          $7.5",
+        "|            kimi-k3     2.0M    100K       0  $7.5",
     ], out
 
 

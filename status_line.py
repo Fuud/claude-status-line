@@ -250,22 +250,33 @@ def format_cost(value: float, units: str) -> str:
     < 0.1 → two decimals ("0.04"). Units whose first char is not alnum
     glue as a prefix ("$8.1"); otherwise they append after a space
     ("402 credits"); empty units → the bare number.
+
+    NOTE: this combined form is used for prefix/empty units in the table
+    (and by tests as the pure formatter); WORD units are split by
+    _cost_cell into number + separate units column so the cost column's
+    numbers right-align (see render_output).
     """
-    if value >= 1_000_000:
-        num = f"{value / 1_000_000:.1f}M"
-    elif value >= 1000:
-        num = f"{value / 1_000:.1f}K"
-    elif value >= 0.1:
-        num = f"{value:.1f}"
-        if num.endswith(".0"):
-            num = num[:-2]
-    else:
-        num = f"{value:.2f}"
+    num = _format_cost_number(value)
     if not units:
         return num
     if units[0].isalnum():
         return f"{num} {units}"
     return f"{units}{num}"
+
+
+def _format_cost_number(value: float) -> str:
+    """The number half of a cost cell — the precision buckets documented
+    in format_cost, without any units handling."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1000:
+        return f"{value / 1_000:.1f}K"
+    if value >= 0.1:
+        num = f"{value:.1f}"
+        if num.endswith(".0"):
+            num = num[:-2]
+        return num
+    return f"{value:.2f}"
 
 
 # ---------------------------------------------------------------------------
@@ -1488,17 +1499,27 @@ def render_table(columns: list, rows: list) -> list:
     return lines
 
 
-def _cost_cell(model: str, rec: dict, prices: dict | None, host: str) -> str:
-    """Cost cell for one per-model row: the formatted number when a price
-    is found, "n/a" when the model is known but unpriced, "" when there
-    is no model at all (the start row and the zero-fallback rows — no
-    model means nothing to price)."""
+def _cost_cell(
+    model: str, rec: dict, prices: dict | None, host: str
+) -> tuple[str, str]:
+    """(cost cell, units cell) for one per-model row.
+
+    The cost cell holds the number: prefix units ("$") glue onto it via
+    format_cost ("$8.1") and empty units leave it bare, but WORD units
+    ("crds") move to the separate unlabeled units column so the cost
+    column's numbers right-align against each other. "n/a" for a known
+    but unpriced model; ("", "") when there is no model at all (the
+    zero-fallback rows — no model means nothing to price)."""
     if not model:
-        return ""
+        return "", ""
     price = price_for(model, prices, host)
     if price is None:
-        return "n/a"
-    return format_cost(compute_cost(rec, price), price.get("units", ""))
+        return "n/a", ""
+    units = price.get("units", "")
+    value = compute_cost(rec, price)
+    if units and units[0].isalnum():
+        return _format_cost_number(value), units
+    return format_cost(value, units), ""
 
 
 def _coerce_record(rec: object) -> dict | None:
@@ -1559,7 +1580,7 @@ def _merge_models(sources: list) -> dict:
 def _group_model_rows(
     label: str, models: dict | None, prices: dict | None, host: str
 ) -> list:
-    """Wide rows (label, model, in, out, cached, cost) for one group.
+    """Wide rows (label, model, in, out, cached, cost, units) for one group.
 
     One row per model in first-appearance order; per-model records whose
     tokens are ALL zero (e.g. <synthetic>) are skipped entirely. The
@@ -1580,6 +1601,7 @@ def _group_model_rows(
             continue
         if not (coerced["in"] or coerced["out"] or coerced["cached"]):
             continue
+        cost_cell, units_cell = _cost_cell(model, coerced, prices, host)
         rows.append(
             [
                 label,
@@ -1587,12 +1609,13 @@ def _group_model_rows(
                 format_tokens(coerced["in"]),
                 format_tokens(coerced["out"]),
                 format_tokens(coerced["cached"]),
-                _cost_cell(model, coerced, prices, host),
+                cost_cell,
+                units_cell,
             ]
         )
         label = ""
     if not rows:
-        rows.append([label, "", "0", "0", "0", ""])
+        rows.append([label, "", "0", "0", "0", "", ""])
     return rows
 
 
@@ -1767,7 +1790,11 @@ def render_output(
     else:
         # Model column between description and `in`; cost column after
         # `cached` (2-space gaps on both sides of the token block, so
-        # the extra columns read as additions to the old layout).
+        # the extra columns read as additions to the old layout). The
+        # unlabeled units column after cost carries WORD units ("crds")
+        # so the cost numbers right-align; prefix units ("$") and empty
+        # units leave it blank (render_table rstrips, so those rows end
+        # at the cost cell exactly as before).
         columns = [
             label_column,
             {
@@ -1778,7 +1805,14 @@ def render_output(
             },
             *_token_columns(_DESC_TOKEN_GAP),
             {"label": "cost", "align": "right", "floor": 0},
+            {"label": "", "align": "left", "floor": 0},
         ]
+        start_cost, start_units = _cost_cell(
+            start_model,
+            {"in": start_in, "out": start_out, "cached": start_cached},
+            prices,
+            host,
+        )
         rows.append(
             [
                 "start:",
@@ -1786,12 +1820,8 @@ def render_output(
                 format_tokens(start_in),
                 format_tokens(start_out),
                 format_tokens(start_cached),
-                _cost_cell(
-                    start_model,
-                    {"in": start_in, "out": start_out, "cached": start_cached},
-                    prices,
-                    host,
-                ),
+                start_cost,
+                start_units,
             ]
         )
         if projected:
