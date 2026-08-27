@@ -1250,6 +1250,23 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
               feeds detect_status (e.g. a user "[Request interrupted by
               user]" event written after the final assistant must
               surface as "stop").
+        ts_first, ts_last — epoch seconds of the FIRST/LAST parsable event
+              carrying a parseable timestamp, of ANY type (plan
+              20260827-status-line-time-columns). Both 0.0 when no event
+              is stamped ("degrade to empty time cells" downstream) or on
+              the OSError degradation path below; they anchor the agent's
+              lifetime for the work/wait/total columns.
+        qa_pauses — closed AskUserQuestion pauses as [question_ts,
+              next_user_ts] pairs, in file order. Mirrors the main scan's
+              rule: any user event resolves a hanging pause (tool_result
+              and string/interrupt content alike); a second question
+              while a pause is open does NOT reset it. Unstamped events
+              are silently skipped for time purposes (pause edges need a
+              parseable stamp on both ends).
+        qa_open_ts — epoch seconds of the still-UNANSWERED AskUserQuestion
+              (the pause whose closing user event has not arrived), 0.0
+              when no pause is open. The orchestrator extends this gap as
+              the agent's wait time.
 
     A missing/unreadable file, or an OSError mid-read, yields the
     all-zero empty scan (the degradation _read_last_event used to
@@ -1259,13 +1276,50 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
     models: dict[str, dict[str, int]] = {}
     last_assistant: dict | None = None
     last_event: dict | None = None
+    # ---- time-segmentation state (plan 20260827-status-line-time-columns)
+    ts_first = 0.0
+    ts_last = 0.0
+    qa_pauses: list[list[float]] = []
+    qa_open_ts = 0.0
     try:
         # OSError from _iter_events (unreadable file, error mid-read)
         # propagates into this loop and is caught below — the degradation
         # contract of the old _read_last_event helper.
         for _, event in _iter_events(jsonl_path):
             last_event = event
-            if event.get("type") != "assistant":
+
+            etype = event.get("type")
+
+            # ---- time segmentation probe (any typed stamped event counts
+            # ---- toward the lifetime bounds; QA bookkeeping mirrors the
+            # ---- main scan's pause machine).
+            seg_ts = _parse_ts(event.get("timestamp"))
+            if seg_ts is not None:
+                if ts_first == 0.0:
+                    ts_first = seg_ts
+                ts_last = seg_ts
+                if etype == "assistant":
+                    msg_t = event.get("message")
+                    msg_dict_t = msg_t if isinstance(msg_t, dict) else {}
+                    content_t = msg_dict_t.get("content")
+                    if isinstance(content_t, list):
+                        for block in content_t:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_use"
+                                and block.get("name") == "AskUserQuestion"
+                                and qa_open_ts == 0.0
+                            ):
+                                # open (or keep) the hanging question
+                                qa_open_ts = seg_ts
+                                break
+                elif etype == "user" and qa_open_ts > 0.0:
+                    # any user event resolves the hanging question;
+                    # work accounting resumes at this stroke downstream
+                    qa_pauses.append([qa_open_ts, seg_ts])
+                    qa_open_ts = 0.0
+
+            if etype != "assistant":
                 continue
             last_assistant = event
             msg = event.get("message") or {}
@@ -1290,6 +1344,10 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
             "last_uuid": None,
             "last_assistant": None,
             "last_event": None,
+            "ts_first": 0.0,
+            "ts_last": 0.0,
+            "qa_pauses": [],
+            "qa_open_ts": 0.0,
         }
     # Same non-str guard as the main scan's last_uuid: a corrupt uuid
     # must not leak into the snapshot, the agents cache and the
@@ -1307,6 +1365,10 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
         "last_uuid": last_uuid,
         "last_assistant": last_assistant,
         "last_event": last_event,
+        "ts_first": ts_first,
+        "ts_last": ts_last,
+        "qa_pauses": qa_pauses,
+        "qa_open_ts": qa_open_ts,
     }
 
 
@@ -1332,6 +1394,16 @@ def compute_agent_snapshot(
         last_uuid     — uuid of the last assistant event, or None
         mtime_jsonl   — st_mtime of jsonl_path, or 0.0 if missing
         mtime_meta    — st_mtime of meta_path, or 0.0 if missing
+        ts_first / ts_last / qa_pauses / qa_open_ts
+                      — the agent's time-segmentation fields straight from
+                        _scan_agent_jsonl (plan
+                        20260827-status-line-time-columns): lifetime epoch
+                        bounds over ALL stamped events, closed
+                        AskUserQuestion pause pairs, and an unanswered
+                        question's ts (0.0 when none). Persisted via
+                        _AGENT_CACHE_FIELDS so cache-HIT cycles still hand
+                        them to the orchestrator; transient work/wait/total
+                        numbers are derived downstream and never cached.
 
     [deviation vs the pre-model-columns schema] The breakdown fields are
     CUMULATIVE totals over the whole jsonl, not the last assistant
@@ -1346,12 +1418,14 @@ def compute_agent_snapshot(
 
     Cache hit: if `cache_entry` is provided AND its last_uuid AND
     mtime_jsonl AND mtime_meta match the current on-disk state AND all
-    three breakdown fields AND `models` are present in cache_entry, the
-    cache_entry is returned unchanged. The field-presence checks guard
-    against stale pre-upgrade caches (which would render zeros via
-    `int(a.get(field) or 0)` until the next jsonl mutation). This
-    function does NOT write to any cache file — the caller (orchestrator)
-    owns cache persistence.
+    three breakdown fields AND `models` AND the four time-segmentation
+    fields (ts_first / ts_last / qa_pauses / qa_open_ts) are present in
+    cache_entry, the cache_entry is returned unchanged. The
+    field-presence checks guard against stale pre-upgrade caches (which
+    would render zeros via `int(a.get(field) or 0)` — and, for the time
+    fields, empty work/wait/total cells — until the next jsonl mutation).
+    This function does NOT write to any cache file — the caller
+    (orchestrator) owns cache persistence.
 
     [deviation] When the jsonl contains zero assistant events at all, status
     is forced to "err" (or "stop" if meta.stoppedByUser=true) regardless of
@@ -1373,10 +1447,11 @@ def compute_agent_snapshot(
     # 4. Cache hit check. mtime_meta is part of the key: if meta.json
     # mutates (e.g. stoppedByUser added later, description edited),
     # cache must invalidate even if jsonl mtime+uuid are unchanged.
-    # Field-presence checks for the three breakdown fields and `models`
-    # are REQUIRED: a pre-upgrade cache (old format) would otherwise
-    # satisfy the key-match but lack the new fields, leading to render
-    # zeros / empty model cells until the next jsonl mutation.
+    # Field-presence checks for the three breakdown fields, `models`,
+    # and the four time-segmentation fields are REQUIRED: a pre-upgrade
+    # cache (old format) would otherwise satisfy the key-match but lack
+    # the new fields, leading to render zeros / empty model cells / empty
+    # time cells until the next jsonl mutation.
     mtime_meta_for_compare = _meta_mtime(meta_path)
     last_uuid_for_compare = scan["last_uuid"]
     # agent_id is needed both for the cache-hit dict-shape invariant (see
@@ -1386,12 +1461,17 @@ def compute_agent_snapshot(
         breakdown_present = all(
             f in cache_entry for f in ("tokens_in", "tokens_out", "tokens_cached")
         )
+        time_fields_present = all(
+            f in cache_entry
+            for f in ("ts_first", "ts_last", "qa_pauses", "qa_open_ts")
+        )
         if (
             cache_entry.get("last_uuid") == last_uuid_for_compare
             and cache_entry.get("mtime_jsonl") == mtime_jsonl
             and cache_entry.get("mtime_meta") == mtime_meta_for_compare
             and breakdown_present
             and "models" in cache_entry
+            and time_fields_present
         ):
             # Preserve the invariant: the returned snapshot always has
             # `agentId` inside, regardless of cache hit or miss. The
@@ -1440,6 +1520,10 @@ def compute_agent_snapshot(
         "last_uuid": last_uuid_for_compare,
         "mtime_jsonl": mtime_jsonl,
         "mtime_meta": mtime_meta_for_compare,
+        "ts_first": scan["ts_first"],
+        "ts_last": scan["ts_last"],
+        "qa_pauses": scan["qa_pauses"],
+        "qa_open_ts": scan["qa_open_ts"],
     }
 
 
@@ -2156,7 +2240,13 @@ def render_output(
 # fields are the render-ready shape (replacing the prior `tokens` sum);
 # `models` is the per-model breakdown feeding the model/cost columns —
 # its presence is part of the cache-hit check so pre-model-columns
-# caches are rebuilt once and rewritten.
+# caches are rebuilt once and rewritten. The four ts_*/qa_* fields carry
+# the agent's time segmentation (lifetime bounds + AskUserQuestion pause
+# bookkeeping, plan 20260827-status-line-time-columns): they persist so
+# cache-HIT cycles can still extend live work windows and split waits;
+# their presence is likewise part of the hit check (pre-time-column
+# caches rebuild once). The derived time_work/time_wait/time_total rows
+# are injected AFTER the cache write and are deliberately NOT here.
 _AGENT_CACHE_FIELDS = (
     "last_uuid",
     "mtime_jsonl",
@@ -2168,6 +2258,10 @@ _AGENT_CACHE_FIELDS = (
     "description",
     "toolUseId",
     "mtime_meta",
+    "ts_first",
+    "ts_last",
+    "qa_pauses",
+    "qa_open_ts",
 )
 
 

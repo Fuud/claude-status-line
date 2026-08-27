@@ -3,7 +3,8 @@
 compute_agent_snapshot(jsonl_path, meta_path, cache_entry) returns a snapshot
 dict for a single subagent: agentId, status, tokens_in, tokens_out,
 tokens_cached, models, description, toolUseId, last_uuid, mtime_jsonl,
-mtime_meta.
+mtime_meta, plus the time-segmentation fields ts_first, ts_last, qa_pauses,
+qa_open_ts (plan 20260827-status-line-time-columns, Task 4).
 
 Token semantics (20260826-status-line-model-cost-columns, Task 3):
 - tokens_in/tokens_out/tokens_cached are CUMULATIVE sums over ALL assistant
@@ -15,9 +16,11 @@ Token semantics (20260826-status-line-model-cost-columns, Task 3):
 Cache semantics:
 - If `cache_entry` (a dict) is provided and its last_uuid + mtime_jsonl +
   mtime_meta all match the current file state AND breakdown fields
-  (tokens_in/out/cached) AND `models` are present in cache_entry → return
-  the cache_entry unchanged (cache hit). The field-presence checks guard
-  against stale caches from pre-upgrade schemas.
+  (tokens_in/out/cached) AND `models` AND the four time-segmentation
+  fields (ts_first/ts_last/qa_pauses/qa_open_ts) are present in
+  cache_entry → return the cache_entry unchanged (cache hit). The
+  field-presence checks guard against stale caches from pre-upgrade
+  schemas (including pre-time-column ones).
 - Otherwise → re-parse the jsonl, compute fields fresh, and return.
 
 The function does NOT write any cache file — the caller (orchestrator) owns
@@ -29,7 +32,10 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 import status_line
 from status_line import _AGENT_CACHE_FIELDS, _compute_agents, compute_agent_snapshot
@@ -535,13 +541,16 @@ def test_meta_missing_fallback(tmp_path: Path) -> None:
 
 def test_cache_hit_with_breakdown_fields() -> None:
     """Pre-populate cache_entry with matching last_uuid + mtime_jsonl +
-    mtime_meta AND all three breakdown fields AND `models` → function
-    returns the cached dict without re-parsing. Sentinel values on the
-    breakdown fields prove the cache was used.
+    mtime_meta AND all three breakdown fields AND `models` AND the four
+    time-segmentation fields → function returns the cached dict without
+    re-parsing. Sentinel values on the breakdown and time fields prove
+    the cache was used (and that the time fields pass through the hit
+    path unchanged — the orchestrator reads them on hit cycles too).
     """
     mtime = AGENT_OK.stat().st_mtime
     last_uuid = "a0000000-0000-0000-0000-000000000004"
     models_sentinel = {"cached-model": {"in": 1, "out": 2, "cached": 3}}
+    qa_pauses_sentinel = [[100.5, 150.25]]
 
     cache_entry = {
         "agentId": _agent_id(AGENT_OK),
@@ -555,6 +564,10 @@ def test_cache_hit_with_breakdown_fields() -> None:
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime,
         "mtime_meta": META_NORMAL.stat().st_mtime,
+        "ts_first": 1000.0,
+        "ts_last": 1400.5,
+        "qa_pauses": qa_pauses_sentinel,
+        "qa_open_ts": 0.0,
     }
 
     result = compute_agent_snapshot(
@@ -568,6 +581,10 @@ def test_cache_hit_with_breakdown_fields() -> None:
     assert result["models"] == models_sentinel
     assert result["description"] == "from-cache"
     assert result["toolUseId"] == "toolu_cached"
+    assert result["ts_first"] == 1000.0
+    assert result["ts_last"] == 1400.5
+    assert result["qa_pauses"] == qa_pauses_sentinel
+    assert result["qa_open_ts"] == 0.0
 
 
 def test_cache_miss_when_breakdown_fields_missing() -> None:
@@ -739,8 +756,9 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
     mtime_meta_v1 = work_meta.stat().st_mtime
     last_uuid = "a0000000-0000-0000-0000-000000000004"
 
-    # Cache built when meta was at v1. Includes the three breakdown fields
-    # and `models` so the only thing invalidating the cache is mtime_meta.
+    # Cache built when meta was at v1. Includes the three breakdown fields,
+    # `models` and the four time fields so the only thing invalidating the
+    # cache is mtime_meta.
     cache_v1 = {
         "agentId": "agent-test",
         "status": "ok",
@@ -753,6 +771,10 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime_jsonl,
         "mtime_meta": mtime_meta_v1,
+        "ts_first": 1000.0,
+        "ts_last": 1400.5,
+        "qa_pauses": [[1100.0, 1150.0]],
+        "qa_open_ts": 0.0,
     }
 
     # First call: cache hits (matching key + breakdown present).
@@ -779,6 +801,328 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
     )
     assert r2["description"] == "edited description"
     assert r2["toolUseId"] == "toolu_v2"
+
+
+# ---------------------------------------------------------------------------
+# time-segmentation fields (per 20260827-status-line-time-columns Task 4)
+#
+# _scan_agent_jsonl additionally collects ts_first/ts_last (epoch bounds of
+# ALL stamped events, any type) and AskUserQuestion pause bookkeeping:
+# qa_pauses holds closed [question → next user event] pairs; qa_open_ts is
+# the question ts of a still-unanswered pause (0.0 when none). The fields
+# flow through compute_agent_snapshot into the agents cache so the
+# orchestrator can extend/handle live work windows on cache-hit cycles too.
+# ---------------------------------------------------------------------------
+
+# Base instant all synthetic stamps are derived from — expected epochs are
+# computed from the same tz-aware datetime, so the assertions stay exact
+# regardless of the machine's local timezone.
+_TIME_BASE = datetime(2026, 8, 27, 10, 0, 0, tzinfo=timezone.utc)
+_T0 = _TIME_BASE.timestamp()
+
+
+def _stamp(offset_s: float) -> str:
+    """ISO 8601 UTC stamp (ms precision) offset seconds from _TIME_BASE."""
+    dt = _TIME_BASE + timedelta(seconds=offset_s)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _t_user(ts: str | None, *, interrupt: bool = False) -> dict:
+    """A string-content user event (prompt or interrupt); ts=None omits it."""
+    text = "[Request interrupted by user]" if interrupt else "do the thing"
+    event: dict = {"type": "user", "message": {"content": text}}
+    if ts is not None:
+        event["timestamp"] = ts
+    return event
+
+
+def _t_tool_result_user(ts: str | None) -> dict:
+    """A list-content user event (a tool_result — activity, not boundary)."""
+    event: dict = {
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "content": "done"}]},
+    }
+    if ts is not None:
+        event["timestamp"] = ts
+    return event
+
+
+def _t_assistant(
+    ts: str | None,
+    *,
+    stop_reason: str = "end_turn",
+    uuid: str = "uuid-x",
+    qa_question: bool = False,
+) -> dict:
+    """An assistant event carrying usage; qa_question=True swaps the content
+    for an AskUserQuestion tool_use block. ts=None omits the timestamp."""
+    content: list[dict] = [{"type": "text", "text": "working"}]
+    if qa_question:
+        content = [
+            {
+                "type": "tool_use",
+                "id": "toolu_qa",
+                "name": "AskUserQuestion",
+                "input": {},
+            }
+        ]
+    event: dict = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "glm-5.3",
+            "stop_reason": stop_reason,
+            "content": content,
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_read_input_tokens": 0,
+            },
+        },
+        "uuid": uuid,
+    }
+    if ts is not None:
+        event["timestamp"] = ts
+    return event
+
+
+def _write_jsonl(path: Path, events: list[dict]) -> Path:
+    path.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+    return path
+
+
+def test_ts_first_ts_last_span_all_stamped_events(tmp_path: Path) -> None:
+    """ts_first/ts_last anchor on ANY typed event carrying a parseable
+    timestamp — user prompts and tool_result events included, not only
+    assistant events (mirrors the main scan's time_first_ts rule)."""
+    jsonl = _write_jsonl(tmp_path / "agent-times.jsonl", [
+        _t_assistant(_stamp(0), uuid="a1"),
+        _t_tool_result_user(_stamp(20)),
+        _t_assistant(_stamp(40), stop_reason="tool_use", uuid="a2"),
+        _t_user(_stamp(60)),
+    ])
+
+    snap = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert snap["ts_first"] == pytest.approx(_T0)
+    assert snap["ts_last"] == pytest.approx(_T0 + 60)
+
+
+def test_unstamped_events_skipped_for_time_bounds(tmp_path: Path) -> None:
+    """Events without a (parseable) timestamp are silently skipped for
+    time purposes; stamped neighbors define both bounds. Mixed stream:
+    unstamped user/assistant lines between stamped ones must not shift
+    or zero ts_first/ts_last."""
+    jsonl = _write_jsonl(tmp_path / "agent-mixed.jsonl", [
+        _t_user(None),
+        _t_assistant(_stamp(5), uuid="a1"),
+        _t_assistant(None, stop_reason="tool_use", uuid="a2"),
+        _t_tool_result_user(_stamp(25)),
+    ])
+
+    snap = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert snap["ts_first"] == pytest.approx(_T0 + 5)
+    assert snap["ts_last"] == pytest.approx(_T0 + 25)
+
+
+def test_all_unstamped_events_yield_zero_time_fields(tmp_path: Path) -> None:
+    """No parseable timestamp anywhere → both bounds stay 0.0 and no QA
+    bookkeeping exists (zeros mean "degrade to empty time cells" for the
+    renderer, NOT "zero duration")."""
+    jsonl = _write_jsonl(tmp_path / "agent-nostamps.jsonl", [
+        _t_user(None),
+        _t_assistant(None, uuid="a1"),
+    ])
+
+    snap = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert snap["ts_first"] == 0.0
+    assert snap["ts_last"] == 0.0
+    assert snap["qa_pauses"] == []
+    assert snap["qa_open_ts"] == 0.0
+
+
+def test_qa_pause_closed_by_user_reply(tmp_path: Path) -> None:
+    """AskUserQuestion tool_use opens a pause at its ts; the NEXT user event
+    of any kind closes it → exactly one closed [question, answer] pair in
+    qa_pauses and qa_open_ts back to 0.0. Here the closer is a list-content
+    tool_result user event."""
+    jsonl = _write_jsonl(tmp_path / "agent-qa-closed.jsonl", [
+        _t_assistant(_stamp(10), stop_reason="end_turn", uuid="a1"),
+        _t_assistant(
+            _stamp(60), qa_question=True, stop_reason="tool_use", uuid="a2"
+        ),
+        _t_tool_result_user(_stamp(90)),
+        _t_assistant(_stamp(120), stop_reason="end_turn", uuid="a3"),
+    ])
+
+    snap = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert len(snap["qa_pauses"]) == 1
+    start, end = snap["qa_pauses"][0]
+    assert start == pytest.approx(_T0 + 60)
+    assert end == pytest.approx(_T0 + 90)
+    assert snap["qa_open_ts"] == 0.0
+
+
+def test_qa_pause_closed_by_interrupt_string_user(tmp_path: Path) -> None:
+    """The user reply that resolves a QA pause may also be a string-content
+    user event (e.g. "[Request interrupted by user]") — same closing rule,
+    mirroring the main scan's 'any user event resolves a hanging QA'."""
+    jsonl = _write_jsonl(tmp_path / "agent-qa-interrupt.jsonl", [
+        _t_assistant(_stamp(30), qa_question=True, stop_reason="tool_use", uuid="a1"),
+        _t_user(_stamp(50), interrupt=True),
+    ])
+
+    snap = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert len(snap["qa_pauses"]) == 1
+    start, end = snap["qa_pauses"][0]
+    assert start == pytest.approx(_T0 + 30)
+    assert end == pytest.approx(_T0 + 50)
+    assert snap["qa_open_ts"] == 0.0
+
+
+def test_multiple_qa_pauses_accumulate_in_order(tmp_path: Path) -> None:
+    """Two full question→answer cycles → two closed pairs, in file order;
+    timestamps inside each pair preserve the actual wait spans."""
+    jsonl = _write_jsonl(tmp_path / "agent-qa-twice.jsonl", [
+        _t_assistant(_stamp(0), stop_reason="end_turn", uuid="a1"),
+        _t_assistant(_stamp(60), qa_question=True, stop_reason="tool_use", uuid="a2"),
+        _t_tool_result_user(_stamp(90)),
+        _t_tool_result_user(_stamp(110)),
+        _t_assistant(_stamp(200), qa_question=True, stop_reason="tool_use", uuid="a3"),
+        _t_tool_result_user(_stamp(230)),
+    ])
+
+    snap = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    pauses = snap["qa_pauses"]
+    assert len(pauses) == 2
+    assert pauses[0][0] == pytest.approx(_T0 + 60)
+    assert pauses[0][1] == pytest.approx(_T0 + 90)
+    assert pauses[1][0] == pytest.approx(_T0 + 200)
+    assert pauses[1][1] == pytest.approx(_T0 + 230)
+    assert snap["qa_open_ts"] == 0.0
+
+
+def test_unanswered_qa_sets_open_ts(tmp_path: Path) -> None:
+    """An AskUserQuestion with NO following user event (the last assistant
+    event of the jsonl) leaves no closed pair but records qa_open_ts — the
+    orchestrator extends this gap as the agent's wait time."""
+    jsonl = _write_jsonl(tmp_path / "agent-qa-open.jsonl", [
+        _t_assistant(_stamp(0), stop_reason="end_turn", uuid="a1"),
+        _t_assistant(_stamp(70), qa_question=True, stop_reason="tool_use", uuid="a2"),
+    ])
+
+    snap = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert snap["qa_pauses"] == []
+    assert snap["qa_open_ts"] == pytest.approx(_T0 + 70)
+
+
+def test_second_qa_while_paused_not_double_tracked(tmp_path: Path) -> None:
+    """A second AskUserQuestion while a pause is already open must not reset
+    the open ts — one pause stays one pause (same guard as the main scan),
+    closed once by the next user event."""
+    jsonl = _write_jsonl(tmp_path / "agent-qa-nested.jsonl", [
+        _t_assistant(_stamp(0), stop_reason="end_turn", uuid="a1"),
+        _t_assistant(_stamp(60), qa_question=True, stop_reason="tool_use", uuid="a2"),
+        _t_assistant(_stamp(80), qa_question=True, stop_reason="tool_use", uuid="a3"),
+        _t_tool_result_user(_stamp(100)),
+    ])
+
+    snap = compute_agent_snapshot(jsonl, META_NORMAL, cache_entry=None)
+
+    assert len(snap["qa_pauses"]) == 1
+    start, end = snap["qa_pauses"][0]
+    assert start == pytest.approx(_T0 + 60)   # NOT reset by the second QA at +80
+    assert end == pytest.approx(_T0 + 100)
+    assert snap["qa_open_ts"] == 0.0
+
+
+def test_time_fields_zero_for_empty_broken_or_missing_jsonl(
+    tmp_path: Path,
+) -> None:
+    """Empty file, file of unparseable lines, and a missing file (OSError
+    degradation path) all yield the zeroed time quartet — never garbage,
+    never an exception ("the hook cannot crash")."""
+    empty = tmp_path / "agent-empty-time.jsonl"
+    empty.write_text("", encoding="utf-8")  # zero lines
+    garbage = tmp_path / "agent-garbage-time.jsonl"
+    garbage.write_text("not json at all\n{broken\n", encoding="utf-8")
+    missing = tmp_path / "agent-absent-time.jsonl"
+
+    for path in (empty, garbage, missing):
+        snap = compute_agent_snapshot(path, META_NORMAL, cache_entry=None)
+        assert snap["ts_first"] == 0.0, f"path={path!r}"
+        assert snap["ts_last"] == 0.0, f"path={path!r}"
+        assert snap["qa_pauses"] == [], f"path={path!r}"
+        assert snap["qa_open_ts"] == 0.0, f"path={path!r}"
+
+
+def test_agent_cache_fields_include_time_keys() -> None:
+    """_AGENT_CACHE_FIELDS must carry the four time fields so they persist
+    across invocations — the orchestrator needs them on cache-HIT cycles
+    (live-run extension happens per render, not per re-parse)."""
+    required = {"ts_first", "ts_last", "qa_pauses", "qa_open_ts"}
+    assert required.issubset(set(_AGENT_CACHE_FIELDS)), (
+        f"_AGENT_CACHE_FIELDS missing time keys: "
+        f"{required - set(_AGENT_CACHE_FIELDS)}"
+    )
+
+
+def test_cache_miss_when_any_time_field_missing() -> None:
+    """[upgrade path] A pre-time-column cache matches the full key AND the
+    breakdown/models guards but lacks one of the four time fields → cache
+    MISS, forward re-parse rebuilds everything. Without this check each
+    agent would show degraded/stale time columns until its jsonl next
+    mutated. Same field-presence pattern as the breakdown/models guards.
+    """
+    base = {
+        "agentId": "wrong-id",
+        "status": "run",
+        "tokens_in": 111,
+        "tokens_out": 222,
+        "tokens_cached": 333,
+        "models": {"m": {"in": 1, "out": 1, "cached": 1}},
+        "description": "stale-no-time",
+        "toolUseId": "toolu_stale",
+        "last_uuid": "a0000000-0000-0000-0000-000000000004",
+        "mtime_jsonl": AGENT_OK.stat().st_mtime,
+        "mtime_meta": META_NORMAL.stat().st_mtime,
+        # sentinels: fresh rebuild values must replace every one of them
+        "ts_first": -1.0,
+        "ts_last": -2.0,
+        "qa_pauses": [[-7.0, -6.0]],
+        "qa_open_ts": -3.0,
+    }
+
+    missing_cases = ("ts_first", "ts_last", "qa_pauses", "qa_open_ts")
+    for absent in missing_cases:
+        entry = dict(base)
+        del entry[absent]
+        result = compute_agent_snapshot(
+            AGENT_OK, META_NORMAL, cache_entry=entry
+        )
+        # Fresh token totals prove the re-parse ran for EVERY absent field.
+        assert result["tokens_in"] == 150, (
+            f"cache miss expected when {absent!r} is missing"
+        )
+        # Rebuilt snapshot carries plausible rebuilt values, not sentinels.
+        assert result["ts_first"] != -1.0
+        assert result["ts_last"] != -2.0
+        assert result["qa_pauses"] != [[-7.0, -6.0]]
+        assert result["qa_open_ts"] != -3.0
+        assert isinstance(result["ts_first"], float)
+        assert isinstance(result["ts_last"], float)
+        assert isinstance(result["qa_pauses"], list)
+        assert isinstance(result["qa_open_ts"], float)
+
+
+# ---------------------------------------------------------------------------
+# _compute_agents orchestrator override
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1513,10 @@ def test_cache_hit_injects_agentid_into_returned_dict() -> None:
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime,
         "mtime_meta": META_NORMAL.stat().st_mtime,
+        "ts_first": 1000.0,
+        "ts_last": 1400.5,
+        "qa_pauses": [],
+        "qa_open_ts": 0.0,
     }
 
     result = compute_agent_snapshot(

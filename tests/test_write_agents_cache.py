@@ -40,6 +40,11 @@ def _snapshot(agent_id: str, **overrides) -> dict:
         "last_uuid": f"uuid-{agent_id}",
         "mtime_jsonl": 1.0,
         "mtime_meta": 1.0,
+        # time-segmentation fields (20260827-status-line-time-columns)
+        "ts_first": 1000.0,
+        "ts_last": 1300.0,
+        "qa_pauses": [[1100.0, 1150.0]],
+        "qa_open_ts": 0.0,
     }
     base.update(overrides)
     return base
@@ -110,6 +115,48 @@ def test_models_field_round_trips(tmp_path: Path) -> None:
     )
     # Key order survives json round-trip (dicts preserve insertion order).
     assert list(on_disk["agent-a"]["models"].keys()) == ["kimi-k3", "glm-5.3"]
+
+
+# ---------------------------------------------------------------------------
+# time-field persistence (20260827-status-line-time-columns, Task 4)
+# ---------------------------------------------------------------------------
+
+def test_time_fields_round_trip(tmp_path: Path) -> None:
+    """ts_first/ts_last/qa_pauses/qa_open_ts must persist verbatim so a
+    cache-hit cycle can still extend the live work window and split the
+    agent's wait into QA pauses without re-parsing the jsonl."""
+    cache = tmp_path / "agents_time.json"
+    agents = [
+        _snapshot(
+            "agent-a",
+            ts_first=1000.5,
+            ts_last=1400.25,
+            qa_pauses=[[1100.0, 1150.25], [1200.0, 1210.0]],
+            qa_open_ts=1350.0,
+        ),
+        _snapshot(
+            "agent-b",  # clean agent: bounded lifetime, no QA activity
+            ts_first=500.0,
+            ts_last=600.0,
+            qa_pauses=[],
+            qa_open_ts=0.0,
+        ),
+    ]
+
+    _write_agents_cache(cache, agents)
+
+    on_disk = json.loads(cache.read_text())
+    entry_a = on_disk["agent-a"]
+    assert entry_a["ts_first"] == 1000.5
+    assert entry_a["ts_last"] == 1400.25
+    # Nested float lists survive the json round-trip exactly.
+    assert entry_a["qa_pauses"] == [[1100.0, 1150.25], [1200.0, 1210.0]]
+    assert entry_a["qa_open_ts"] == 1350.0
+    entry_b = on_disk["agent-b"]
+    assert entry_b["ts_first"] == 500.0
+    assert entry_b["ts_last"] == 600.0
+    assert entry_b["qa_pauses"] == []
+    assert entry_b["qa_open_ts"] == 0.0
 
 
 # ---------------------------------------------------------------------------

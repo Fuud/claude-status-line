@@ -246,11 +246,11 @@ JSON `null` в полях времени кэша проходит presence-га
 - Modify: `status_line.py` (`_scan_agent_jsonl`, `compute_agent_snapshot`, `_AGENT_CACHE_FIELDS`)
 - Modify: `tests/test_compute_agent_snapshot.py`
 
-- [ ] написать тесты: `ts_first`/`ts_last` по событиям с ts; события без ts пропускаются; `qa_pauses` — закрытая пара [QA-assistant → user-ответ]; `qa_open_ts` — QA без ответа; пустой/битый jsonl → нули
-- [ ] написать тесты кэша: снапшот несёт четыре поля; `_AGENT_CACHE_FIELDS` включает их; до-апгрейдная запись без полей → miss и re-scan
-- [ ] прогнать — красный
-- [ ] реализовать сбор полей, прокидывание в снапшот, расширение `_AGENT_CACHE_FIELDS` и presence-гарда
-- [ ] прогнать — зелёный, до задачи 5
+- [x] написать тесты: `ts_first`/`ts_last` по событиям с ts; события без ts пропускаются; `qa_pauses` — закрытая пара [QA-assistant → user-ответ]; `qa_open_ts` — QA без ответа; пустой/битый jsonl → нули
+- [x] написать тесты кэша: снапшот несёт четыре поля; `_AGENT_CACHE_FIELDS` включает их; до-апгрейдная запись без полей → miss и re-scan
+- [x] прогнать — красный
+- [x] реализовать сбор полей, прокидывание в снапшот, расширение `_AGENT_CACHE_FIELDS` и presence-гарда
+- [x] прогнать — зелёный, до задачи 5
 
 ### Task 5: колонки work/wait/total в рендере
 
