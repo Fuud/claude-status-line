@@ -266,7 +266,7 @@ cd ~/.claude/status_line
 python3 -m pytest tests/ -v
 ```
 
-327+ tests cover: pure functions (`format_tokens`, `detect_status`,
+360+ tests cover: pure functions (`format_tokens`, `detect_status`,
 `parse_stdin`), price helpers (`provider_host`, `load_prices`,
 `price_for`, `compute_cost`, `format_cost`), I/O helpers
 (`compute_main_cum`, `compute_agent_snapshot`, `find_session_dir(s)`,
