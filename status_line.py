@@ -38,6 +38,7 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,55 @@ def format_tokens(n: int) -> str:
     # if rounding produced a value that rounds up to next integer (e.g. 9.96),
     # format as "10.0M" rather than collapsing — caller can adjust if needed
     return f"{m:.1f}M"
+
+
+# ---------------------------------------------------------------------------
+# time formatting / parsing (plan 20260827-status-line-time-columns)
+# ---------------------------------------------------------------------------
+
+def format_duration(seconds: float) -> str:
+    """Format a duration in seconds as "HH:MM:SS".
+
+    Rules:
+        hours have no upper bound ("03:45:12", "103:25:10");
+        minutes/seconds are zero-padded;
+        fractional seconds truncate toward zero (59.9s → "00:00:59");
+        negative input clamps to "00:00:00" (defensive — wait is already
+        clamped upstream).
+    """
+    if seconds < 0:
+        seconds = 0
+    total = int(seconds)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _parse_ts(value: Any) -> float | None:
+    """Parse an ISO 8601 timestamp string into a POSIX epoch float.
+
+    - a trailing "Z" is replaced with "+00:00" by hand (Python 3.9's
+      datetime.fromisoformat does not accept "Z").
+    - naive timestamps are assumed UTC (the status line runs on machines
+      with arbitrary local zones; session jsonl stamps are UTC).
+    - anything unparseable (garbage, None, empty, non-string) returns None —
+      the caller silently skips such events for time purposes.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 # ---------------------------------------------------------------------------
