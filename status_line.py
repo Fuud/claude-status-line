@@ -718,6 +718,30 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
             Key order follows first appearance in the scan. `cached` is
             cache_read only — cache_creation is never surfaced, matching
             the cached-column semantics of every other row.
+        time_first_ts — epoch seconds of the FIRST event carrying a
+            parseable timestamp, of ANY type (mode/system/snapshot events
+            count); 0.0 when no event has one. Anchors the session's
+            "total" wall-clock column downstream.
+        time_turns — list (one entry per TURN) of lists of [start, end]
+            epoch sub-intervals. Turns are keyed on "real" user events
+            (type=user, message.content a string — prompts, commands,
+            interrupts); list-content user events (tool_results) are
+            activity inside the current turn, not boundaries. A turn spans
+            [prompt → last activity]; an AskUserQuestion pause
+            ([QA-assistant → next user event of any kind]) cuts it into
+            sub-intervals, and an UNANSWERED QA trims the tail at the
+            question moment. A turn without any activity degrades to its
+            [[u, u]] degenerate marker (union_work drops those later).
+            Activity before the first real prompt turns into nothing.
+            Events without a parseable ts, stamped queue-operation /
+            system / snapshot events do not extend or open turns.
+        time_open — whether the LAST, still-live turn should be extended
+            to now by the orchestrator ("live-now"). True when the turn
+            ended with an assistant stop_reason in {tool_use, pause_turn},
+            with trailing tool_results, or holds a real prompt with no
+            assistant response yet. An unresolved AskUserQuestion or an
+            interrupt forces False. Only the final turn is evaluated —
+            historical turns' geometry is recorded as-is.
 
     [deviation vs the pre-model-columns scan] The flat cum_in / cum_out /
     cum_cache_create / cum_cache_read sums were removed together with the
@@ -736,7 +760,166 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
     last_uuid = ""
     seen_first_usage = False
 
+    # ---- time segmentation state (plan 20260827-status-line-time-columns) ----
+    time_first_ts = 0.0
+    time_turns: list[list[list[float]]] = []
+    time_open = False
+    turn_anchor: float | None = None      # opening real-user-event ts, or None
+    turn_is_interrupt = False             # current turn was opened by an interrupt
+    turn_has_assistant = False            # an assistant event landed in this turn
+    turn_trailing_tool_results = False    # last registered activity was a tool_result
+    turn_last_stop: str | None = None     # last assistant stop_reason this turn
+    cur_subints: list[list[float]] = []   # sub-intervals of the live turn
+    chunk_start: float | None = None      # live work-chunk [chunk_start, chunk_end]
+    chunk_end: float | None = None        # (None end ⇒ no activity since the anchor)
+    qa_open_ts: float | None = None       # unresolved AskUserQuestion question ts
+
+    def _flush_chunk() -> None:
+        """Fold the live work chunk into the turn's sub-intervals; a chunk
+        that never saw activity degrades to its degenerate [[u, u]] marker."""
+        nonlocal chunk_start, chunk_end
+        if chunk_start is None:
+            return
+        cur_subints.append(
+            [chunk_start, chunk_end if chunk_end is not None else chunk_start]
+        )
+        chunk_start = chunk_end = None
+
+    def _close_current_turn() -> None:
+        """Finalize the live turn's geometry and park it in time_turns."""
+        nonlocal cur_subints, turn_anchor
+        nonlocal turn_is_interrupt, turn_has_assistant
+        nonlocal turn_trailing_tool_results, turn_last_stop
+        if turn_anchor is None:
+            return
+        _flush_chunk()
+        time_turns.append(cur_subints)
+        cur_subints = []
+        turn_anchor = None
+        turn_is_interrupt = False
+        turn_has_assistant = False
+        turn_trailing_tool_results = False
+        turn_last_stop = None
+
+    def _live_turn_is_open() -> bool:
+        """Verdict for the LAST, still-live turn only ('live-now'): historical
+        turns are never consulted — their geometry is already recorded."""
+        if turn_anchor is None:
+            return False
+        if qa_open_ts is not None:
+            # an unanswered AskUserQuestion is waiting on the human — the gap
+            # grows as wait, not as work
+            return False
+        if not turn_has_assistant:
+            # prompt with no response yet stays open; the dead air after an
+            # interrupt does not
+            return not turn_is_interrupt
+        if turn_trailing_tool_results:
+            return True
+        return turn_last_stop in ("tool_use", "pause_turn")
+
+    def _seg_apply(event: dict, ts: float) -> None:
+        """Feed one stamped event into the segmentation machine (the event
+        is guaranteed anchored: a real prompt has already been seen)."""
+        nonlocal turn_is_interrupt, turn_has_assistant
+        nonlocal turn_trailing_tool_results, turn_last_stop
+        nonlocal chunk_start, chunk_end, qa_open_ts, turn_anchor
+        nonlocal cur_subints
+
+        etype = event.get("type")
+        message = event.get("message")
+        msg_dict = message if isinstance(message, dict) else {}
+
+        # Dormant before the first real prompt — activity there turns into
+        # nothing; only string-content user events matter pre-anchor, since
+        # they are the boundaries that open the first turn.
+        if turn_anchor is None and not (
+            etype == "user"
+            and isinstance(msg_dict.get("content"), str)
+        ):
+            return
+
+        if etype == "user":
+            content = msg_dict.get("content")
+            if isinstance(content, str):
+                # REAL boundary: prompts/commands/interrupts close the current
+                # turn and open the next one.
+                qa_open_ts = None  # any user event resolves a hanging QA pause;
+                # the just-resumed window would die at the boundary anyway
+                _close_current_turn()
+                turn_anchor = ts
+                turn_is_interrupt = _content_contains_marker(
+                    content, _INTERRUPT_MARKER
+                )
+                cur_subints = []
+                chunk_start, chunk_end = ts, None
+                turn_has_assistant = False
+                turn_trailing_tool_results = False
+                turn_last_stop = None
+                return
+            # list-content user event — a tool_result: activity (and the QA
+            # pause resolver, being "a user event of any kind").
+            if qa_open_ts is not None:
+                # pause ends here; work resumes FROM this stroke
+                qa_open_ts = None
+                chunk_start, chunk_end = ts, ts
+            elif chunk_start is None:
+                chunk_start, chunk_end = ts, ts
+            elif chunk_end is None or ts > chunk_end:
+                # chunk_end None ⇒ open chunk since the anchor: this is its
+                # first registered activity
+                chunk_end = ts
+            turn_trailing_tool_results = True
+            return
+
+        if etype != "assistant":
+            # queue-operation / system / snapshot events never extend a turn
+            # (a background-agent notification must not shift waiting into
+            # work), even when they carry a timestamp
+            return
+
+        if qa_open_ts is not None:
+            return  # frozen inside an unresolved AskUserQuestion pause
+
+        if isinstance(msg_dict.get("content"), list):
+            for block in msg_dict["content"]:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == "AskUserQuestion"
+                    and qa_open_ts is None
+                ):
+                    # cut the turn AT the question moment: everything elapsed
+                    # up to now is work; nothing accrues until a user event
+                    # answers the pause
+                    if chunk_start is None:
+                        chunk_start = ts
+                    cur_subints.append([chunk_start, ts])
+                    chunk_start = chunk_end = None
+                    qa_open_ts = ts
+                    return
+
+        # ordinary assistant activity
+        if chunk_start is None:
+            chunk_start, chunk_end = ts, ts
+        elif chunk_end is None or ts > chunk_end:
+            # chunk_end None ⇒ open chunk since the anchor: first activity
+            chunk_end = ts
+        turn_has_assistant = True
+        turn_trailing_tool_results = False
+        stop = msg_dict.get("stop_reason")
+        turn_last_stop = stop if isinstance(stop, str) else None
+
     for index, event in _iter_events(jsonl_path):
+        # --- timestamp probe: any typed event's first stamp anchors total;
+        # --- everything else ignores unstamped events entirely (the machine
+        # --- itself stays dormant until the first real prompt).
+        seg_ts = _parse_ts(event.get("timestamp"))
+        if seg_ts is not None:
+            if time_first_ts == 0.0:
+                time_first_ts = seg_ts
+            _seg_apply(event, seg_ts)
+
         if event.get("type") == "assistant":
             # record uuid for this assistant event
             uuid = event.get("uuid")
@@ -807,6 +990,11 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
                 # last-wins on duplicate task-id (resume scenario)
                 task_notifications[m_id.group(1)] = mapped
 
+    # End of scan: judge the still-live turn ("live-now"), then park its
+    # geometry alongside the historical turns.
+    time_open = _live_turn_is_open()
+    _close_current_turn()
+
     return {
         "start_in": start_in,
         "start_out": start_out,
@@ -817,6 +1005,9 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
         "last_uuid": last_uuid,
         "task_notifications": task_notifications,
         "per_model": per_model,
+        "time_first_ts": time_first_ts,
+        "time_turns": time_turns,
+        "time_open": time_open,
     }
 
 
@@ -863,6 +1054,9 @@ _EMPTY_MAIN_RESULT: dict = {
     "tool_use_positions": {},
     "task_notifications": {},
     "per_model": {},
+    "time_first_ts": 0.0,
+    "time_turns": [],
+    "time_open": False,
 }
 
 
@@ -882,7 +1076,12 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     Returns a dict with keys:
         start_in, start_out, start_cached, context_tokens,
         last_uuid, mtime_jsonl, tool_use_positions, task_notifications,
-        per_model
+        per_model, time_first_ts, time_turns, time_open
+
+    The three time_* fields carry the main-scan's time segmentation (see
+    _scan_main_jsonl): the session wall-clock anchor, the per-turn work
+    sub-intervals, and whether the last live turn should be extended to
+    now by the orchestrator.
 
     context_tokens is the context-window occupancy at the LAST assistant
     event (input + cache_creation + cache_read) — the header's "Context:"
@@ -913,6 +1112,12 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     pre-model-column caches lack it and would render empty model/cost
     columns for one cycle after upgrade. Same field-presence guard pattern
     as the context_tokens / start_* checks above.
+
+    [deviation] Cache hit likewise requires the three time-segmentation
+    fields (time_first_ts / time_turns / time_open) to be present: pre-
+    time-column caches lack them and would render empty time columns for
+    one cycle after upgrade. Same field-presence guard pattern as the
+    per_model check above.
 
     per_model is the per-model token breakdown feeding the table's model
     and cost columns (see _scan_main_jsonl for the accumulation rules).
@@ -947,9 +1152,9 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     mtime_jsonl = _jsonl_mtime(jsonl_path)
 
     # Cache hit? Both last_uuid AND mtime_jsonl must match — otherwise stale.
-    # `context_tokens`, the `start_*` fields and `per_model` presence are
-    # part of the hit check (see [deviation]s in the docstring): pre-upgrade
-    # caches lack them.
+    # `context_tokens`, the `start_*` fields, `per_model` and the three
+    # time-segmentation fields' presence are part of the hit check (see
+    # [deviation]s in the docstring): pre-upgrade caches lack them.
     if (
         cache is not None
         and scan["last_uuid"]
@@ -961,6 +1166,9 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
             for f in ("start_in", "start_out", "start_cached", "start_model")
         )
         and "per_model" in cache
+        and all(
+            f in cache for f in ("time_first_ts", "time_turns", "time_open")
+        )
     ):
         return cache
 

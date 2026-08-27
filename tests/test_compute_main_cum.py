@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from status_line import compute_main_cum
+from status_line import _parse_ts, compute_main_cum
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -64,6 +64,8 @@ def _write_main_cache(
     to 0/"" — PRESENT
     (possibly zero) fields; the cache-hit guard checks presence, not value.
     Same for `per_model` (defaults to a present-but-arbitrary dict).
+    The three time_* fields are also always PRESENT (post-time-columns
+    shape) so the seeded entry passes every presence guard and hits.
     `mtime_jsonl=None` reads the current MAIN_NORMAL mtime so the cache hit
     succeeds (compute_main_cum's cache key is `(last_uuid, mtime_jsonl)`).
     `extra` merges additional (legacy) keys into the payload — used to
@@ -82,6 +84,9 @@ def _write_main_cache(
         "mtime_jsonl": mtime_jsonl,
         "tool_use_positions": {},
         "per_model": per_model if per_model is not None else {"sentinel-model": {"in": 1, "out": 2, "cached": 3}},
+        "time_first_ts": 0.0,
+        "time_turns": [],
+        "time_open": False,
     }
     if total is not None:
         payload["total"] = total
@@ -222,6 +227,11 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
         "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
         "tool_use_positions": sentinel_positions,
         "per_model": sentinel_per_model,
+        # post-time-columns shape — present fields pass the guard; values are
+        # inert here (nothing else is asserted about them)
+        "time_first_ts": 0.0,
+        "time_turns": [],
+        "time_open": False,
     }
     cache.write_text(json.dumps(cached))
 
@@ -446,6 +456,10 @@ def test_cache_hit_preserves_task_notifications(tmp_path: Path) -> None:
         "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
         "task_notifications": {"sentinel-agent": "ok"},
         "per_model": {"sentinel-model": {"in": 1, "out": 1, "cached": 1}},
+        # post-time-columns shape — passes the presence guard
+        "time_first_ts": 0.0,
+        "time_turns": [],
+        "time_open": False,
     }
     cache.write_text(json.dumps(cached))
 
@@ -1015,6 +1029,117 @@ def test_missing_jsonl_per_model_empty(tmp_path: Path) -> None:
 
     assert result["per_model"] == {}
     assert isinstance(result["per_model"], dict)
+
+
+# ---------------------------------------------------------------------------
+# time_* fields (plan 20260827-status-line-time-columns, Task 3)
+# ---------------------------------------------------------------------------
+
+def test_cache_hit_requires_time_fields(tmp_path: Path) -> None:
+    """Pre-upgrade cache shape: both key parts match AND context_tokens,
+    start_*, per_model are all present, but the three time fields
+    (time_first_ts / time_turns / time_open) are missing. The presence
+    guard must treat it as a MISS and recompute — else the session would
+    render empty time columns for one cycle after upgrade. Same guard
+    pattern as the per_model check above."""
+    cache = tmp_path / "main_old_schema_no_time.json"
+    cached = {
+        "start_in": 100,
+        "start_out": 30,
+        "start_cached": 200,
+        "start_model": "claude-opus-4-1",
+        "context_tokens": 1050,
+        "last_uuid": MAIN_NORMAL_LAST_UUID,
+        "mtime_jsonl": MAIN_NORMAL.stat().st_mtime,
+        "tool_use_positions": {},
+        "task_notifications": {},
+        "per_model": {"sentinel-model": {"in": 111, "out": 222, "cached": 333}},
+        # time_first_ts / time_turns / time_open intentionally ABSENT
+    }
+    cache.write_text(json.dumps(cached))
+
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    # Recomputed from main_normal.jsonl: its first TOP-LEVEL stamped event is
+    # the first user prompt at 2026-08-24T10:00:01.000Z (the leading
+    # file-history-snapshot carries its stamp NESTED inside the snapshot
+    # object, which the anchor does not see); the stale sentinel per_model
+    # is replaced by the real breakdown.
+    expected_first = _parse_ts("2026-08-24T10:00:01.000Z")
+    assert result["time_first_ts"] == expected_first
+    assert isinstance(result["time_turns"], list) and result["time_turns"]
+    assert isinstance(result["time_open"], bool)
+    assert result["per_model"] == {
+        "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
+    }
+    # Cache rewritten in the new shape.
+    on_disk = json.loads(cache.read_text())
+    assert on_disk["time_first_ts"] == expected_first
+
+
+def test_cache_hit_returns_time_fields_verbatim(tmp_path: Path) -> None:
+    """A cache entry carrying all three time fields passes the guard and
+    comes back verbatim (sentinel values the scan could never produce)."""
+    cache = tmp_path / "main_hit_time.json"
+    sentinel_first_ts = 1_234_567.5
+    sentinel_turns = [[[1.5, 2.5], [3.5, 4.5]], [[9.0, 9.0]]]
+    cached = {
+        "start_in": 0,
+        "start_out": 0,
+        "start_cached": 0,
+        "start_model": "",
+        "context_tokens": 1050,
+        "last_uuid": MAIN_NORMAL_LAST_UUID,
+        "mtime_jsonl": MAIN_NORMAL.stat().st_mtime,
+        "tool_use_positions": {},
+        "task_notifications": {},
+        "per_model": {"sentinel-model": {"in": 1, "out": 2, "cached": 3}},
+        "time_first_ts": sentinel_first_ts,
+        "time_turns": sentinel_turns,
+        "time_open": True,
+    }
+    cache.write_text(json.dumps(cached))
+
+    result = compute_main_cum(MAIN_NORMAL, cache)
+
+    assert result["time_first_ts"] == sentinel_first_ts
+    assert result["time_turns"] == sentinel_turns
+    assert result["time_open"] is True
+
+
+def test_time_fields_persisted_to_cache(tmp_path: Path) -> None:
+    """Fresh compute persists the three time fields to the cache file; a
+    second call hits the cache and returns them unchanged."""
+    cache = tmp_path / "main_time_disk.json"
+    first = compute_main_cum(MAIN_NORMAL, cache)
+
+    expected_first = _parse_ts("2026-08-24T10:00:01.000Z")
+    assert first["time_first_ts"] == expected_first
+
+    on_disk = json.loads(cache.read_text())
+    assert "time_first_ts" in on_disk
+    assert "time_turns" in on_disk
+    assert "time_open" in on_disk
+    assert on_disk["time_first_ts"] == expected_first
+
+    second = compute_main_cum(MAIN_NORMAL, cache)  # cache hit
+    assert second["time_first_ts"] == expected_first
+    assert second["time_turns"] == first["time_turns"]
+    assert second["time_open"] == first["time_open"]
+
+
+def test_empty_main_result_carries_time_defaults(tmp_path: Path) -> None:
+    """The _EMPTY_MAIN_RESULT copy (missing-jsonl path) must carry the time
+    defaults: anchor 0.0, no turns, not open — the render/orchestrator side
+    degrades to empty cells rather than crashing or showing zeros."""
+    jsonl = tmp_path / "does_not_exist.jsonl"
+    cache = tmp_path / "main_time_missing.json"
+
+    result = compute_main_cum(jsonl, cache)
+
+    assert result["time_first_ts"] == 0.0
+    assert result["time_turns"] == []
+    assert result["time_open"] is False
 
 
 # ---------------------------------------------------------------------------

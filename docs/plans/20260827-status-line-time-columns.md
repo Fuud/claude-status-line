@@ -233,11 +233,11 @@ JSON `null` в полях времени кэша проходит presence-га
 - Create: `tests/test_time_segmentation.py`
 - Modify: `tests/test_compute_main_cum.py`
 
-- [ ] написать тесты сегментации на синтетических jsonl (через `_scan_main_jsonl`): один ход; несколько ходов с паузами между ними; interrupt-событие закрывает ход; открытый ход (`stop_reason=tool_use` И `pause_turn` → `time_open=True`); закрытый (`end_turn`; плюс `stop_sequence` — второй по частоте в реальных данных); trailing tool_result'ы держат ход открытым; QA-пауза расщепляет подынтервалы; открытая QA → `time_open=False`, подынтервалы обрезаны; события без ts и trailing `queue-operation` не продлевают ход; активность до первого промпта игнорируется; пустой jsonl → нули/пустота
-- [ ] написать тесты кэша: до-апгрейдный `main_<sid>.json` без полелей времени → rescan и rewrite; hit возвращает `time_*`-поля
-- [ ] прогнать — красный
-- [ ] реализовать сбор `time_first_ts`/`time_turns`/`time_open` в скане; расширить `_EMPTY_MAIN_RESULT`; добавить presence-гард в cache-hit `compute_main_cum`
-- [ ] прогнать — зелёный, до задачи 4
+- [x] написать тесты сегментации на синтетических jsonl (через `_scan_main_jsonl`): один ход; несколько ходов с паузами между ними; interrupt-событие закрывает ход; открытый ход (`stop_reason=tool_use` И `pause_turn` → `time_open=True`); закрытый (`end_turn`; плюс `stop_sequence` — второй по частоте в реальных данных); trailing tool_result'ы держат ход открытым; QA-пауза расщепляет подынтервалы; открытая QA → `time_open=False`, подынтервалы обрезаны; события без ts и trailing `queue-operation` не продлевают ход; активность до первого промпта игнорируется; пустой jsonl → нули/пустота
+- [x] написать тесты кэша: до-апгрейдный `main_<sid>.json` без полелей времени → rescan и rewrite; hit возвращает `time_*`-поля
+- [x] прогнать — красный
+- [x] реализовать сбор `time_first_ts`/`time_turns`/`time_open` в скане; расширить `_EMPTY_MAIN_RESULT`; добавить presence-гард в cache-hit `compute_main_cum`
+- [x] прогнать — зелёный, до задачи 4
 
 ### Task 4: временные поля агент-скана + agents-кэш
 
