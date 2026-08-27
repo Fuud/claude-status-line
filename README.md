@@ -14,30 +14,31 @@ row per model:
 
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
-|                                      model            in     out  cached  cost
+|                                      model            in     out  cached  cost              work     wait    total
 | start:                               glm-5.3         12K      1K       0  10.7 credits
-| sum:                                 glm-5.3        1.1M     34K   50.8M  9.5K credits
+| sum:                                 glm-5.3        1.1M     34K   50.8M  9.5K credits  28:03:20 00:08:20 28:11:40
 |                                      kimi-k3        150K     40K    3.0M  $1.9
 |                                      MiniMax-M3      500     200      3K   n/a
-| main:                                glm-5.3        1.1M     30K   50.7M  9.4K credits
+| main:                                glm-5.3        1.1M     30K   50.7M  9.4K credits  28:03:20 00:08:20 28:11:40
 |                                      kimi-k3        150K     40K    3.0M  $1.9
-| [ok]    Review: implementation plan  glm-5.3         12K      4K    100K  34.9 credits
-| [err]   Review: quality              MiniMax-M3      500     200      3K   n/a
-| [run]   Task 4: MissingGlyphLog                        0       0       0
+| [ok]    Review: implementation plan  glm-5.3         12K      4K    100K  34.9 credits  01:12:30 00:03:00 01:15:30
+| [err]   Review: quality              MiniMax-M3      500     200      3K   n/a          00:26:40 00:05:00 00:31:40
+| [run]   Task 4: MissingGlyphLog                        0       0       0                00:02:04 00:00:00 00:02:04
 ```
 
-Without `prices.json` both columns disappear and each group renders a
-single totals row — the exact pre-cost layout:
+Without `prices.json` both columns disappear, each group renders a single
+totals row — but the always-visible `work / wait / total` time columns
+stay:
 
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
-|                                           in     out  cached
+|                                           in     out  cached      work     wait    total
 | start:                                   12K      1K       0
-| sum:                                    1.3M     74K   53.8M
-| main:                                   1.2M     70K   53.7M
-| [ok]    Review: implementation plan      12K      4K    100K
-| [err]   Review: quality                  500     200      3K
-| [run]   Task 4: MissingGlyphLog            0       0       0
+| sum:                                    1.3M     74K   53.8M  28:03:20 00:08:20 28:11:40
+| main:                                   1.2M     70K   53.7M  28:03:20 00:08:20 28:11:40
+| [ok]    Review: implementation plan      12K      4K    100K  01:12:30 00:03:00 01:15:30
+| [err]   Review: quality                  500     200      3K  00:26:40 00:05:00 00:31:40
+| [run]   Task 4: MissingGlyphLog            0       0       0  00:02:04 00:00:00 00:02:04
 ```
 
 Line layout:

@@ -259,11 +259,11 @@ JSON `null` в полях времени кэша проходит presence-га
 - Modify: `status_line.py` (`_time_columns`, `render_output`, `_group_model_rows`, `_token_columns`)
 - Modify: `tests/test_render_output.py`
 
-- [ ] написать тесты: колонки есть в обоих режимах (labels `work`/`wait`/`total`, right-align, floor 8); prices-режим — после units, plain — после cached; `start:` — пустые ячейки; `main_time` рендерится в `sum:`/`main:`; агент без полелей времени → пустые ячейки; агент с `time_*` → значения на первой строке группы, продолжения per-model пустые; None-значения → пустые ячейки (не `00:00:00`); формат `HH:MM:SS`
-- [ ] прогнать — красный
-- [ ] реализовать `_time_columns`, параметр `main_time` у `render_output`, временные ячейки в `_group_model_rows` (только первая строка группы)
-- [ ] обновить устаревающие докстринги: модульный (обещание «prices=None байт-в-байт как раньше»), `render_output` («Layout with prices=None is byte-identical…»), `_token_columns` («the plain single space when nothing follows») — с пометкой `[deviation]` по конвенции репо
-- [ ] прогнать — зелёный, до задачи 6
+- [x] написать тесты: колонки есть в обоих режимах (labels `work`/`wait`/`total`, right-align, floor 8); prices-режим — после units, plain — после cached; `start:` — пустые ячейки; `main_time` рендерится в `sum:`/`main:`; агент без полелей времени → пустые ячейки; агент с `time_*` → значения на первой строке группы, продолжения per-model пустые; None-значения → пустые ячейки (не `00:00:00`); формат `HH:MM:SS`
+- [x] прогнать — красный
+- [x] реализовать `_time_columns`, параметр `main_time` у `render_output`, временные ячейки в `_group_model_rows` (только первая строка группы)
+- [x] обновить устаревающие докстринги: модульный (обещание «prices=None байт-в-байт как раньше»), `render_output` («Layout with prices=None is byte-identical…»), `_token_columns` («the plain single space when nothing follows») — с пометкой `[deviation]` по конвенции репо
+- [x] прогнать — зелёный, до задачи 6
 
 ### Task 6: оркестратор + интеграция
 

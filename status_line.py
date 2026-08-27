@@ -14,13 +14,18 @@ Module-level invariants:
   plus the `models` per-model breakdown) — not the last event's usage
   (agreed behavior change, plan 20260826-status-line-model-cost-columns).
 - render_output renders the model/cost columns only when a prices dict
-  is passed: prices=None reproduces the pre-model-columns layout
-  byte-for-byte (one row per group, group totals). With prices, every
-  group (sum/main/agent) expands to one row per model in first-appearance
-  order; zero-token per-model records are skipped and a group left empty
-  renders ONE zero row with an empty model cell (groups are never
-  skipped). The start row is a reference row and never carries
-  model/cost cells.
+  is passed. [deviation] The "prices=None reproduces the pre-model-columns
+  layout byte-for-byte" promise ended with the always-visible time columns
+  (plan 20260827-status-line-time-columns): BOTH layouts now close every
+  row with the three work/wait/total duration cells after the token/cost
+  block. Without time data (no main_time argument, no transient time_*
+  fields on an agent) those cells render EMPTY — a legacy direct call
+  keeps the row structure (one row per group, group totals) and only
+  gains the header labels. With prices, every group (sum/main/agent)
+  expands to one row per model in first-appearance order; zero-token
+  per-model records are skipped and a group left empty renders ONE zero
+  row with an empty model cell (groups are never skipped). The start row
+  is a reference row and never carries model/cost or time cells.
 - The orchestrator override in _compute_agents may additionally set
   agent.status="kill" when a main-log queue-operation task-notification with
   <status>killed</status> is present and the compute_agent_snapshot verdict
@@ -1800,6 +1805,10 @@ def sort_agents(
 # format_tokens (e.g. "999.5K", "1.2M" → 5 chars max, plus a small
 # safety margin).
 _TOKEN_COLUMN_WIDTH = 7
+# Floor for the work/wait/total duration columns ("HH:MM:SS" is exactly
+# 8 characters and the labels are shorter, so typical sessions never widen
+# them; plan 20260827-status-line-time-columns).
+_TIME_COLUMN_FLOOR = 8
 # Gap between the status tag and the description column (2 spaces).
 _STATUS_GAP = "  "
 # Gap between the description column and the token column (2 spaces).
@@ -1955,9 +1964,14 @@ def _merge_models(sources: list) -> dict:
 
 
 def _group_model_rows(
-    label: str, models: dict | None, prices: dict | None, host: str
+    label: str,
+    models: dict | None,
+    prices: dict | None,
+    host: str,
+    time_cells: list[str] | None = None,
 ) -> list:
-    """Wide rows (label, model, in, out, cached, cost, units) for one group.
+    """Wide rows (label, model, in, out, cached, cost, units, work/wait/
+    total) for one group.
 
     One row per model in first-appearance order; per-model records whose
     tokens are ALL zero (e.g. <synthetic>) are skipped entirely. The
@@ -1966,11 +1980,22 @@ def _group_model_rows(
     model cell — groups are never skipped (the "agents never skipped"
     invariant, extended to main and sum).
 
+    `time_cells` — the group's THREE pre-formatted work/wait/total cells;
+    they ride ONLY the FIRST row of the group too (continuation per-model
+    rows carry empty cells), mirroring the single-label rule: a group is
+    one logical entity whose durations are session/group-wide, not
+    per-model quantities. Zero-fallback rows are first rows and keep the
+    cells.
+
     Records are coerced ONCE via _coerce_record (the untrusted-cache
     boundary) and the coerced values are what both the token cells and
     the cost cell consume — a None/non-numeric field must not raise from
     compute_cost.
     """
+    if time_cells is None or len(time_cells) != 3:
+        time_cells = ["", "", ""]
+    else:
+        time_cells = list(time_cells)
     rows: list = []
     for model, rec in (models or {}).items():
         coerced = _coerce_record(rec)
@@ -1988,11 +2013,13 @@ def _group_model_rows(
                 format_tokens(coerced["cached"]),
                 cost_cell,
                 units_cell,
+                *time_cells,
             ]
         )
         label = ""
+        time_cells = ["", "", ""]
     if not rows:
-        rows.append([label, "", "0", "0", "0", "", ""])
+        rows.append([label, "", "0", "0", "0", "", "", *time_cells])
     return rows
 
 
@@ -2000,10 +2027,13 @@ def _token_columns(cached_gap: str) -> list[dict]:
     """The in/out/cached column specs shared by both render_output layouts.
 
     All three are right-aligned with the _TOKEN_COLUMN_WIDTH floor;
-    `cached_gap` separates the token block from whatever follows it —
-    the plain single space when nothing follows (the prices=None layout,
-    matching render_table's default) and _DESC_TOKEN_GAP when the cost
-    column follows (the prices layout).
+    `cached_gap` separates the token block from whatever follows it.
+    [deviation] Since the always-visible time columns (plan
+    20260827-status-line-time-columns) there IS no "nothing follows"
+    layout anymore — the cost column follows `cached` in prices mode and
+    the work column in plain mode, so every caller passes
+    _DESC_TOKEN_GAP. The parameter survives so both column-spec helpers
+    stay symmetrical and each layout states its separator exactly once.
     """
     return [
         {
@@ -2027,6 +2057,48 @@ def _token_columns(cached_gap: str) -> list[dict]:
     ]
 
 
+def _time_columns() -> list[dict]:
+    """The work/wait/total duration-column specs shared by both
+    render_output layouts (plan 20260827-status-line-time-columns).
+
+    All three are right-aligned with the _TIME_COLUMN_FLOOR=8 floor
+    ("HH:MM:SS" fills it exactly), separated by single spaces inside the
+    block. The WIDE separator marking the block off from whatever
+    precedes it is NOT carried here: render_table renders every column's
+    gap AFTER it (see how cached_gap closes the token block), so the
+    caller puts _DESC_TOKEN_GAP on the last content column before this
+    block — the `cached` column in the plain layout, the unlabeled units
+    column in the prices layout.
+    """
+    return [
+        {"label": "work", "align": "right", "floor": _TIME_COLUMN_FLOOR,
+         "gap": " "},
+        {"label": "wait", "align": "right", "floor": _TIME_COLUMN_FLOOR,
+         "gap": " "},
+        {"label": "total", "align": "right", "floor": _TIME_COLUMN_FLOOR,
+         "gap": " "},
+    ]
+
+
+def _time_row_cells(*durations: object) -> list[str]:
+    """The three work/wait/total CELLS for one table row.
+
+    Each input may be numeric seconds (→ format_duration — fractional
+    values truncate inside), or anything else (None / mis-typed junk →
+    ""). Missing data degrades to an EMPTY cell, never to "00:00:00":
+    absent timestamps mean unknown elapsed time, not zero. The loose
+    object contract mirrors _coerce_record — agent dicts arrive through
+    untrusted cache reads, so one garbage field blanks its cell instead
+    of raising out of the render.
+    """
+    return [
+        format_duration(d)
+        if isinstance(d, (int, float)) and not isinstance(d, bool)
+        else ""
+        for d in durations
+    ]
+
+
 def render_output(
     header: str,
     start_in: int,
@@ -2037,23 +2109,29 @@ def render_output(
     prices: dict | None = None,
     host: str = "",
     start_model: str = "",
+    main_time: Any = None,
 ) -> str:
     """Build the multi-line status line string with a tabular breakdown.
 
     Layout with prices (the model + cost columns are shown):
         <header>
-        | <table header — labels "model"/"in"/"out"/"cached"/"cost";
-          the label/description column's label is EMPTY>
-        | start: <model> <in> <out> <cached> <cost>
-        | sum:   <model> <in> <out> <cached> <cost>   # only if agents
-        | main:  <model> <in> <out> <cached> <cost>
+        | <table header — labels "model"/"in"/"out"/"cached"/"cost"
+          followed by the always-visible work/wait/total block; the
+          label/description column's label is EMPTY>
+        | start: <model> <in> <out> <cached> <cost>   # time cells empty
+        | sum:   <model> <in> <out> <cached> <cost> work wait total
+        | main:  <model> <in> <out> <cached> <cost> work wait total
         | for each agent (in input order):
-              [<status>]  <description>  <model> <in> <out> <cached> <cost>
+              [<status>]  <description>  <model> <in> <out> <cached>
+              <cost> work wait total
 
-    Layout with prices=None is byte-identical to the pre-model-columns
-    render: NO model and NO cost columns, one row per group carrying the
-    group's totals (backward-compatibility requirement — a missing
-    prices.json must not change the table's shape).
+    [deviation] With prices=None the layout is NO LONGER byte-identical
+    to the pre-model-columns render (that promise held until the
+    time columns arrived, plan 20260827-status-line-time-columns): there
+    are still NO model/cost columns and one row per group carrying the
+    group's totals, but the three ALWAYS-VISIBLE work/wait/total columns
+    close every row (empty cells unless time data exists). A missing
+    prices.json still does not change the table's ROW shape.
 
     main_models is the per-model breakdown {model_id: {"in","out","cached"}}
     (see _scan_main_jsonl); the main row's totals are the sum of its
@@ -2061,6 +2139,18 @@ def render_output(
     string — the orchestrator wires both (see _main_unsafe); the model
     column sits between the description and `in` (left-aligned), the cost
     column after `cached` (right-aligned).
+
+    main_time is the SESSION's (work_sec, wait_sec, total_sec) union
+    triple; by construction it renders IDENTICALLY on the sum: and main:
+    rows (waiting on agents already counts as main's work). Cells go
+    through _time_row_cells: numeric seconds → "HH:MM:SS", None/junk →
+    "" (degraded data shows blanks, never "00:00:00"). Anything other
+    than a length-3 sequence degrades to ALL-empty. Passing nothing (a
+    legacy direct call / pre-upgrade pipeline stage) leaves every session
+    time cell blank. Agents carry their own transient time_work/
+    time_wait/time_total keys (injected post-cache-write by _main_unsafe)
+    rendered the same way on the group's FIRST row only; `start:` keeps
+    empty time cells unconditionally.
 
     Groups with prices: sum (per-model merge of main_models and every
     agent's `models`, NO cross-model sums, model order = first appearance
@@ -2084,10 +2174,22 @@ def render_output(
     All padding/alignment is delegated to render_table; the label column
     (label/description/icon) is left-aligned with floor
     _LABEL_COL_FLOOR, token columns right-aligned with floor
-    _TOKEN_COLUMN_WIDTH. Description is truncated to 40 chars with
+    _TOKEN_COLUMN_WIDTH, duration columns right-aligned with floor
+    _TIME_COLUMN_FLOOR. Description is truncated to 40 chars with
     U+2026 (re-applied defensively). Defensive _to_int / isinstance
     handling covers pre-upgrade caches and hand-corrupted cache files.
     """
+    # The session triple normalizes to three pre-formatted cells ONCE —
+    # sum/main/agent-free branches reuse them without re-coercing. A
+    # non-sequence or wrong-arity argument degrades to all-empty cells
+    # (strict-triple contract, defensive against mis-shaped callers).
+    normalized_time: list = (
+        list(main_time) if isinstance(main_time, (list, tuple)) else []
+    )
+    if len(normalized_time) != 3:
+        normalized_time = [None, None, None]
+    session_cells = _time_row_cells(*normalized_time)
+
     # 1. Project agents into render-ready rows: the group label (icon +
     # status gap + truncated description — only the group's FIRST row
     # shows it), the flat totals (prices=None path), and the per-model
@@ -2111,6 +2213,11 @@ def render_output(
                 "out": _to_int(a.get("tokens_out")),
                 "cached": _to_int(a.get("tokens_cached")),
                 "models": models if isinstance(models, dict) else {},
+                # Transient agent durations (None/missing → "") — NOT part
+                # of the persisted cache shape.
+                "time": _time_row_cells(
+                    a.get("time_work"), a.get("time_wait"), a.get("time_total")
+                ),
             }
         )
     if not isinstance(main_models, dict):
@@ -2118,7 +2225,9 @@ def render_output(
 
     # 2. Column specs + rows. The label column's gap is the historical
     # 2-space description gap; token columns keep the single-space
-    # separators. prices=None drops the model/cost columns entirely.
+    # separators. prices=None drops the model/cost columns entirely — but
+    # never the always-visible time block (both layouts put it last, one
+    # wide gap after whatever precedes it).
     label_column: dict = {
         "label": "",
         "align": "left",
@@ -2128,7 +2237,13 @@ def render_output(
     rows: list = []
     if prices is None:
         # Today's layout: one row per group, the group's totals.
-        columns = [label_column, *_token_columns(" ")]
+        columns = [
+            label_column,
+            # The cached column's wide gap opens the time block (see
+            # _time_columns).
+            *_token_columns(_DESC_TOKEN_GAP),
+            *_time_columns(),
+        ]
         main_in, main_out, main_cached = _models_total(main_models)
         rows.append(
             [
@@ -2136,6 +2251,9 @@ def render_output(
                 format_tokens(start_in),
                 format_tokens(start_out),
                 format_tokens(start_cached),
+                "",  # start never carries time cells
+                "",
+                "",
             ]
         )
         if projected:
@@ -2145,6 +2263,7 @@ def render_output(
                     format_tokens(main_in + sum(p["in"] for p in projected)),
                     format_tokens(main_out + sum(p["out"] for p in projected)),
                     format_tokens(main_cached + sum(p["cached"] for p in projected)),
+                    *session_cells,
                 ]
             )
         rows.append(
@@ -2153,6 +2272,7 @@ def render_output(
                 format_tokens(main_in),
                 format_tokens(main_out),
                 format_tokens(main_cached),
+                *session_cells,
             ]
         )
         for p in projected:
@@ -2162,6 +2282,7 @@ def render_output(
                     format_tokens(p["in"]),
                     format_tokens(p["out"]),
                     format_tokens(p["cached"]),
+                    *p["time"],
                 ]
             )
     else:
@@ -2170,8 +2291,9 @@ def render_output(
         # the extra columns read as additions to the old layout). The
         # unlabeled units column after cost carries WORD units ("crds")
         # so the cost numbers right-align; prefix units ("$") and empty
-        # units leave it blank (render_table rstrips, so those rows end
-        # at the cost cell exactly as before).
+        # units leave it blank. Its wide trailing gap opens the time block
+        # (render_table rstrips, so rows without duration values end at
+        # their last real cell exactly as before).
         columns = [
             label_column,
             {
@@ -2182,7 +2304,8 @@ def render_output(
             },
             *_token_columns(_DESC_TOKEN_GAP),
             {"label": "cost", "align": "right", "floor": 0},
-            {"label": "", "align": "left", "floor": 0},
+            {"label": "", "align": "left", "floor": 0, "gap": _DESC_TOKEN_GAP},
+            *_time_columns(),
         ]
         start_cost, start_units = _cost_cell(
             start_model,
@@ -2199,16 +2322,27 @@ def render_output(
                 format_tokens(start_cached),
                 start_cost,
                 start_units,
+                "",  # start never carries time cells
+                "",
+                "",
             ]
         )
         if projected:
             merged = _merge_models(
                 [main_models, *(p["models"] for p in projected)]
             )
-            rows.extend(_group_model_rows("sum:", merged, prices, host))
-        rows.extend(_group_model_rows("main:", main_models, prices, host))
+            rows.extend(
+                _group_model_rows(
+                    "sum:", merged, prices, host, session_cells
+                )
+            )
+        rows.extend(
+            _group_model_rows("main:", main_models, prices, host, session_cells)
+        )
         for p in projected:
-            rows.extend(_group_model_rows(p["label"], p["models"], prices, host))
+            rows.extend(
+                _group_model_rows(p["label"], p["models"], prices, host, p["time"])
+            )
 
     # 3. Render the table and prepend the row marker to everything
     # except the session header (see _TABLE_ROW_PREFIX). A single

@@ -866,8 +866,12 @@ def test_dirless_session_via_transcript_path_renders_main_row(
     header, labels, start, main = lines
     # Context falls back to jsonl-derived occupancy of the LAST event.
     assert header.endswith("| Context: 2K (1%)"), f"header: {header!r}"
-    # "| " table-row prefix, then the three labels
-    assert labels.split() == ["|", "in", "out", "cached"], f"labels: {labels!r}"
+    # "| " table-row prefix, then the token labels and the always-visible
+    # time block (no duration data in this pipeline stage → empty cells,
+    # but the label row itself is non-empty)
+    assert labels.split() == [
+        "|", "in", "out", "cached", "work", "wait", "total",
+    ], f"labels: {labels!r}"
     # start row carries the FIRST event's breakdown.
     start_cells = start.split()
     assert start_cells[:2] == ["|", "start:"], f"start row: {start!r}"
@@ -1249,8 +1253,12 @@ def test_prices_plain_key_adds_model_and_cost_columns(
         f"expected {_PRICES_LINE_COUNT} lines, got {len(lines)}; "
         f"first 8: {lines[:8]}"
     )
-    # Table header carries the model and cost labels alongside in/out/cached.
-    assert lines[1].split() == ["|", "model", "in", "out", "cached", "cost"], (
+    # Table header carries the model and cost labels alongside in/out/cached
+    # plus the always-visible work/wait/total block (no time data flows
+    # through the pipeline until the orchestrator wires it — empty cells).
+    assert lines[1].split() == [
+        "|", "model", "in", "out", "cached", "cost", "work", "wait", "total",
+    ], (
         f"table header: {lines[1]!r}"
     )
     # The start row is a reference row (not part of sum) but carries the
@@ -1345,7 +1353,9 @@ def test_prices_absent_no_columns(fake_home_with_real_session) -> None:
     )
     lines = result.stdout.decode("utf-8").splitlines()
     assert len(lines) == _NO_PRICES_LINE_COUNT, f"first 8: {lines[:8]}"
-    assert lines[1].split() == ["|", "in", "out", "cached"], f"header: {lines[1]!r}"
+    assert lines[1].split() == [
+        "|", "in", "out", "cached", "work", "wait", "total",
+    ], f"header: {lines[1]!r}"
     # No per-model expansion either: one flat row per group.
     assert lines[3].split()[:2] == ["|", "sum:"], f"sum row: {lines[3]!r}"
     assert lines[4].split()[:2] == ["|", "main:"], f"main row: {lines[4]!r}"
@@ -1364,7 +1374,9 @@ def test_prices_broken_file_no_columns(fake_home_with_real_session) -> None:
     )
     lines = result.stdout.decode("utf-8").splitlines()
     assert len(lines) == _NO_PRICES_LINE_COUNT, f"first 8: {lines[:8]}"
-    assert lines[1].split() == ["|", "in", "out", "cached"], f"header: {lines[1]!r}"
+    assert lines[1].split() == [
+        "|", "in", "out", "cached", "work", "wait", "total",
+    ], f"header: {lines[1]!r}"
 
 
 SYNTH_PRICES_SID = "12345678-1234-1234-1234-123456789012"
@@ -1426,7 +1438,8 @@ def test_synth_prices_per_model_rows_and_costs(tmp_path: Path) -> None:
     # glm (22000*6.9+9000*24+120000*1.7)/10000 = 57.18 → 57.2 credits;
     # agent glm (12000*6.9+4000*24+100000*1.7)/10000 = 34.88 → 34.9.
     assert lines[1:] == [
-        "|                      model         in     out  cached  cost",
+        "|                      model         in     out  cached"
+        "  cost              work     wait    total",
         "| start:               glm-5.3      10K      5K     20K  22.3 credits",
         "| sum:                 glm-5.3      22K      9K    120K  57.2 credits",
         "|                      kimi-k3     2.0M    100K       0  $7.5",
