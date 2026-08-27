@@ -1475,6 +1475,26 @@ def test_partial_and_junk_time_values_render_empty() -> None:
     ], lines[5]
 
 
+def test_boolean_time_values_rejected_as_junk() -> None:
+    """True/False are bools — int SUBCLASSES — and must render EMPTY cells,
+    not coerce to 1s/0s durations ("00:00:01"/"00:00:00"): a hand-corrupted
+    cache writing a boolean into a transient time field means unknown, not
+    one second of work. Same bool-rejection convention as _to_float."""
+    agents = [{
+        "status": "ok", "tokens_in": 100, "tokens_out": 0,
+        "tokens_cached": 0, "description": "bool junk",
+        "time_work": True,
+        "time_wait": False,
+        "time_total": True,
+    }]
+    out = render_output("Session: x", 0, 0, 0, _main(0, 0, 0), agents)
+    agent_line = out.split("\n")[5]
+    assert agent_line.split() == [
+        "|", "[ok]", "bool", "junk", "100", "0", "0",
+    ], agent_line
+    assert "00:00:0" not in agent_line, agent_line
+
+
 def test_agent_time_cells_first_group_row_only_prices_mode() -> None:
     """An agent's transient time_* triple rides ONLY the FIRST row of its
     prices-mode group; per-model continuation rows end at their cost cell.
@@ -1547,13 +1567,16 @@ def test_legacy_call_keeps_historical_tokens() -> None:
 
 
 def test_malformed_main_time_argument_is_tolerated() -> None:
-    """main_time is not a 3-element sequence (junk, wrong arity) → ALL
-    session cells render empty. Strict-triple, defensive-degrade: the hook
-    must never raise over a shaped-wrong argument."""
-    for junk in (None, "x", (1,), (1, 2, 3, 4), {"work": 1}):
-        out = render_output("Session: x", 0, 0, 0, _main(0, 0, 0), [],
-                            main_time=junk)
-        main_line = out.split("\n")[3]
-        assert main_line.split() == ["|", "main:", "0", "0", "0"], (
-            f"junk main_time {junk!r} leaked into {main_line!r}"
-        )
+    """main_time=None (legacy direct call / pre-upgrade pipeline stage)
+    leaves every session cell empty — the hook must never raise and must
+    not invent "00:00:00" placeholders. [deviation] the former
+    strict-triple shape normalization was removed with the render
+    refactor: main_time is a typed same-module internal handoff whose
+    sole production caller passes None or a strict 3-tuple."""
+    out = render_output("Session: x", 0, 0, 0, _main(0, 0, 0), [],
+                        main_time=None)
+    main_line = out.split("\n")[3]
+    assert main_line.split() == ["|", "main:", "0", "0", "0"], (
+        f"None main_time leaked into {main_line!r}"
+    )
+    assert "00:00:00" not in out, out

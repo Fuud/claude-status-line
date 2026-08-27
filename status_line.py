@@ -664,9 +664,16 @@ def _to_float(value: object) -> float | None:
     time field passes the presence-guard but would raise TypeError out of
     the arithmetic, so every epoch/duration number read back from a cache
     file is funneled through here. bool is rejected despite being an int
-    subclass (same convention as _is_num / parse_stdin)."""
+    subclass (same convention as _is_num / parse_stdin), and so are
+    NON-FINITE floats: json.loads happily parses the bare Infinity/NaN
+    extensions, a nan is truthy (slips past `or 0.0` guards), poisons
+    every comparison, and would eventually raise ValueError out of
+    format_duration's int() — degrading the WHOLE status line through
+    main()'s catch-all. Non-finite ⇒ None ⇒ the owning agent/session
+    renders empty time cells instead."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     return None
 
 
@@ -798,6 +805,13 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
     chunk_start: float | None = None      # live work-chunk [chunk_start, chunk_end]
     chunk_end: float | None = None        # (None end ⇒ no activity since the anchor)
     qa_open_ts: float | None = None       # unresolved AskUserQuestion question ts
+    # State-machine invariant (what lets _seg_apply skip re-checks): once a
+    # turn is anchored, chunk_start is None ONLY inside an open QA pause —
+    # the sole mid-turn clearer of chunk_start is the QA cut, which sets
+    # qa_open_ts in the same stroke. Hence every qa_open_ts-is-None path
+    # below may assume chunk_start is not None (the only other clearer,
+    # _flush_chunk, runs inside _close_current_turn together with
+    # turn_anchor=None, returning the machine to dormancy-gate protection).
 
     def _flush_chunk() -> None:
         """Fold the live work chunk into the turn's sub-intervals; a chunk
@@ -888,11 +902,10 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
                 # pause ends here; work resumes FROM this stroke
                 qa_open_ts = None
                 chunk_start, chunk_end = ts, ts
-            elif chunk_start is None:
-                chunk_start, chunk_end = ts, ts
             elif chunk_end is None or ts > chunk_end:
                 # chunk_end None ⇒ open chunk since the anchor: this is its
-                # first registered activity
+                # first registered activity (chunk_start is not None here —
+                # see the state-machine invariant above)
                 chunk_end = ts
             turn_trailing_tool_results = True
             return
@@ -916,18 +929,15 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
                 ):
                     # cut the turn AT the question moment: everything elapsed
                     # up to now is work; nothing accrues until a user event
-                    # answers the pause
-                    if chunk_start is None:
-                        chunk_start = ts
+                    # answers the pause (chunk_start is not None here — see
+                    # the state-machine invariant above the closures)
                     cur_subints.append([chunk_start, ts])
                     chunk_start = chunk_end = None
                     qa_open_ts = ts
                     return
 
         # ordinary assistant activity
-        if chunk_start is None:
-            chunk_start, chunk_end = ts, ts
-        elif chunk_end is None or ts > chunk_end:
+        if chunk_end is None or ts > chunk_end:
             # chunk_end None ⇒ open chunk since the anchor: first activity
             chunk_end = ts
         turn_has_assistant = True
@@ -2000,22 +2010,21 @@ def _group_model_rows(
     model cell — groups are never skipped (the "agents never skipped"
     invariant, extended to main and sum).
 
-    `time_cells` — the group's THREE pre-formatted work/wait/total cells;
-    they ride ONLY the FIRST row of the group too (continuation per-model
-    rows carry empty cells), mirroring the single-label rule: a group is
-    one logical entity whose durations are session/group-wide, not
-    per-model quantities. Zero-fallback rows are first rows and keep the
-    cells.
+    `time_cells` — the group's THREE pre-formatted work/wait/total cells
+    (the exact-arity output of _time_row_cells, the sole constructor at
+    every call site); they ride ONLY the FIRST row of the group too
+    (continuation per-model rows carry empty cells), mirroring the
+    single-label rule: a group is one logical entity whose durations are
+    session/group-wide, not per-model quantities. Zero-fallback rows are
+    first rows and keep the cells.
 
     Records are coerced ONCE via _coerce_record (the untrusted-cache
     boundary) and the coerced values are what both the token cells and
     the cost cell consume — a None/non-numeric field must not raise from
     compute_cost.
     """
-    if time_cells is None or len(time_cells) != 3:
+    if time_cells is None:
         time_cells = ["", "", ""]
-    else:
-        time_cells = list(time_cells)
     rows: list = []
     for model, rec in (models or {}).items():
         coerced = _coerce_record(rec)
@@ -2043,17 +2052,14 @@ def _group_model_rows(
     return rows
 
 
-def _token_columns(cached_gap: str) -> list[dict]:
+def _token_columns() -> list[dict]:
     """The in/out/cached column specs shared by both render_output layouts.
 
-    All three are right-aligned with the _TOKEN_COLUMN_WIDTH floor;
-    `cached_gap` separates the token block from whatever follows it.
-    [deviation] Since the always-visible time columns (plan
-    20260827-status-line-time-columns) there IS no "nothing follows"
-    layout anymore — the cost column follows `cached` in prices mode and
-    the work column in plain mode, so every caller passes
-    _DESC_TOKEN_GAP. The parameter survives so both column-spec helpers
-    stay symmetrical and each layout states its separator exactly once.
+    All three are right-aligned with the _TOKEN_COLUMN_WIDTH floor; the
+    `cached` column's gap is the wide _DESC_TOKEN_GAP separating the token
+    block from the always-visible time columns that follow it in BOTH
+    layouts (plan 20260827-status-line-time-columns) — the cost column in
+    prices mode, the work column in plain mode.
     """
     return [
         {
@@ -2072,7 +2078,7 @@ def _token_columns(cached_gap: str) -> list[dict]:
             "label": "cached",
             "align": "right",
             "floor": _TOKEN_COLUMN_WIDTH,
-            "gap": cached_gap,
+            "gap": _DESC_TOKEN_GAP,
         },
     ]
 
@@ -2129,7 +2135,7 @@ def render_output(
     prices: dict | None = None,
     host: str = "",
     start_model: str = "",
-    main_time: Any = None,
+    main_time: tuple[float, float, float] | None = None,
 ) -> str:
     """Build the multi-line status line string with a tabular breakdown.
 
@@ -2164,10 +2170,9 @@ def render_output(
     triple; by construction it renders IDENTICALLY on the sum: and main:
     rows (waiting on agents already counts as main's work). Cells go
     through _time_row_cells: numeric seconds → "HH:MM:SS", None/junk →
-    "" (degraded data shows blanks, never "00:00:00"). Anything other
-    than a length-3 sequence degrades to ALL-empty. Passing nothing (a
-    legacy direct call / pre-upgrade pipeline stage) leaves every session
-    time cell blank. Agents carry their own transient time_work/
+    "" (degraded data shows blanks, never "00:00:00"). Passing nothing
+    (a legacy direct call / pre-upgrade pipeline stage) leaves every
+    session time cell blank. Agents carry their own transient time_work/
     time_wait/time_total keys (injected post-cache-write by _main_unsafe)
     rendered the same way on the group's FIRST row only; `start:` keeps
     empty time cells unconditionally.
@@ -2199,16 +2204,16 @@ def render_output(
     U+2026 (re-applied defensively). Defensive _to_int / isinstance
     handling covers pre-upgrade caches and hand-corrupted cache files.
     """
-    # The session triple normalizes to three pre-formatted cells ONCE —
+    # The session triple becomes three pre-formatted cells ONCE —
     # sum/main/agent-free branches reuse them without re-coercing. A
-    # non-sequence or wrong-arity argument degrades to all-empty cells
-    # (strict-triple contract, defensive against mis-shaped callers).
-    normalized_time: list = (
-        list(main_time) if isinstance(main_time, (list, tuple)) else []
+    # None triple (legacy direct call) leaves the session cells empty.
+    # No shape validation: this is a same-module internal handoff whose
+    # sole production caller constructs None or a strict 3-tuple one
+    # frame up (the repo's degrade-never-crash armor targets untrusted
+    # boundaries — stdin, jsonl, cache — not internal arguments).
+    session_cells = (
+        ["", "", ""] if main_time is None else _time_row_cells(*main_time)
     )
-    if len(normalized_time) != 3:
-        normalized_time = [None, None, None]
-    session_cells = _time_row_cells(*normalized_time)
 
     # 1. Project agents into render-ready rows: the group label (icon +
     # status gap + truncated description — only the group's FIRST row
@@ -2261,7 +2266,7 @@ def render_output(
             label_column,
             # The cached column's wide gap opens the time block (see
             # _time_columns).
-            *_token_columns(_DESC_TOKEN_GAP),
+            *_token_columns(),
             *_time_columns(),
         ]
         main_in, main_out, main_cached = _models_total(main_models)
@@ -2322,7 +2327,7 @@ def render_output(
                 "floor": 0,
                 "gap": _DESC_TOKEN_GAP,
             },
-            *_token_columns(_DESC_TOKEN_GAP),
+            *_token_columns(),
             {"label": "cost", "align": "right", "floor": 0},
             {"label": "", "align": "left", "floor": 0, "gap": _DESC_TOKEN_GAP},
             *_time_columns(),
@@ -2588,7 +2593,7 @@ def _write_agents_cache(agents_cache_path: Path, agents: list) -> None:
 
 
 def _agent_time_segments(
-    agent: dict, now: float | None
+    agent: dict, now: float
 ) -> tuple[list, float, float, float] | None:
     """Work sub-intervals + durations for ONE agent snapshot.
 
@@ -2609,10 +2614,21 @@ def _agent_time_segments(
           extension);
         - closed qa_pauses pairs are cut out of the lifetime, each clipped
           into its live window ([decision] clipping rather than the naive
-          raw sum of pair lengths keeps wait ≤ duration when junk or
-          partially-overlapping pairs arrive from a hand-corrupted cache);
-        - wait = Σ clipped pauses (+ now − qa_open_ts for an open one);
-          work = total − wait clamped ≥ 0 defensively.
+          raw sum of pair lengths keeps the closed wait ≤ duration when
+          junk or partially-overlapping pairs arrive from a hand-corrupted
+          cache). Inverted/degenerate pairs (p_end <= p_start, producible
+          by regressed jsonl stamps or a hand-edited cache) are SKIPPED —
+          a negative wait contribution would drag the cursor backwards,
+          emit overlapping work sub-intervals and render work > total;
+        - work = total − Σ clipped CLOSED pauses, clamped ≥ 0 — the work
+          the agent performed before a hanging question is never erased by
+          the growing open gap;
+        - wait = Σ clipped closed pauses (+ now − qa_open_ts for an open
+          one). [decision] the open gap is a plain addend, NOT capped at
+          total: while a question hangs, `total` stays frozen at the
+          question moment but the waiting keeps growing — wait > total on
+          the agent row is the honest picture, and the work+wait==total
+          invariant is scoped to session rows only.
     """
     ts_first = _to_float(agent.get("ts_first")) or 0.0
     ts_last = _to_float(agent.get("ts_last")) or 0.0
@@ -2628,59 +2644,63 @@ def _agent_time_segments(
                 continue
             p_start = _to_float(pair[0])
             p_end = _to_float(pair[1])
-            if p_start is None or p_end is None:
+            if p_start is None or p_end is None or p_end <= p_start:
                 continue
             pauses.append((p_start, p_end))
     pauses.sort()
 
     if qa_open_ts > 0.0:
         life_end = min(ts_last, max(ts_first, qa_open_ts))
-    elif agent.get("status") == "run" and now is not None:
+    elif agent.get("status") == "run":
         life_end = max(ts_last, now)
     else:
         life_end = ts_last
 
     sub_intervals: list[list[float]] = []
     cursor = ts_first
-    wait = 0.0
+    closed_wait = 0.0
     for p_start, p_end in pauses:
         if p_end <= cursor or p_start >= life_end:
             continue  # pause entirely outside the live window
         if p_start > cursor:
             sub_intervals.append([cursor, p_start])
-        wait += min(p_end, life_end) - max(p_start, cursor)
+        closed_wait += min(p_end, life_end) - max(p_start, cursor)
         cursor = max(cursor, p_end)
         if cursor >= life_end:
             break
     if cursor < life_end:
         sub_intervals.append([cursor, life_end])
 
-    if qa_open_ts > 0.0 and now is not None:
+    total = life_end - ts_first
+    work = max(0.0, total - closed_wait)
+    wait = closed_wait
+    if qa_open_ts > 0.0:
         gap = now - qa_open_ts
         if gap > 0.0:
             wait += gap
-
-    total = life_end - ts_first
-    work = max(0.0, total - wait)
     return sub_intervals, work, wait, total
 
 
-def _main_unsafe(now: float | None = None) -> int:
+def _main_unsafe(now: float) -> int:
     """Internal implementation — assumes the caller (main) wraps OSError.
     See main() docstring for the never-crash contract.
 
     `now` — the wall-clock anchor (epoch seconds) for the work/wait/total
-    time columns (plan 20260827-status-line-time-columns). Production
-    passes time.time() from main(); tests freeze it explicitly (in-process
-    with monkeypatched stdin per the plan's Testing Strategy). When it is
-    None — a legacy direct call / pre-time pipeline stage — NO time data is
-    computed or injected and every duration cell renders empty.
+    time columns (plan 20260827-status-line-time-columns) — REQUIRED:
+    production passes time.time() from main(), tests freeze it explicitly
+    (in-process with monkeypatched stdin per the plan's Testing Strategy).
+    [decision] no None default: a silent blank-time legacy mode would hide
+    wiring mistakes (a caller forgetting to pass the clock would render
+    empty cells instead of failing loudly); the render-level degrade
+    (render_output's main_time=None) stays for direct/pre-upgrade calls.
 
-    Time assembly, gated on now is not None:
+    Time assembly:
         - intervals start from the main scan's time_turns sub-intervals;
           when time_open marks the final turn live its LAST sub-interval is
           stretched to now ("live-now"; max() keeps a stamp already ahead
-          of a skewed clock from shrinking);
+          of a skewed clock from shrinking). time_open must be literally
+          True — a hand-corrupted truthy cache value ("yes") must not
+          stretch anything;
         - each agent contributes its life-minus-pauses intervals via
           _agent_time_segments (running agents extend to now, open
           questions trim at the question), and receive their personal
@@ -2765,44 +2785,43 @@ def _main_unsafe(now: float | None = None) -> int:
     agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
 
     # ---- time columns (plan 20260827-status-line-time-columns) — see the
-    # ---- _main_unsafe docstring for the assembly contract. Gated on now:
-    # a None `now` (legacy direct call) skips everything below so the
-    # render keeps empty duration cells.
-    main_time = None
-    if now is not None:
-        intervals: list[list[float]] = []
-        raw_turns = main_cum.get("time_turns")
-        if isinstance(raw_turns, list):
-            for turn in raw_turns:
-                if not isinstance(turn, list):
-                    continue
-                for span in turn:
-                    if not isinstance(span, (list, tuple)) or len(span) != 2:
-                        continue
-                    s = _to_float(span[0])
-                    e = _to_float(span[1])
-                    if s is not None and e is not None:
-                        intervals.append([s, e])
-        # Live-now: an open final turn keeps working until the render
-        # moment — stretch its LAST sub-interval up to now.
-        if intervals and main_cum.get("time_open"):
-            intervals[-1][1] = max(intervals[-1][1], now)
-        for agent in agents:
-            segments = _agent_time_segments(agent, now)
-            if segments is None:
-                # unstamped / corrupt agent — its cells stay empty
+    # ---- _main_unsafe docstring for the assembly contract.
+    intervals: list[list[float]] = []
+    raw_turns = main_cum.get("time_turns")
+    if isinstance(raw_turns, list):
+        for turn in raw_turns:
+            if not isinstance(turn, list):
                 continue
-            ag_intervals, ag_work, ag_wait, ag_total = segments
-            intervals.extend(ag_intervals)
-            agent["time_work"] = ag_work
-            agent["time_wait"] = ag_wait
-            agent["time_total"] = ag_total
-        first_ts = _to_float(main_cum.get("time_first_ts")) or 0.0
-        if first_ts > 0.0:
-            total_sec = max(0.0, now - first_ts)
-            work_sec = min(union_work(intervals), total_sec)
-            wait_sec = max(0.0, total_sec - work_sec)
-            main_time = (work_sec, wait_sec, total_sec)
+            for span in turn:
+                if not isinstance(span, (list, tuple)) or len(span) != 2:
+                    continue
+                s = _to_float(span[0])
+                e = _to_float(span[1])
+                if s is not None and e is not None:
+                    intervals.append([s, e])
+    # Live-now: an open final turn keeps working until the render moment —
+    # stretch its LAST sub-interval up to now. `is True`: the field is a
+    # bool from the scan; a truthy junk value in a hand-corrupted cache
+    # must not stretch anything (same type-strictness as _to_float).
+    if intervals and main_cum.get("time_open") is True:
+        intervals[-1][1] = max(intervals[-1][1], now)
+    for agent in agents:
+        segments = _agent_time_segments(agent, now)
+        if segments is None:
+            # unstamped / corrupt agent — its cells stay empty
+            continue
+        ag_intervals, ag_work, ag_wait, ag_total = segments
+        intervals.extend(ag_intervals)
+        agent["time_work"] = ag_work
+        agent["time_wait"] = ag_wait
+        agent["time_total"] = ag_total
+    first_ts = _to_float(main_cum.get("time_first_ts")) or 0.0
+    main_time: tuple[float, float, float] | None = None
+    if first_ts > 0.0:
+        total_sec = max(0.0, now - first_ts)
+        work_sec = min(union_work(intervals), total_sec)
+        wait_sec = max(0.0, total_sec - work_sec)
+        main_time = (work_sec, wait_sec, total_sec)
 
     # Task 4/5 — model/cost columns: render_output consumes the per-model
     # dict (the main row's totals are the sum of its records — the flat

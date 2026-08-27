@@ -174,7 +174,11 @@ layouts (plan 20260827-status-line-time-columns):
 - `wait` — user-facing idle: `total − work` (clamped at 0). Includes
   the current unfinished pause.
 
-By construction `work + wait = total`.
+By construction `work + wait = total` on the session rows (`sum:` /
+`main:`). An AGENT row is exempt while one of its questions hangs
+unanswered: its `total` freezes at the question moment, but the open gap
+keeps growing its `wait` — so `wait > total` there is the honest picture
+(the work the agent performed before asking is never erased).
 
 How intervals are derived:
 
@@ -191,16 +195,27 @@ How intervals are derived:
   the gap grows as wait, and the turn counts as closed (no live-now
   extension through it).
 - **Live-now** — when the last turn is still open (the session ended in
-  `tool_use`/`pause_turn`, or tool results follow the last assistant
-  event) and when an agent's status is `[run]` without a hanging
-  question, their LAST interval stretches up to the render moment —
-  `total` grows in real time without new jsonl writes.
+  `tool_use`/`pause_turn`, tool results follow the last assistant event,
+  or the last real prompt simply has no assistant reply yet) and when an
+  agent's status is `[run]` without a hanging question, their LAST
+  interval stretches up to the render moment — `total` grows in real time
+  without new jsonl writes. A turn closes on `end_turn`, a
+  `stop_sequence`, an interrupt, an error, or a hanging question; an
+  assistant reply WITHOUT a `stop_reason` (an aborted/truncated
+  generation) also counts as closed — the plan's "closed on error" rule,
+  which bounds the damage of a crash to an undercount instead of counting
+  unbounded dead air as work.
 - **Agents** — each agent renders its own triple: `total` = lifetime
-  (first → last stamped event, extended to now while running);
-  `wait` = Σ clipped AskUserQuestion pauses (+ the open one up to now);
-  `work` = `total − wait`. The agent's active intervals also feed the
-  session union — which is why the `sum:` and `main:` rows show IDENTICAL
-  triples.
+  (first → last stamped event, extended to now while running, frozen at
+  the question moment while one hangs);
+  `work` = `total` − Σ clipped closed AskUserQuestion pauses;
+  `wait` = those closed pauses plus the OPEN question's gap up to now
+  (uncapped — see the invariant note above). The agent's active
+  intervals also feed the session union — which is why the `sum:` and
+  `main:` rows show IDENTICAL triples. While an agent's question hangs
+  the session's own triple keeps counting the blocked time as WORK
+  (waiting on agents is work by the union rule), even though the agent's
+  personal row accrues it as wait.
 
 Format: `HH:MM:SS` via `format_duration`; hours are unbounded
 (`03:45:12`, `103:25:10`); fractional seconds truncate.
@@ -222,8 +237,9 @@ Code's status-line hook configuration.
 
 ## Runtime dependencies
 
-- **Python 3.9+** (only stdlib used: `datetime`, `json`, `math`, `os`,
-  `re`, `subprocess`, `sys`, `time`, `urllib.parse`, `pathlib`, `typing`)
+- **Python 3.9+** (only stdlib used: `collections.abc`, `datetime`,
+  `json`, `math`, `os`, `re`, `subprocess`, `sys`, `time`,
+  `urllib.parse`, `pathlib`, `typing`)
 - **`git`** on `$PATH` (optional; absence is silently handled by
   returning `branch=""`)
 - **`ANTHROPIC_BASE_URL`** env var (optional): the hook inherits it from
@@ -327,11 +343,17 @@ Both files are written atomically (`.tmp` → `os.replace()`).
 - **Missing / unparsable timestamps**: events without an ISO 8601 stamp
   are silently skipped for timing; a session or agent with no usable
   stamps at all renders EMPTY work/wait/total cells (never `00:00:00`).
-  JSON `null` in cached time fields coerces to 0 by the repo's usual
-  defensive-read convention rather than crashing the arithmetic.
-- **Legacy direct call** (`render_output` / `_main_unsafe` without the
-  time arguments): rows keep their structure, every duration cell stays
-  empty — only the header labels appear.
+  JSON `null` in cached time fields passes the presence hit-guard but
+  coerces to "no data" by the repo's usual defensive-read convention
+  (`_to_float`, which also rejects booleans and non-finite junk — a bare
+  `NaN`/`Infinity` a hand-edited cache parses to would otherwise poison
+  the arithmetic into degrading the whole output) — the affected cells
+  render empty rather than crashing the arithmetic.
+- **Legacy direct call** (`render_output` without `main_time`): rows keep
+  their structure, every duration cell stays empty — only the header
+  labels appear. `_main_unsafe` itself takes a REQUIRED `now` — there is
+  no blank-time orchestrator mode that could silently hide a wiring
+  mistake.
 - **Stale empty `agents_<sid>.json`** (written by pre-2026-08 versions
   that scanned only one session dir — the worktree-split bug): rewritten
   automatically on the next invocation once agents are found across all
@@ -355,11 +377,12 @@ cd ~/.claude/status_line
 python3 -m pytest tests/ -v
 ```
 
-459 tests cover: pure functions (`format_tokens`, `format_duration`,
+488 tests cover: pure functions (`format_tokens`, `format_duration`,
 `union_work`, `_parse_ts` in `tests/test_format_duration.py` /
-`tests/test_union_work.py`, `detect_status`, `parse_stdin`), price
-helpers (`provider_host`, `load_prices`, `price_for`, `compute_cost`,
-`format_cost`), I/O helpers (`compute_main_cum`,
+`tests/test_union_work.py`, the agent pause/trim/extension geometry in
+`tests/test_agent_time_segments.py`, `detect_status`, `parse_stdin`),
+price helpers (`provider_host`, `load_prices`, `price_for`,
+`compute_cost`, `format_cost`), I/O helpers (`compute_main_cum`,
 `compute_agent_snapshot`, `find_session_dir(s)`, `_resolve_session_dirs`,
 `sort_agents`, `_write_agents_cache`) including the main/agent time
 segmentation and cache presence guards (`tests/test_time_segmentation.py`),
@@ -370,8 +393,11 @@ multi-dir merge across duplicate session dirs
 (`tests/test_resolve_session_dirs.py`, `tests/test_find_session_dir.py`)
 and the work/wait/total invariants (`work + wait == total` within ±1s,
 identical `main:` / `sum:` triples) checked in a now-independent way — a
-frozen-clock suite calling `_main_unsafe(now=…)` in-process — a runtime
-smoke test — and the bash wrapper.
+frozen-clock suite calling `_main_unsafe(now=…)` in-process that also
+pins the live-now extensions (open main turn, run agent), the hanging-QA
+agent triple, the `min(work, total)` and clock-skew clamps, and the
+null-time-fields cache-hit degrade — a runtime smoke test — and the bash
+wrapper.
 
 ### Real-session fixture
 

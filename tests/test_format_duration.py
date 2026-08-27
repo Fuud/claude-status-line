@@ -80,6 +80,20 @@ def test_parse_ts_z_suffix() -> None:
     assert ts == _utc(2026, 8, 27, 12, 30, 5)
 
 
+def test_parse_ts_lowercase_z_suffix() -> None:
+    """Defensive normalization: some emitters write a lowercase 'z' — the
+    hand-rolled suffix replacement accepts both."""
+    ts = _parse_ts("2026-08-27T12:30:05z")
+    assert ts == _utc(2026, 8, 27, 12, 30, 5)
+
+
+def test_parse_ts_surrounding_whitespace_stripped() -> None:
+    """Defensive normalization: surrounding whitespace (stray spaces, a
+    trailing newline from a sloppy writer) is stripped before parsing."""
+    ts = _parse_ts("  2026-08-27T12:30:05Z \n")
+    assert ts == _utc(2026, 8, 27, 12, 30, 5)
+
+
 def test_parse_ts_explicit_utc_offset() -> None:
     ts = _parse_ts("2026-08-27T12:30:05+00:00")
     assert ts == _utc(2026, 8, 27, 12, 30, 5)
