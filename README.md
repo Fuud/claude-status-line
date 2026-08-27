@@ -7,10 +7,12 @@ that only tracked main-session tokens.
 ## What it does
 
 Renders a multi-line status string consumed by the Claude Code status-line
-hook. With a `prices.json` present (see [Costs](#costs-pricesjson)) the
-table carries two extra columns — `model` (the model id from the jsonl
-events) and `cost` (money/credits spent) — and every group expands to one
-row per model:
+hook. Three duration columns — `work`, `wait`, `total` (see
+[Time columns](#time-columns-work--wait--total)) — are ALWAYS visible and
+close every table row in both layouts. With a `prices.json` present (see
+[Costs](#costs-pricesjson)) the table additionally carries two extra
+columns — `model` (the model id from the jsonl events) and `cost`
+(money/credits spent) — and every group expands to one row per model:
 
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
@@ -47,20 +49,23 @@ Line layout:
 - Line 2 — table header: `in / out / cached` right-aligned under their
   columns; with prices also `model` (left-aligned, between the
   description and `in`) and `cost` (right-aligned, after `cached`). The
-  label/description column's header cell is empty.
+  three time labels `work / wait / total` close the header in BOTH
+  layouts. The label/description column's header cell is empty.
 - Line 3 — `start:` row with the FIRST assistant event's breakdown —
   the session's baseline message. A reference row: not included in the
-  `sum:` aggregate; in prices mode it carries that event's model and its
-  priced cost.
+  `sum:` aggregate; its three time cells are always empty; in prices
+  mode it carries that event's model and its priced cost.
 - `sum:` group (omitted if there are zero agents) — per-model merge of
   the main session and every agent; each model keeps its own row (no
-  cross-model sums).
+  cross-model sums). Its time cells are the SESSION's union triple.
 - `main:` group — cumulative breakdown of the main session, one row per
-  model.
+  model. Same session time triple as `sum:` — waiting on agents already
+  counts as main's work (see [Time columns](#time-columns-work--wait--total)).
 - One group per agent — `[<status>]` icon and description on the FIRST
   row of the group only. Totals are cumulative across ALL of the agent's
   events (not the last API call's usage); one row per model the agent
-  used.
+  used. The agent's personal work/wait/total render on that first row;
+  continuation per-model rows leave the time cells blank.
 
 Per-model rows whose tokens are all zero (e.g. `<synthetic>` events)
 are skipped; a group left with no rows after that — an agent with no
@@ -75,9 +80,11 @@ strips leading whitespace from status-line rows, and the marker keeps the
 all-spaces table-header row aligned with the rows below it.
 
 Each numeric cell is formatted via `format_tokens` (so `1000` renders
-as `1K`, `1_500_000` as `1.5M`). Every column's width — including the
+as `1K`, `1_500_000` as `1.5M`) and each duration cell via
+`format_duration` (`HH:MM:SS`). Every column's width — including the
 `sum:` row's cells — is the widest cell under it (floored at 7 for the
-token columns), so at extreme totals the columns can be one character
+token columns, at 8 for the duration columns — `HH:MM:SS` fills that
+exactly), so at extreme totals the columns can be one character
 wider than the other rows suggested.
 
 | Tag      | Meaning                                              |
@@ -150,6 +157,62 @@ What happens when parts are missing:
 | model known but not in the price file | `n/a` in the cost cell                  |
 | group with no models after zero-skip  | one zero row with an empty `model` cell |
 
+## Time columns (work / wait / total)
+
+The last three columns measure wall-clock time and are present in BOTH
+layouts (plan 20260827-status-line-time-columns):
+
+- `total` — elapsed session wall-clock: `now − first_ts`, where
+  `first_ts` is the FIRST timestamped event in the main jsonl (ISO 8601
+  stamps parsed to epoch seconds; a trailing `Z` is handled by hand for
+  Python 3.9).
+- `work` — autonomous time: the UNION of all active intervals — the main
+  session's turns plus every subagent's active lifetime — minus
+  AskUserQuestion pauses. Waiting on a running agent counts as WORK
+  (it is the machine doing what the user asked); parallel agents do NOT
+  double-count overlapping wall-clock time (union, not a sum).
+- `wait` — user-facing idle: `total − work` (clamped at 0). Includes
+  the current unfinished pause.
+
+By construction `work + wait = total`.
+
+How intervals are derived:
+
+- **Turns** — the main scan splits the session at "real" user events
+  (`type=user` with string content: prompts, commands, interrupts;
+  `tool_result` lists do NOT bound anything). A turn spans from its
+  prompt to the last activity carrying a timestamp; trailing
+  `queue-operation`/`system` events don't extend it — a notification
+  about a background agent must not shift the start of the wait.
+- **AskUserQuestion pauses** — from an assistant event carrying an
+  AskUserQuestion `tool_use` until the next user event of any kind.
+  A pause is cut out of BOTH the containing turn's work and the asking
+  agent's lifetime. While a question hangs UNANSWERED nothing accrues:
+  the gap grows as wait, and the turn counts as closed (no live-now
+  extension through it).
+- **Live-now** — when the last turn is still open (the session ended in
+  `tool_use`/`pause_turn`, or tool results follow the last assistant
+  event) and when an agent's status is `[run]` without a hanging
+  question, their LAST interval stretches up to the render moment —
+  `total` grows in real time without new jsonl writes.
+- **Agents** — each agent renders its own triple: `total` = lifetime
+  (first → last stamped event, extended to now while running);
+  `wait` = Σ clipped AskUserQuestion pauses (+ the open one up to now);
+  `work` = `total − wait`. The agent's active intervals also feed the
+  session union — which is why the `sum:` and `main:` rows show IDENTICAL
+  triples.
+
+Format: `HH:MM:SS` via `format_duration`; hours are unbounded
+(`03:45:12`, `103:25:10`); fractional seconds truncate.
+
+Degradation: an event without a parsable timestamp is silently skipped
+for timing; a session or agent with NO usable stamps (or a legacy direct
+call bypassing the orchestrator) renders EMPTY time cells — never
+`00:00:00`. Missing data means unknown, not zero. Transient clock-skew
+protection: work is clamped with `min(work, total)` so the invariant
+`work + wait = total` survives resumed/multi-dir sessions where an
+agent's stamps start before main's first timestamp.
+
 ## Install
 
 This module lives at `~/.claude/status_line/`. Claude Code invokes it
@@ -159,8 +222,8 @@ Code's status-line hook configuration.
 
 ## Runtime dependencies
 
-- **Python 3.9+** (only stdlib used: `json`, `os`, `re`, `subprocess`,
-  `sys`, `time`, `urllib.parse`, `pathlib`, `typing`)
+- **Python 3.9+** (only stdlib used: `datetime`, `json`, `math`, `os`,
+  `re`, `subprocess`, `sys`, `time`, `urllib.parse`, `pathlib`, `typing`)
 - **`git`** on `$PATH` (optional; absence is silently handled by
   returning `branch=""`)
 - **`ANTHROPIC_BASE_URL`** env var (optional): the hook inherits it from
@@ -191,22 +254,29 @@ Code's status-line hook configuration.
    dedup by `agentId` (first dir wins), using the agents cache at
    `~/.claude/status_line/data/agents_<sid>.json`.
 5. Sorts agents by main-jsonl `tool_use` position (`sort_agents`).
-6. Renders the multi-line output (`render_output`), wiring in
-   `prices.json` and the `ANTHROPIC_BASE_URL` hostname when a prices
-   file exists (see [Costs](#costs-pricesjson)).
-7. Prints to stdout. Never returns non-zero.
+6. Computes the time columns: with `now = time.time()` the orchestrator
+   unions main turns + agent lifetimes into the session work/wait/total
+   triple and injects each agent's personal durations as TRANSIENT keys —
+   after the agents-cache write, so they never persist (see
+   [Time columns](#time-columns-work--wait--total)). Tests freeze the
+   clock by calling `_main_unsafe(now=…)` directly.
+7. Renders the multi-line output (`render_output`), wiring in
+   `prices.json`, the `ANTHROPIC_BASE_URL` hostname when a prices file
+   exists (see [Costs](#costs-pricesjson)) and the time data.
+8. Prints to stdout. Never returns non-zero.
 
 ### Caching
 
 Two cache files are persisted under `~/.claude/status_line/data/`:
 
-| File                | Invalidation key                       | Purpose                                                                          |
-| ------------------- | -------------------------------------- | -------------------------------------------------------------------------------- |
-| `main_<sid>.json`   | `(last_uuid, mtime_jsonl)`             | per-model breakdown + first-message `start_*` + context occupancy + tool_use ids |
-| `agents_<sid>.json` | `(last_uuid, mtime_jsonl, mtime_meta)` | per-agent render-ready snapshot dict                                             |
+| File                | Invalidation key                       | Purpose                                                                                                                                             |
+| ------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main_<sid>.json`   | `(last_uuid, mtime_jsonl)`             | per-model breakdown + first-message `start_*` + context occupancy + tool_use ids + time segmentation (`time_first_ts` / `time_turns` / `time_open`) |
+| `agents_<sid>.json` | `(last_uuid, mtime_jsonl, mtime_meta)` | per-agent render-ready snapshot dict incl. time stamps (`ts_first` / `ts_last` / `qa_pauses` / `qa_open_ts`)                                        |
 
 Both main-cache field groups added after the first release
-(`context_tokens`, `start_in`/`start_out`/`start_cached`, `per_model`)
+(`context_tokens`, `start_in`/`start_out`/`start_cached`, `per_model`,
+and the time-segmentation trio `time_first_ts`/`time_turns`/`time_open`)
 are part of the cache-hit check: a pre-upgrade cache file that matches
 the key but lacks them is treated as a miss and rescanned once, then
 rewritten in the new shape.
@@ -214,13 +284,19 @@ rewritten in the new shape.
 Each per-agent entry in `agents_<sid>.json` is keyed by `agentId` and
 holds the fields `last_uuid`, `mtime_jsonl`, `mtime_meta`, `status`,
 `tokens_in`, `tokens_out`, `tokens_cached`, `models`, `description`,
-`toolUseId`. The three `tokens_*` fields are the CUMULATIVE breakdown
-columns rendered in the status line (input / output / cache-read, summed
-over all of the agent's assistant events); `models` is the per-model
-breakdown feeding the `model`/`cost` columns. Cache-hit requires all
-four (`tokens_*` + `models`) fields to be present — a pre-upgrade cache
+`toolUseId`, plus the four time-stamp fields `ts_first`, `ts_last`,
+`qa_pauses`, `qa_open_ts`. The three `tokens_*` fields are the CUMULATIVE
+breakdown columns rendered in the status line (input / output /
+cache-read, summed over all of the agent's assistant events); `models`
+is the per-model breakdown feeding the `model`/`cost` columns; the four
+time fields persist so cache-HIT cycles can still apply live-now
+extensions and AskUserQuestion wait splits. Cache-hit requires ALL of
+these breakdown + time fields to be present — a pre-upgrade cache
 missing any of them invalidates and triggers a forward re-parse (see
-Edge cases).
+Edge cases). The derived durations (`time_work` / `time_wait` /
+`time_total`) are deliberately NOT here: they are recomputed and
+injected into the agent dicts after every cache write by the
+orchestrator.
 
 Both files are written atomically (`.tmp` → `os.replace()`).
 
@@ -241,12 +317,21 @@ Both files are written atomically (`.tmp` → `os.replace()`).
   emitted with three zero cells in the breakdown columns (never
   skipped).
 - **Pre-upgrade agents cache (no breakdown fields)**: cache-hit
-  requires `tokens_in`/`tokens_out`/`tokens_cached`/`models` to be
+  requires `tokens_in`/`tokens_out`/`tokens_cached`/`models` plus the
+  four time fields (`ts_first`/`ts_last`/`qa_pauses`/`qa_open_ts`) to be
   present; if any are missing, the entry is treated as a miss and the
   jsonl is re-scanned. After the first such re-scan the cache is
   rewritten with the new shape and subsequent calls hit cleanly. Without
   this check, a stale entry would render zeros (via `int(field or 0)`)
-  until the next jsonl mutation.
+  or blank duration cells until the next jsonl mutation.
+- **Missing / unparsable timestamps**: events without an ISO 8601 stamp
+  are silently skipped for timing; a session or agent with no usable
+  stamps at all renders EMPTY work/wait/total cells (never `00:00:00`).
+  JSON `null` in cached time fields coerces to 0 by the repo's usual
+  defensive-read convention rather than crashing the arithmetic.
+- **Legacy direct call** (`render_output` / `_main_unsafe` without the
+  time arguments): rows keep their structure, every duration cell stays
+  empty — only the header labels appear.
 - **Stale empty `agents_<sid>.json`** (written by pre-2026-08 versions
   that scanned only one session dir — the worktree-split bug): rewritten
   automatically on the next invocation once agents are found across all
@@ -270,16 +355,23 @@ cd ~/.claude/status_line
 python3 -m pytest tests/ -v
 ```
 
-360+ tests cover: pure functions (`format_tokens`, `detect_status`,
-`parse_stdin`), price helpers (`provider_host`, `load_prices`,
-`price_for`, `compute_cost`, `format_cost`), I/O helpers
-(`compute_main_cum`, `compute_agent_snapshot`, `find_session_dir(s)`,
-`_resolve_session_dirs`, `sort_agents`, `_write_agents_cache`),
-`render_table` and `render_output` (model/cost columns, per-model
-groups, the `start:` row), `main()` end-to-end against a real session
-fixture — including the multi-dir merge across duplicate session dirs
+459 tests cover: pure functions (`format_tokens`, `format_duration`,
+`union_work`, `_parse_ts` in `tests/test_format_duration.py` /
+`tests/test_union_work.py`, `detect_status`, `parse_stdin`), price
+helpers (`provider_host`, `load_prices`, `price_for`, `compute_cost`,
+`format_cost`), I/O helpers (`compute_main_cum`,
+`compute_agent_snapshot`, `find_session_dir(s)`, `_resolve_session_dirs`,
+`sort_agents`, `_write_agents_cache`) including the main/agent time
+segmentation and cache presence guards (`tests/test_time_segmentation.py`),
+`render_table` and `render_output` (model/cost columns, per-model groups,
+the `start:` row, the always-visible work/wait/total block),
+`main()` end-to-end against a real session fixture — including the
+multi-dir merge across duplicate session dirs
 (`tests/test_resolve_session_dirs.py`, `tests/test_find_session_dir.py`)
-and a runtime smoke test — and the bash wrapper.
+and the work/wait/total invariants (`work + wait == total` within ±1s,
+identical `main:` / `sum:` triples) checked in a now-independent way — a
+frozen-clock suite calling `_main_unsafe(now=…)` in-process — a runtime
+smoke test — and the bash wrapper.
 
 ### Real-session fixture
 
