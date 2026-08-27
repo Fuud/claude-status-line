@@ -1253,10 +1253,11 @@ def test_prices_plain_key_adds_model_and_cost_columns(
     assert lines[1].split() == ["|", "model", "in", "out", "cached", "cost"], (
         f"table header: {lines[1]!r}"
     )
-    # The start row is a reference row: no model, no cost cell.
+    # The start row is a reference row (not part of sum) but carries the
+    # first event's model and its priced cost like every other row.
     assert lines[2].split()[:2] == ["|", "start:"], f"start row: {lines[2]!r}"
-    assert len(lines[2].split()) == 5, (
-        f"start row must carry exactly in/out/cached cells: {lines[2]!r}"
+    assert len(lines[2].split()) == 7, (
+        f"start row must carry model + in/out/cached + cost cells: {lines[2]!r}"
     )
     # sum group: two model rows, label only on the first, both with costs.
     assert lines[3].split()[:3] == ["|", "sum:", "kimi-k3"], f"sum row 1: {lines[3]!r}"
@@ -1426,7 +1427,7 @@ def test_synth_prices_per_model_rows_and_costs(tmp_path: Path) -> None:
     # agent glm (12000*6.9+4000*24+100000*1.7)/10000 = 34.88 → 34.9.
     assert lines[1:] == [
         "|                      model         in     out  cached          cost",
-        "| start:                            10K      5K     20K",
+        "| start:               glm-5.3      10K      5K     20K  22.3 credits",
         "| sum:                 glm-5.3      22K      9K    120K  57.2 credits",
         "|                      kimi-k3     2.0M    100K       0          $7.5",
         "| main:                glm-5.3      10K      5K     20K  22.3 credits",

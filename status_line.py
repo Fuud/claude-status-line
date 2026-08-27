@@ -632,6 +632,7 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
     nothing reads them.
     """
     start_in = start_out = start_cached = 0
+    start_model = ""
     context_tokens = 0
     tool_use_positions: dict[str, int] = {}
     task_notifications: dict[str, str] = {}
@@ -664,6 +665,10 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
                     start_in = in_v
                     start_out = out_v
                     start_cached = cache_read_v
+                    # Model of that first usage-bearing event — the start
+                    # row's model/cost cells (prices mode). Same "or ''"
+                    # normalization as _accumulate_model.
+                    start_model = str(msg.get("model") or "")
                 # Per-model breakdown (model/cost columns). Same gate
                 # as the start/context captures: only assistant events
                 # with a usage block; the setdefault/zero-record rules
@@ -710,6 +715,7 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
         "start_in": start_in,
         "start_out": start_out,
         "start_cached": start_cached,
+        "start_model": start_model,
         "context_tokens": context_tokens,
         "tool_use_positions": tool_use_positions,
         "last_uuid": last_uuid,
@@ -754,6 +760,7 @@ _EMPTY_MAIN_RESULT: dict = {
     "start_in": 0,
     "start_out": 0,
     "start_cached": 0,
+    "start_model": "",
     "context_tokens": 0,
     "last_uuid": "",
     "mtime_jsonl": 0.0,
@@ -853,7 +860,10 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
         and cache.get("last_uuid") == scan["last_uuid"]
         and cache.get("mtime_jsonl") == mtime_jsonl
         and "context_tokens" in cache
-        and all(f in cache for f in ("start_in", "start_out", "start_cached"))
+        and all(
+            f in cache
+            for f in ("start_in", "start_out", "start_cached", "start_model")
+        )
         and "per_model" in cache
     ):
         return cache
@@ -1626,6 +1636,7 @@ def render_output(
     agents: list,
     prices: dict | None = None,
     host: str = "",
+    start_model: str = "",
 ) -> str:
     """Build the multi-line status line string with a tabular breakdown.
 
@@ -1633,7 +1644,7 @@ def render_output(
         <header>
         | <table header — labels "model"/"in"/"out"/"cached"/"cost";
           the label/description column's label is EMPTY>
-        | start:                                     <in> <out> <cached>
+        | start: <model> <in> <out> <cached> <cost>
         | sum:   <model> <in> <out> <cached> <cost>   # only if agents
         | main:  <model> <in> <out> <cached> <cost>
         | for each agent (in input order):
@@ -1660,8 +1671,11 @@ def render_output(
 
     The start row is the FIRST table row: the first assistant event's
     breakdown (the session's baseline message). It is a reference row —
-    not part of the sum row, never carrying model/cost cells — and is
-    always rendered, like the main row, even when all zeros.
+    not part of the sum row — and is always rendered, like the main row,
+    even when all zeros. In prices mode it carries the first event's
+    model (start_model) and its priced cost; an empty start_model
+    (no usage-bearing first event / pre-upgrade cache) renders empty
+    model/cost cells.
 
     Every table row carries the "| " prefix (_TABLE_ROW_PREFIX) so that
     Claude Code's leading-whitespace strip cannot left-shift the
@@ -1768,11 +1782,16 @@ def render_output(
         rows.append(
             [
                 "start:",
-                "",
+                start_model,
                 format_tokens(start_in),
                 format_tokens(start_out),
                 format_tokens(start_cached),
-                "",
+                _cost_cell(
+                    start_model,
+                    {"in": start_in, "out": start_out, "cached": start_cached},
+                    prices,
+                    host,
+                ),
             ]
         )
         if projected:
@@ -2085,6 +2104,7 @@ def _main_unsafe() -> int:
         agents,
         prices=prices,
         host=host,
+        start_model=str(main_cum.get("start_model") or ""),
     )
     print(output)
     return 0

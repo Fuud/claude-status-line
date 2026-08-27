@@ -1126,7 +1126,7 @@ def test_readme_examples_match_render_output() -> None:
 
     with_prices = render_output(
         header, 12_000, 1_000, 0, main_models, agents,
-        prices=_PRICES, host="api.z.ai",
+        prices=_PRICES, host="api.z.ai", start_model="glm-5.3",
     )
     assert with_prices.split("\n") == with_prices_block.rstrip("\n").split("\n"), (
         "README with-prices example drifted from the real render_output"
@@ -1136,6 +1136,44 @@ def test_readme_examples_match_render_output() -> None:
     assert no_prices.split("\n") == no_prices_block.rstrip("\n").split("\n"), (
         "README no-prices example drifted from the real render_output"
     )
+
+
+def test_start_row_carries_model_and_cost() -> None:
+    """In prices mode the start row carries the first event's model and its
+    priced cost; with no start_model (no usage-bearing first event /
+    pre-upgrade cache) both cells render empty."""
+    main_models = {"glm-5.3": {"in": 10_000, "out": 5_000, "cached": 20_000}}
+    priced = render_output(
+        "Session: x", 10_000, 5_000, 20_000, main_models, [],
+        prices=_PRICES, host="api.z.ai", start_model="glm-5.3",
+    )
+    # (10000*6.9 + 5000*24 + 20000*1.7) / 10000 = 22.3 credits
+    assert priced.split("\n")[2].split() == [
+        "|", "start:", "glm-5.3", "10K", "5K", "20K", "22.3", "credits",
+    ], priced.split("\n")[2]
+
+    unpriced_model = render_output(
+        "Session: x", 10_000, 5_000, 20_000, main_models, [],
+        prices=_PRICES, host="api.z.ai", start_model="MiniMax-M3",
+    )
+    assert unpriced_model.split("\n")[2].split()[-1] == "n/a"
+
+    no_model = render_output(
+        "Session: x", 10_000, 5_000, 20_000, main_models, [],
+        prices=_PRICES, host="api.z.ai",
+    )
+    assert no_model.split("\n")[2].split() == [
+        "|", "start:", "10K", "5K", "20K",
+    ], no_model.split("\n")[2]
+
+    # prices=None: start row keeps the historical 3-cell shape regardless.
+    legacy = render_output(
+        "Session: x", 10_000, 5_000, 20_000, main_models, [],
+        start_model="glm-5.3",
+    )
+    assert legacy.split("\n")[2].split() == [
+        "|", "start:", "10K", "5K", "20K",
+    ], legacy.split("\n")[2]
 
 
 def test_prices_empty_dict_shows_columns_with_na() -> None:

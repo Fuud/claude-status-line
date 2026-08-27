@@ -15,7 +15,7 @@ row per model:
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
 |                                      model            in     out  cached          cost
-| start:                                               12K      1K       0
+| start:                               glm-5.3         12K      1K       0  10.7 credits
 | sum:                                 glm-5.3        1.1M     34K   50.8M  9.5K credits
 |                                      kimi-k3        150K     40K    3.0M          $1.9
 |                                      MiniMax-M3      500     200      3K           n/a
@@ -49,7 +49,8 @@ Line layout:
   label/description column's header cell is empty.
 - Line 3 — `start:` row with the FIRST assistant event's breakdown —
   the session's baseline message. A reference row: not included in the
-  `sum:` aggregate, never carrying model/cost cells.
+  `sum:` aggregate; in prices mode it carries that event's model and its
+  priced cost.
 - `sum:` group (omitted if there are zero agents) — per-model merge of
   the main session and every agent; each model keeps its own row (no
   cross-model sums).

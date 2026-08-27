@@ -48,6 +48,7 @@ def _write_main_cache(
     start_in: int = 0,
     start_out: int = 0,
     start_cached: int = 0,
+    start_model: str = "",
     context_tokens: int = 0,
     total: int | None = None,
     per_model: dict | None = None,
@@ -59,7 +60,8 @@ def _write_main_cache(
     writes to disk) and return the dict.
 
     `total=None` omits the legacy `total` key; pass an int to include it.
-    `context_tokens` and the `start_*` fields default to 0 — PRESENT
+    `context_tokens` and the `start_*` fields (incl. start_model) default
+    to 0/"" — PRESENT
     (possibly zero) fields; the cache-hit guard checks presence, not value.
     Same for `per_model` (defaults to a present-but-arbitrary dict).
     `mtime_jsonl=None` reads the current MAIN_NORMAL mtime so the cache hit
@@ -74,6 +76,7 @@ def _write_main_cache(
         "start_in": start_in,
         "start_out": start_out,
         "start_cached": start_cached,
+        "start_model": start_model,
         "context_tokens": context_tokens,
         "last_uuid": last_uuid,
         "mtime_jsonl": mtime_jsonl,
@@ -213,6 +216,7 @@ def test_cache_hit_returns_cached(tmp_path: Path) -> None:
         "start_in": sentinel_start,
         "start_out": 0,
         "start_cached": 0,
+        "start_model": "",
         "context_tokens": sentinel_context,
         "last_uuid": "66666666-6666-6666-6666-666666666666",  # matches main_with_tool_use tail
         "mtime_jsonl": MAIN_TOOL_USE.stat().st_mtime,
@@ -239,6 +243,7 @@ def test_cache_miss_recomputes(tmp_path: Path) -> None:
         "start_in": 0,
         "start_out": 0,
         "start_cached": 0,
+        "start_model": "",
         "context_tokens": 0,
         "last_uuid": "stale-uuid-from-old-session",
         "tool_use_positions": {},
@@ -433,6 +438,7 @@ def test_cache_hit_preserves_task_notifications(tmp_path: Path) -> None:
         "start_in": 0,
         "start_out": 0,
         "start_cached": 0,
+        "start_model": "",
         "context_tokens": 0,
         "total": 999_999_999,
         "last_uuid": "66666666-6666-6666-6666-666666666666",  # matches MAIN_TOOL_USE tail
@@ -472,6 +478,7 @@ def test_cache_invalidates_on_mtime_change(tmp_path: Path) -> None:
         "start_in": 0,
         "start_out": 0,
         "start_cached": 0,
+        "start_model": "",
         "context_tokens": 0,
         "last_uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",  # matches fixture tail
         "tool_use_positions": {},
@@ -500,6 +507,7 @@ def test_cache_hit_preserves_mtime_jsonl_field(tmp_path: Path) -> None:
         "start_in": 0,
         "start_out": 0,
         "start_cached": 0,
+        "start_model": "",
         "context_tokens": 0,
         "last_uuid": "66666666-6666-6666-6666-666666666666",
         "tool_use_positions": {},
@@ -573,7 +581,7 @@ def test_result_has_no_flat_cum_keys(tmp_path: Path) -> None:
         )
     # Sanity: the surviving keys ARE present.
     for key in (
-        "start_in", "start_out", "start_cached", "context_tokens",
+        "start_in", "start_out", "start_cached", "start_model", "context_tokens",
         "last_uuid", "mtime_jsonl", "tool_use_positions",
         "task_notifications", "per_model",
     ):
@@ -709,6 +717,7 @@ def test_cache_hit_requires_context_tokens_field(tmp_path: Path) -> None:
         "start_in": 0,
         "start_out": 0,
         "start_cached": 0,
+        "start_model": "",
         "last_uuid": MAIN_NORMAL_LAST_UUID,
         "mtime_jsonl": MAIN_NORMAL.stat().st_mtime,
         "tool_use_positions": {},
@@ -743,6 +752,7 @@ def test_start_values_from_first_assistant_event(tmp_path: Path) -> None:
     assert result["start_in"] == 100
     assert result["start_out"] == 30
     assert result["start_cached"] == 200
+    assert result["start_model"] == "claude-opus-4-1"
     # Distinct from both the whole-session per-model sums (450/230/1400)
     # and the last event's occupancy (context_tokens=1050).
     rec = result["per_model"]["claude-opus-4-1"]
@@ -761,12 +771,14 @@ def test_start_persisted_to_cache(tmp_path: Path) -> None:
     assert on_disk["start_in"] == 100
     assert on_disk["start_out"] == 30
     assert on_disk["start_cached"] == 200
+    assert on_disk["start_model"] == "claude-opus-4-1"
 
     # Second call hits the cache and returns the same start values.
     result2 = compute_main_cum(MAIN_NORMAL, cache)
     assert result2["start_in"] == 100
     assert result2["start_out"] == 30
     assert result2["start_cached"] == 200
+    assert result2["start_model"] == "claude-opus-4-1"
 
 
 def test_start_zero_when_no_assistant_events(tmp_path: Path) -> None:
@@ -781,6 +793,28 @@ def test_start_zero_when_no_assistant_events(tmp_path: Path) -> None:
     assert result["start_in"] == 0
     assert result["start_out"] == 0
     assert result["start_cached"] == 0
+    assert result["start_model"] == ""
+
+
+def test_start_model_is_first_usage_event_model(tmp_path: Path) -> None:
+    """With a mid-session model switch the start row must keep the FIRST
+    usage-bearing event's model — the row describes the session's baseline
+    message, not the latest model."""
+    jsonl = tmp_path / "switch.jsonl"
+    jsonl.write_text(
+        '{"type":"assistant","message":{"role":"assistant","model":"kimi-k3",'
+        '"content":[],"usage":{"input_tokens":10,"output_tokens":1,'
+        '"cache_read_input_tokens":0}},"uuid":"u1"}\n'
+        '{"type":"assistant","message":{"role":"assistant","model":"glm-5.3",'
+        '"content":[],"usage":{"input_tokens":20,"output_tokens":2,'
+        '"cache_read_input_tokens":0}},"uuid":"u2"}\n'
+    )
+    cache = tmp_path / "main_switch.json"
+
+    result = compute_main_cum(jsonl, cache)
+
+    assert result["start_model"] == "kimi-k3"
+    assert set(result["per_model"]) == {"kimi-k3", "glm-5.3"}
 
 
 def test_start_first_event_without_usage_skipped(tmp_path: Path) -> None:
