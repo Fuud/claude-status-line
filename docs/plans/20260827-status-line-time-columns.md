@@ -272,12 +272,12 @@ JSON `null` в полях времени кэша проходит presence-га
 - Modify: `status_line.py` (`_main_unsafe`, `main`)
 - Modify: `tests/test_main_integration.py`
 
-- [ ] написать тест-кейс «фоновый агент заполняет простой main»: union превращает wait в work (главное правило) — frozen-now: вызов `_main_unsafe(now=…)` in-process (monkeypatch `sys.stdin`, `capsys`), не subprocess
-- [ ] написать тест: параллельные агенты не задваиваются (union) — тот же in-process механизм
-- [ ] написать интеграционные тесты на `real_session` (существующий subprocess-формат, проверки инвариантны к `now`): `work + wait == total` (±1с), строки `main:` == `sum:`, значения > 0, вывод содержит три колонки
-- [ ] прогнать — красный
-- [ ] реализовать `_main_unsafe(now=None)`: сбор интервалов, продления (open ход, run-агент, обрезка по `qa_open_ts`), `union_work`, инжект `time_*` в агент-дикты после `_write_agents_cache`, передача `main_time` в `render_output`; `main()` передаёт `time.time()`
-- [ ] прогнать — зелёный, до задачи 7
+- [x] написать тест-кейс «фоновый агент заполняет простой main»: union превращает wait в work (главное правило) — frozen-now: вызов `_main_unsafe(now=…)` in-process (monkeypatch `sys.stdin`, `capsys`), не subprocess
+- [x] написать тест: параллельные агенты не задваиваются (union) — тот же in-process механизм
+- [x] написать интеграционные тесты на `real_session` (существующий subprocess-формат, проверки инвариантны к `now`): `work + wait == total` (±1с), строки `main:` == `sum:`, значения > 0, вывод содержит три колонки
+- [x] прогнать — красный
+- [x] реализовать `_main_unsafe(now=None)`: сбор интервалов, продления (open ход, run-агент, обрезка по `qa_open_ts`), `union_work`, инжект `time_*` в агент-дикты после `_write_agents_cache`, передача `main_time` в `render_output`; `main()` передаёт `time.time()`
+- [x] прогнать — зелёный, до задачи 7
 
 ### Task 7: Verify acceptance criteria
 

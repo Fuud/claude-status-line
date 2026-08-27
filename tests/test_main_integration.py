@@ -12,6 +12,7 @@ Layout under fake HOME:
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -19,9 +20,13 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+import status_line
+from status_line import _parse_ts
 
 FIXTURES = Path(__file__).parent / "fixtures"
 REAL_SESSION_SID = "f5044e4f-3e01-4330-be72-eb008a1d035e"
@@ -60,6 +65,39 @@ def _run_main(
         timeout=30,
         env=env,
     )
+
+
+# ---------------------------------------------------------------------------
+# Time-cell plumbing shared by the Task 6 tests (plan
+# 20260827-status-line-time-columns). With the orchestrator wired
+# (main() passes now=time.time()) every session/agent row ends with three
+# live "HH:MM:SS" cells whose VALUES depend on wall-clock time. Tests
+# therefore either pin exact values (the frozen-now in-process runs in
+# section 13) or mask durations away (legacy cross-invocation equality).
+# ---------------------------------------------------------------------------
+
+_DUR_CELL = r"\d{1,}:[0-5]\d:[0-5]\d"
+_DUR_CELL_RE = re.compile(_DUR_CELL)
+
+
+def _mask_durations(text: str) -> str:
+    """Replace every HH:MM:SS duration cell with "<DUR>".
+
+    Consecutive hook invocations over unchanged files differ ONLY in the
+    elapsed-time digits (live-now durations grow), so masking them makes
+    byte-level output comparisons meaningful again."""
+    return _DUR_CELL_RE.sub("<DUR>", text)
+
+
+def _hms_seconds(cell: str) -> int:
+    """Parse "HH:MM:SS" into total seconds. Raises on anything else so a
+    shifted/missing time column fails loudly instead of silently passing."""
+    hours, minutes, secs = cell.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + int(secs)
+
+
+def _is_duration_cell(cell: str) -> bool:
+    return re.fullmatch(_DUR_CELL, cell) is not None
 
 
 @pytest.fixture
@@ -426,12 +464,21 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
         f"second call header should contain the real session_id, got: "
         f"{second_lines[0]!r}"
     )
-    # Output must be byte-identical to the first call (no flake — the cache
-    # hit should be deterministic for unchanged files).
-    assert second_output == first_output, (
+    # Output must be identical to the first call apart from the live-now
+    # duration cells (the cache hit should be deterministic for unchanged
+    # files; since plan 20260827-status-line-time-columns main() passes
+    # now=time.time(), the work/wait/total cells legitimately grow between
+    # invocations — mask them before comparing).
+    assert _mask_durations(second_output) == _mask_durations(first_output), (
         "cache-hit output diverged from cache-miss output:\n"
         f"first:  {first_output[:200]!r}\n"
         f"second: {second_output[:200]!r}"
+    )
+    # Both calls rendered REAL durations on the sum row (time columns are
+    # populated end-to-end, not blank).
+    sum_cells = first_lines[3].split()
+    assert all(_is_duration_cell(c) for c in sum_cells[-3:]), (
+        f"sum row lacks HH:MM:SS work/wait/total cells: {lines[3]!r}"
     )
 
 
@@ -878,7 +925,14 @@ def test_dirless_session_via_transcript_path_renders_main_row(
     assert start_cells[2:] == _DIRLESS_EXPECTED_START_CELLS, f"start row: {start!r}"
     cells = main.split()
     assert cells[:2] == ["|", "main:"], f"main row: {main!r}"
-    assert cells[2:] == _DIRLESS_EXPECTED_CELLS, f"main row: {main!r}"
+    # Token totals unchanged, then the three live duration cells — values
+    # depend on wall-clock now (fixture stamps are in the past), so only
+    # their HH:MM:SS shape is pinned here. Exact-value pins live in the
+    # frozen-now tests of section 13.
+    assert cells[2:5] == _DIRLESS_EXPECTED_CELLS, f"main row: {main!r}"
+    assert len(cells) == 8 and all(
+        _is_duration_cell(c) for c in cells[5:]
+    ), f"main row must end with 3 duration cells: {main!r}"
     assert "sum:" not in result.stdout.decode("utf-8"), "no agents → no sum row"
 
 
@@ -895,7 +949,11 @@ def test_dirless_session_via_glob_renders_main_row(tmp_path: Path) -> None:
     assert len(lines) == 4, f"expected 4 lines: {lines!r}"
     assert lines[0].endswith("| Context: 2K (1%)"), f"header: {lines[0]!r}"
     assert lines[2].split()[2:] == _DIRLESS_EXPECTED_START_CELLS, f"start: {lines[2]!r}"
-    assert lines[3].split()[2:] == _DIRLESS_EXPECTED_CELLS, f"main: {lines[3]!r}"
+    main_cells = lines[3].split()
+    assert main_cells[2:5] == _DIRLESS_EXPECTED_CELLS, f"main: {lines[3]!r}"
+    assert all(_is_duration_cell(c) for c in main_cells[5:]), (
+        f"main row must end with duration cells: {lines[3]!r}"
+    )
 
 
 def test_dirless_session_skips_agents_cache_write(tmp_path: Path) -> None:
@@ -1136,7 +1194,11 @@ def test_merge_session_second_call_uses_persisted_cache(tmp_path: Path) -> None:
     second = _run_main(stdin, tmp_path)
 
     assert second.returncode == 0, second.stderr.decode("utf-8", "replace")
-    assert second.stdout == first.stdout, (
+    # Durations are masked: live-now cells legitimately grow between the
+    # two invocations; everything else must be byte-identical.
+    assert _mask_durations(second.stdout.decode("utf-8")) == _mask_durations(
+        first.stdout.decode("utf-8")
+    ), (
         "cache-hit invocation must render identically:\n"
         f"first={first.stdout.decode('utf-8')!r}\nsecond={second.stdout.decode('utf-8')!r}"
     )
@@ -1268,14 +1330,26 @@ def test_prices_plain_key_adds_model_and_cost_columns(
         f"start row must carry model + in/out/cached + cost cells: {lines[2]!r}"
     )
     # sum group: two model rows, label only on the first, both with costs.
+    # Since Task 6 wires live durations, time cells ride ONLY a group's
+    # FIRST row (continuations rstrip to their cost), so each row's cost is
+    # located after trimming an optional trailing HH:MM:SS run.
+    def _cost_of(cells: list) -> str:
+        if len(cells) >= 3 and all(_is_duration_cell(c) for c in cells[-3:]):
+            return cells[-4]
+        return cells[-1]
+
     assert lines[3].split()[:3] == ["|", "sum:", "kimi-k3"], f"sum row 1: {lines[3]!r}"
-    assert lines[3].split()[-1].startswith("$"), f"sum row 1 cost: {lines[3]!r}"
+    assert _cost_of(lines[3].split()).startswith("$"), f"sum row 1 cost: {lines[3]!r}"
     assert lines[4].split()[:2] == ["|", "glm-5.3"], f"sum row 2: {lines[4]!r}"
     assert "sum:" not in lines[4], f"label must ride the first row only: {lines[4]!r}"
-    assert lines[4].split()[-1].startswith("$"), f"sum row 2 cost: {lines[4]!r}"
+    assert _cost_of(lines[4].split()).startswith("$"), f"sum row 2 cost: {lines[4]!r}"
     # main group: per-model cumulative totals + computed costs.
-    assert lines[5].split() == _MAIN_KIMI_ROW, f"main row 1: {lines[5]!r}"
-    assert lines[6].split() == _MAIN_GLM_ROW, f"main row 2: {lines[6]!r}"
+    for index, expected in ((5, _MAIN_KIMI_ROW), (6, _MAIN_GLM_ROW)):
+        got = lines[index].split()
+        assert got[:7] == expected, f"main row: {lines[index]!r}"
+        assert all(_is_duration_cell(c) for c in got[7:]), (
+            f"main row must end with 3 duration cells: {lines[index]!r}"
+        )
     # 38 agent rows, one per agent: single-model agents collapse to one row.
     agent_lines = lines[7:]
     assert len(agent_lines) == 38, f"expected 38 agent rows, got {len(agent_lines)}"
@@ -1309,8 +1383,10 @@ def test_prices_host_key_matches_via_env(fake_home_with_real_session) -> None:
     )
     lines = result.stdout.decode("utf-8").splitlines()
     assert len(lines) == _PRICES_LINE_COUNT, f"first 8: {lines[:8]}"
-    assert lines[5].split() == _MAIN_KIMI_ROW, f"main row 1: {lines[5]!r}"
-    assert lines[6].split() == _MAIN_GLM_ROW, f"main row 2: {lines[6]!r}"
+    for index, expected in ((5, _MAIN_KIMI_ROW), (6, _MAIN_GLM_ROW)):
+        got = lines[index].split()
+        assert got[:7] == expected, f"main row: {lines[index]!r}"
+        assert all(_is_duration_cell(c) for c in got[7:])
     assert all("n/a" not in line.split() for line in lines[1:])
 
 
@@ -1332,12 +1408,12 @@ def test_prices_host_key_without_env_is_na(fake_home_with_real_session) -> None:
     )
     lines = result.stdout.decode("utf-8").splitlines()
     assert len(lines) == _PRICES_LINE_COUNT, f"first 8: {lines[:8]}"
-    assert lines[5].split() == _MAIN_KIMI_ROW[:-1] + ["n/a"], (
-        f"main row 1 should be n/a: {lines[5]!r}"
-    )
-    assert lines[6].split() == _MAIN_GLM_ROW[:-1] + ["n/a"], (
-        f"main row 2 should be n/a: {lines[6]!r}"
-    )
+    for index, expected in ((5, _MAIN_KIMI_ROW), (6, _MAIN_GLM_ROW)):
+        got = lines[index].split()
+        assert got[:7] == expected[:-1] + ["n/a"], (
+            f"main row should be n/a: {lines[index]!r}"
+        )
+        assert all(_is_duration_cell(c) for c in got[7:])
 
 
 def test_prices_absent_no_columns(fake_home_with_real_session) -> None:
@@ -1432,18 +1508,334 @@ def test_synth_prices_per_model_rows_and_costs(tmp_path: Path) -> None:
     lines = result.stdout.decode("utf-8").splitlines()
     # header + labels + start + sum(2) + main(2) + agent(1) = 8 lines
     assert len(lines) == 8, f"first 8: {lines[:8]}"
-    # Byte-exact table (header line skipped — it carries the machine's
-    # branch name). Costs: main glm (10000*6.9+5000*24+20000*1.7)/10000
-    # = 22.3 credits; kimi (2000000*3+100000*15)/1e6 = 7.5 → $7.5; sum
-    # glm (22000*6.9+9000*24+120000*1.7)/10000 = 57.18 → 57.2 credits;
+    # Structural pin of every table row (header line skipped — it carries
+    # the machine's branch name). Costs: main glm
+    # (10000*6.9+5000*24+20000*1.7)/10000 = 22.3 credits; kimi
+    # (2000000*3+100000*15)/1e6 = 7.5 → $7.5; sum glm
+    # (22000*6.9+9000*24+120000*1.7)/10000 = 57.18 → 57.2 credits;
     # agent glm (12000*6.9+4000*24+100000*1.7)/10000 = 34.88 → 34.9.
-    assert lines[1:] == [
-        "|                      model         in     out  cached"
-        "  cost              work     wait    total",
-        "| start:               glm-5.3      10K      5K     20K  22.3 credits",
-        "| sum:                 glm-5.3      22K      9K    120K  57.2 credits",
-        "|                      kimi-k3     2.0M    100K       0  $7.5",
-        "| main:                glm-5.3      10K      5K     20K  22.3 credits",
-        "|                      kimi-k3     2.0M    100K       0  $7.5",
-        "| [ok]    Synth agent  glm-5.3      12K      4K    100K  34.9 credits",
-    ], f"table mismatch:\n" + "\n".join(repr(l) for l in lines[1:])
+    # Since the orchestrator passes now=time.time(), each group's FIRST row
+    # also ends with three live HH:MM:SS cells whose values depend on
+    # wall-clock distance to the fixture stamps — only shape is pinned.
+    # Continuation per-model rows keep EMPTY time cells (they are rstripped
+    # away), and the reference start row never carries time cells at all.
+    # Row tuples: (label-or-None, fixed tail cells, has_duration_tail).
+    # [deviation] Previously this table was byte-exact; live durations made
+    # the trailing cells (and eventually the column WIDTHS) wall-clock
+    # dependent.
+    assert lines[1].split() == [
+        "|", "model", "in", "out", "cached", "cost", "work", "wait", "total",
+    ], f"labels: {lines[1]!r}"
+    expected_rows = [
+        ("start:", ["glm-5.3", "10K", "5K", "20K", "22.3", "credits"], False),
+        ("sum:", ["glm-5.3", "22K", "9K", "120K", "57.2", "credits"], True),
+        (None, ["kimi-k3", "2.0M", "100K", "0", "$7.5"], False),
+        ("main:", ["glm-5.3", "10K", "5K", "20K", "22.3", "credits"], True),
+        (None, ["kimi-k3", "2.0M", "100K", "0", "$7.5"], False),
+        # The icon AND the description form the group label together.
+        ("[ok] Synth agent", ["glm-5.3", "12K", "4K", "100K", "34.9",
+                              "credits"], True),
+    ]
+    for raw, (label, tail_cells, has_durations) in zip(lines[2:], expected_rows):
+        got = raw.split()
+        body = got[1:]
+        # Group label rides the row start; descriptions may contain spaces,
+        # so match it word-wise.
+        if label is not None:
+            label_parts = label.split()
+            assert body[: len(label_parts)] == label_parts, (
+                f"row {raw!r}: label {label!r} not at row start"
+            )
+            body = body[len(label_parts):]
+        # First rows of a group close with three positive live duration
+        # cells (fixture stamps lie in the past); cut them off before
+        # comparing the fixed model/token/cost tail.
+        if has_durations:
+            assert len(body) >= 3 and all(
+                _is_duration_cell(c) for c in body[-3:]
+            ), f"row must end with 3 HH:MM:SS cells: {raw!r}"
+            # Zeros are legitimate here (the agent transcript is a single
+            # stamped event → a zero-length lifetime renders 00:00:00);
+            # strictly-positive durations are pinned by the frozen-now and
+            # real-session tests instead.
+            body = body[:-3]
+        assert body == list(tail_cells), (
+            f"row {raw!r}: fixed cells {body!r} != {list(tail_cells)!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 13. Orchestrator time columns (20260827 plan, Task 6): _main_unsafe(now=…)
+#     unions main turns + agent lifetimes into session work/wait/total and
+#     injects per-agent durations AFTER the agents-cache write.
+#
+#     Frozen-now coverage runs _main_unsafe IN-PROCESS (per the plan's
+#     Testing Strategy: monkeypatch cannot cross a subprocess boundary, so
+#     wall-clock freezing requires the in-process route with patched stdin +
+#     capsys). The real-fixture test below stays in the historical
+#     subprocess format because its assertions are invariant to `now`.
+# ---------------------------------------------------------------------------
+
+_FROZEN_BASE = datetime(2026, 8, 27, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _frozen_iso(offset: float) -> str:
+    """ISO-8601 Z stamp `offset` seconds after the frozen base."""
+    dt = _FROZEN_BASE + timedelta(seconds=offset)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _fzep(offset: float) -> float:
+    """Epoch expectation for a frozen-base offset (via _parse_ts — no epoch
+    number is ever hardcoded)."""
+    return _parse_ts(_frozen_iso(offset))
+
+
+def _fz_user(offset: float, text: str) -> str:
+    return json.dumps({
+        "type": "user",
+        "timestamp": _frozen_iso(offset),
+        "message": {"role": "user", "content": text},
+        "uuid": f"fu{offset:.0f}",
+    })
+
+
+def _fz_assistant(
+    offset: float, stop: str = "end_turn", in_tok: int = 100, out_tok: int = 10
+) -> str:
+    return json.dumps({
+        "type": "assistant",
+        "timestamp": _frozen_iso(offset),
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "working"}],
+            "model": "kimi-k3",
+            "stop_reason": stop,
+            "usage": {
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        },
+        "uuid": f"fa{offset:.0f}",
+    })
+
+
+def _fz_agent_jsonl(user_off: float, assist_off: float) -> str:
+    """Two-event agent transcript: user prompt then an end_turn assistant →
+    detect_status says [ok]; lifetime = [user_off, assist_off]."""
+    return (
+        _fz_user(user_off, "sub-agent task")
+        + "\n"
+        + _fz_assistant(assist_off, "end_turn", in_tok=50, out_tok=5)
+        + "\n"
+    )
+
+
+def _fz_main_done_turn() -> list[str]:
+    """Main transcript with ONE finished turn: prompt at t=0 answered by an
+    end_turn assistant at t=20 — afterwards the session is idle (turn
+    closed, nothing extends toward now)."""
+    return [
+        _fz_user(0, "kick things off"),
+        _fz_assistant(20, "end_turn"),
+    ]
+
+
+# Frozen geometry shared by both orchestrator tests (all in seconds):
+#   main turn work ................. 20   ([t=0, t=20])
+#   background agents' lifetimes ... 240  ([t=60, t=300])
+#   frozen now ..................... t=1200
+# Session union work = 20 + 240 = 260 → "00:04:20";
+# total = 1200 → "00:20:00"; wait = 940 → "00:15:40".
+_FROZEN_NOW_OFFSET = 1200
+_FROZEN_SESSION_CELLS = ["00:04:20", "00:15:40", "00:20:00"]
+_FROZEN_AGENT_CELLS = ["00:04:00", "00:00:00", "00:04:00"]
+
+FROZEN_SID_IDLE = "71d1e100-0000-4000-8000-0000000000a1"
+FROZEN_SID_PARALLEL = "71d1e100-0000-4000-8000-0000000000b2"
+
+
+def _run_frozen_now(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    sid: str,
+    main_lines: list[str],
+    agent_files: list[tuple[str, str, str]],
+) -> tuple[int, list[str]]:
+    """Build a synthetic session, then invoke `_main_unsafe(now=…)`
+    IN-PROCESS with the clock effectively frozen (now is passed explicitly).
+
+    Hermeticity inside one pytest process:
+      - Path.home → tmp_path (projects tree + status_line data dir resolve
+        under it — mirrors what the HOME-env override does for subprocess
+        runs in _run_main);
+      - _PRICES_PATH is rebound under tmp_path — the import-time constant
+        still points at the DEVELOPER'S real prices.json and would otherwise
+        leak columns into these runs;
+      - sys.stdin → StringIO with the JSON payload (parse_stdin contract);
+      - stdout goes through capsys.
+
+    The parse_stdin branch probe may shell out to real git in the repo cwd —
+    harmless, only the header's Branch segment consumes the result.
+    """
+    _build_synth_session(tmp_path, sid, main_lines, agent_files)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        status_line,
+        "_PRICES_PATH",
+        tmp_path / ".claude" / "status_line" / "prices.json",
+    )
+    payload = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    rc = status_line._main_unsafe(now=_fzep(_FROZEN_NOW_OFFSET))
+    captured = capsys.readouterr()
+    return rc, captured.out.splitlines()
+
+
+def test_frozen_background_agent_fills_main_idle_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """THE rule: a background agent living entirely inside main's idle gap
+    turns that waiting into WORK via the union (its whole lifetime counts
+    once, even though main's own turns ended long before)."""
+    rc, lines = _run_frozen_now(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        FROZEN_SID_IDLE,
+        _fz_main_done_turn(),
+        [("agent-bgfill", _fz_agent_jsonl(60, 300),
+          _agent_meta("Bg: filler", "toolu_bg"))],
+    )
+
+    assert rc == 0, f"non-zero exit; lines[:2]={lines[:2]!r}"
+    # header, labels, start, sum, main, 1 agent = 6 lines
+    assert len(lines) == 6, f"unexpected line count: {lines!r}"
+    assert lines[1].split() == [
+        "|", "in", "out", "cached", "work", "wait", "total",
+    ], f"labels: {lines[1]!r}"
+
+    sum_cells = next(l for l in lines if l.startswith("| sum:")).split()
+    main_cells = next(l for l in lines if l.startswith("| main:")).split()
+    # Identical triples on both rows — waiting on agents already counts as
+    # main's work (union consequence agreed in the plan Overview).
+    assert sum_cells[-3:] == _FROZEN_SESSION_CELLS, f"sum row: {sum_cells!r}"
+    assert main_cells[-3:] == _FROZEN_SESSION_CELLS, f"main row: {main_cells!r}"
+    work, wait_s, total_s = (_hms_seconds(c) for c in sum_cells[-3:])
+    # Without the agent, work would have stopped at 20s (main's own turn).
+    # The union raised it to 260 = 20 + 240 — the agent's life became work.
+    assert work == 260 > 20, f"union did not fold agent idle-gap time in: {work}s"
+    assert work + wait_s == total_s, f"invariant broken: {work}+{wait_s}!={total_s}"
+    assert total_s == _FROZEN_NOW_OFFSET
+
+    # Per-agent cells ride the agent's row: dur 240 / wait 0 / total 240.
+    agent_cells = next(l for l in lines if "[ok]" in l).split()
+    assert agent_cells[-3:] == _FROZEN_AGENT_CELLS, f"agent row: {agent_cells!r}"
+
+    # The injected durations are TRANSIENT: nothing but the four scan fields
+    # reaches the persisted agents cache.
+    cache_path = (
+        tmp_path / ".claude" / "status_line" / "data" / f"agents_{FROZEN_SID_IDLE}.json"
+    )
+    loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+    entry = loaded["agent-bgfill"]
+    assert all(f not in entry for f in ("time_work", "time_wait", "time_total")), (
+        f"transient durations leaked into cache: {sorted(entry)!r}"
+    )
+    assert entry["ts_first"] == _fzep(60)
+    assert entry["ts_last"] == _fzep(300)
+
+
+def test_frozen_parallel_agents_union_does_not_double_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Two agents covering the SAME wall-clock window add their duration to
+    the union ONCE: session work stays 260 (= main 20 + window 240), never
+    500 (naive per-agent summation)."""
+    agents = [
+        ("agent-parA", _fz_agent_jsonl(60, 300),
+         _agent_meta("Par: alpha", "toolu_pa")),
+        ("agent-parB", _fz_agent_jsonl(60, 300),
+         _agent_meta("Par: beta", "toolu_pb")),
+    ]
+    rc, lines = _run_frozen_now(
+        monkeypatch, capsys, tmp_path, FROZEN_SID_PARALLEL,
+        _fz_main_done_turn(), agents,
+    )
+
+    assert rc == 0, f"non-zero exit; lines[:2]={lines[:2]!r}"
+    # header, labels, start, sum, main, 2 agents = 7 lines
+    assert len(lines) == 7, f"unexpected line count: {lines!r}"
+    sum_cells = next(l for l in lines if l.startswith("| sum:")).split()
+    main_cells = next(l for l in lines if l.startswith("| main:")).split()
+    assert sum_cells[-3:] == _FROZEN_SESSION_CELLS, (
+        f"parallel windows doubled: {sum_cells!r}"
+    )
+    assert main_cells[-3:] == sum_cells[-3:], "main/sum divergence"
+    work, wait_s, total_s = (_hms_seconds(c) for c in sum_cells[-3:])
+    assert work == 260, f"expected single-count union (260s), got {work}s"
+    assert work + wait_s == total_s
+
+    # EACH agent still shows its OWN full window as its personal duration.
+    par_alpha = next(l for l in lines if "Par: alpha" in l).split()
+    par_beta = next(l for l in lines if "Par: beta" in l).split()
+    assert par_alpha[-3:] == _FROZEN_AGENT_CELLS, f"alpha row: {par_alpha!r}"
+    assert par_beta[-3:] == _FROZEN_AGENT_CELLS, f"beta row: {par_beta!r}"
+
+
+def test_real_session_time_columns_invariants(fake_home_with_real_session) -> None:
+    """End-to-end over the REAL fixture, historical subprocess format (every
+    assertion here is invariant to wall-clock `now`):
+
+        work + wait == total   (±1s — flooring three values independently
+                                can diverge by exactly one second at most)
+        main: row == sum: row  (union consequence)
+        all three values > 0   (a long real interactive session worked AND
+                                idled at some point)
+        the table renders the three time-column labels, and at least one
+        agent row carries populated duration cells.
+    """
+    tmp_path, sid = fake_home_with_real_session
+    stdin = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+    result = _run_main(stdin, tmp_path)
+    assert result.returncode == 0, (
+        f"non-zero exit; stderr={result.stderr.decode('utf-8', 'replace')}"
+    )
+    lines = result.stdout.decode("utf-8").splitlines()
+    assert lines[1].split() == [
+        "|", "in", "out", "cached", "work", "wait", "total",
+    ], f"labels: {lines[1]!r}"
+
+    sum_cells = next(l for l in lines if l.startswith("| sum:")).split()
+    main_cells = next(l for l in lines if l.startswith("| main:")).split()
+    session_triple = sum_cells[-3:]
+    for cell in session_triple:
+        assert _is_duration_cell(cell), f"non-duration session cell: {cell!r}"
+    work, wait_s, total_s = (_hms_seconds(c) for c in session_triple)
+
+    assert abs((work + wait_s) - total_s) <= 1, (
+        f"work({work}) + wait({wait_s}) != total({total_s}) beyond ±1s "
+        f"(raw cells: {session_triple!r})"
+    )
+    assert session_triple == main_cells[-3:], (
+        f"main row diverged from sum row: {main_cells[-3:]!r} vs {session_triple!r}"
+    )
+    assert work > 0, f"real session rendered zero work: {session_triple!r}"
+    assert wait_s > 0, f"real session rendered zero wait: {session_triple!r}"
+    assert total_s > 0, f"real session rendered zero total: {session_triple!r}"
+
+    main_index = next(i for i, l in enumerate(lines) if l.startswith("| main:"))
+    agent_rows = lines[main_index + 1:]
+    assert agent_rows, "fixture must render at least one agent row"
+    filled = sum(
+        1
+        for row in agent_rows
+        if all(_is_duration_cell(c) for c in row.split()[-3:])
+    )
+    assert filled >= 1, (
+        f"expected at least one agent row with duration cells:\n"
+        + "\n".join(agent_rows[:5])
+    )

@@ -26,6 +26,12 @@ Module-level invariants:
   per-model records are skipped and a group left empty renders ONE zero
   row with an empty model cell (groups are never skipped). The start row
   is a reference row and never carries model/cost or time cells.
+- The orchestrator (main() → _main_unsafe(now=time.time())) computes the
+  session work/wait/total union triple (main turns + agent lifetimes,
+  live-now extensions applied; AskUserQuestion pauses excluded) and each
+  agent's personal durations every cycle — both are injected as transient
+  fields AFTER the agents-cache write and never persist
+  (plan 20260827-status-line-time-columns).
 - The orchestrator override in _compute_agents may additionally set
   agent.status="kill" when a main-log queue-operation task-notification with
   <status>killed</status> is present and the compute_agent_snapshot verdict
@@ -648,6 +654,20 @@ def _to_int(value: object) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0
+
+
+def _to_float(value: object) -> float | None:
+    """Coerce a jsonl/cache value to float; None for anything non-numeric.
+
+    Float counterpart of _to_int for the time-arithmetic path (plan
+    20260827-status-line-time-columns): a JSON null inside a persisted
+    time field passes the presence-guard but would raise TypeError out of
+    the arithmetic, so every epoch/duration number read back from a cache
+    file is funneled through here. bool is rejected despite being an int
+    subclass (same convention as _is_num / parse_stdin)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
 
 
 def _accumulate_model(
@@ -2405,9 +2425,13 @@ def main() -> int:
     Returns the process exit code (0 on success; we never return non-zero
     because the status line hook should never break the user's session —
     errors are swallowed and the worst case is a degraded display).
+
+    Supplies now=time.time() so the work/wait/total columns render live
+    values (plan 20260827-status-line-time-columns); tests freeze the clock
+    by calling _main_unsafe(now=…) directly instead.
     """
     try:
-        return _main_unsafe()
+        return _main_unsafe(now=time.time())
     except Exception:
         # Hard safety net: any unexpected error (OSError not anticipated,
         # programming bug, future-proofing) MUST NOT propagate out of the
@@ -2563,9 +2587,115 @@ def _write_agents_cache(agents_cache_path: Path, agents: list) -> None:
         pass
 
 
-def _main_unsafe() -> int:
+def _agent_time_segments(
+    agent: dict, now: float | None
+) -> tuple[list, float, float, float] | None:
+    """Work sub-intervals + durations for ONE agent snapshot.
+
+    Returns (work_intervals, work_sec, wait_sec, total_sec), or None when
+    the agent carries no usable lifetime stamps (ts_first/ts_last missing,
+    null or 0.0 — degradation contract: EMPTY cells downstream, never
+    "00:00:00") or a corrupt inverted lifetime.
+
+    Geometry (plan 20260827-status-line-time-columns):
+        - lifetime [ts_first → ts_last] over all stamped events;
+        - while the agent is still running (status=run) WITHOUT an open
+          AskUserQuestion the tail extends to `now` — "a running agent's
+          duration grows" (max() guards against shrinking a stamp that is
+          already ahead of a skewed clock);
+        - with an OPEN question (qa_open_ts > 0) the lifetime is trimmed AT
+          the question moment instead — nothing accrues while the human has
+          not answered, even for a run-status agent (trim wins over
+          extension);
+        - closed qa_pauses pairs are cut out of the lifetime, each clipped
+          into its live window ([decision] clipping rather than the naive
+          raw sum of pair lengths keeps wait ≤ duration when junk or
+          partially-overlapping pairs arrive from a hand-corrupted cache);
+        - wait = Σ clipped pauses (+ now − qa_open_ts for an open one);
+          work = total − wait clamped ≥ 0 defensively.
+    """
+    ts_first = _to_float(agent.get("ts_first")) or 0.0
+    ts_last = _to_float(agent.get("ts_last")) or 0.0
+    if ts_first <= 0.0 or ts_last <= 0.0 or ts_last < ts_first:
+        return None
+
+    qa_open_ts = _to_float(agent.get("qa_open_ts")) or 0.0
+    pauses: list[tuple[float, float]] = []
+    raw_pauses = agent.get("qa_pauses")
+    if isinstance(raw_pauses, list):
+        for pair in raw_pauses:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            p_start = _to_float(pair[0])
+            p_end = _to_float(pair[1])
+            if p_start is None or p_end is None:
+                continue
+            pauses.append((p_start, p_end))
+    pauses.sort()
+
+    if qa_open_ts > 0.0:
+        life_end = min(ts_last, max(ts_first, qa_open_ts))
+    elif agent.get("status") == "run" and now is not None:
+        life_end = max(ts_last, now)
+    else:
+        life_end = ts_last
+
+    sub_intervals: list[list[float]] = []
+    cursor = ts_first
+    wait = 0.0
+    for p_start, p_end in pauses:
+        if p_end <= cursor or p_start >= life_end:
+            continue  # pause entirely outside the live window
+        if p_start > cursor:
+            sub_intervals.append([cursor, p_start])
+        wait += min(p_end, life_end) - max(p_start, cursor)
+        cursor = max(cursor, p_end)
+        if cursor >= life_end:
+            break
+    if cursor < life_end:
+        sub_intervals.append([cursor, life_end])
+
+    if qa_open_ts > 0.0 and now is not None:
+        gap = now - qa_open_ts
+        if gap > 0.0:
+            wait += gap
+
+    total = life_end - ts_first
+    work = max(0.0, total - wait)
+    return sub_intervals, work, wait, total
+
+
+def _main_unsafe(now: float | None = None) -> int:
     """Internal implementation — assumes the caller (main) wraps OSError.
-    See main() docstring for the never-crash contract."""
+    See main() docstring for the never-crash contract.
+
+    `now` — the wall-clock anchor (epoch seconds) for the work/wait/total
+    time columns (plan 20260827-status-line-time-columns). Production
+    passes time.time() from main(); tests freeze it explicitly (in-process
+    with monkeypatched stdin per the plan's Testing Strategy). When it is
+    None — a legacy direct call / pre-time pipeline stage — NO time data is
+    computed or injected and every duration cell renders empty.
+
+    Time assembly, gated on now is not None:
+        - intervals start from the main scan's time_turns sub-intervals;
+          when time_open marks the final turn live its LAST sub-interval is
+          stretched to now ("live-now"; max() keeps a stamp already ahead
+          of a skewed clock from shrinking);
+        - each agent contributes its life-minus-pauses intervals via
+          _agent_time_segments (running agents extend to now, open
+          questions trim at the question), and receive their personal
+          work/wait/total as TRANSIENT time_work/time_wait/time_total keys
+          injected AFTER _write_agents_cache — deliberately absent from
+          _AGENT_CACHE_FIELDS so they never persist;
+        - session triple: total = now − time_first_ts,
+          work = min(union_work(intervals), total),
+          wait = max(0, total − work). The min-clamp preserves
+          work + wait == total even when an agent's clock-stamped work
+          nominally starts before main's first ts (resumed / multi-dir
+          sessions), per the plan's edge-case note. Degraded anchors
+          (time_first_ts missing/0/null) leave the session cells empty
+          while agent cells still render from the agents' own stamps.
+    """
     parsed = parse_stdin(sys.stdin.read())
     session_id = parsed.get("session_id", "") or ""
     transcript_path = parsed.get("transcript_path", "") or ""
@@ -2633,6 +2763,47 @@ def _main_unsafe() -> int:
     # main()'s except clause — silently degrading to the fallback header.
     tool_use_positions = main_cum.get("tool_use_positions")
     agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
+
+    # ---- time columns (plan 20260827-status-line-time-columns) — see the
+    # ---- _main_unsafe docstring for the assembly contract. Gated on now:
+    # a None `now` (legacy direct call) skips everything below so the
+    # render keeps empty duration cells.
+    main_time = None
+    if now is not None:
+        intervals: list[list[float]] = []
+        raw_turns = main_cum.get("time_turns")
+        if isinstance(raw_turns, list):
+            for turn in raw_turns:
+                if not isinstance(turn, list):
+                    continue
+                for span in turn:
+                    if not isinstance(span, (list, tuple)) or len(span) != 2:
+                        continue
+                    s = _to_float(span[0])
+                    e = _to_float(span[1])
+                    if s is not None and e is not None:
+                        intervals.append([s, e])
+        # Live-now: an open final turn keeps working until the render
+        # moment — stretch its LAST sub-interval up to now.
+        if intervals and main_cum.get("time_open"):
+            intervals[-1][1] = max(intervals[-1][1], now)
+        for agent in agents:
+            segments = _agent_time_segments(agent, now)
+            if segments is None:
+                # unstamped / corrupt agent — its cells stay empty
+                continue
+            ag_intervals, ag_work, ag_wait, ag_total = segments
+            intervals.extend(ag_intervals)
+            agent["time_work"] = ag_work
+            agent["time_wait"] = ag_wait
+            agent["time_total"] = ag_total
+        first_ts = _to_float(main_cum.get("time_first_ts")) or 0.0
+        if first_ts > 0.0:
+            total_sec = max(0.0, now - first_ts)
+            work_sec = min(union_work(intervals), total_sec)
+            wait_sec = max(0.0, total_sec - work_sec)
+            main_time = (work_sec, wait_sec, total_sec)
+
     # Task 4/5 — model/cost columns: render_output consumes the per-model
     # dict (the main row's totals are the sum of its records — the flat
     # cum_* sums no longer exist). prices come from
@@ -2656,6 +2827,7 @@ def _main_unsafe() -> int:
         prices=prices,
         host=host,
         start_model=str(main_cum.get("start_model") or ""),
+        main_time=main_time,
     )
     print(output)
     return 0
