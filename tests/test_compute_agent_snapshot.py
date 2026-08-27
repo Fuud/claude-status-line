@@ -23,6 +23,7 @@ import json
 import os
 from pathlib import Path
 
+import status_line
 from status_line import _AGENT_CACHE_FIELDS, _compute_agents, compute_agent_snapshot
 
 
@@ -529,15 +530,11 @@ def _make_session_with_agent(
 
     Returns (session_dir, agents_cache_path, agent_id) where agent_id is the
     canonical stem ("agent-test") — callers use it to derive the join key.
+    The fixture-pair copy itself lives in `_add_agent_to_session` below.
     """
     session_dir = tmp_path / "session-abc"
-    subagents_dir = session_dir / "subagents"
-    subagents_dir.mkdir(parents=True)
     agent_id = "agent-test"
-    dst_jsonl = subagents_dir / f"{agent_id}.jsonl"
-    dst_meta = subagents_dir / f"{agent_id}.meta.json"
-    dst_jsonl.write_bytes(src_jsonl.read_bytes())
-    dst_meta.write_bytes(src_meta.read_bytes())
+    _add_agent_to_session(session_dir, agent_id, src_jsonl, src_meta)
     agents_cache = tmp_path / "agents_cache.json"
     return session_dir, agents_cache, agent_id
 
@@ -673,6 +670,171 @@ def test_compute_agents_no_match_no_override(tmp_path: Path) -> None:
     assert len(agents) == 1
     # agent_running.jsonl → "run"; unmatched queue key has no effect.
     assert agents[0]["status"] == "run"
+
+
+# ---------------------------------------------------------------------------
+# _compute_agents multi-dir merge + agentId dedup
+# (added per 20260826-merge-subagents-across-session-dirs: one session id can
+# live in several project dirs — main checkout + worktree — and agents are
+# spread across their subagents/ trees)
+# ---------------------------------------------------------------------------
+
+def _add_agent_to_session(
+    session_dir: Path, agent_id: str, src_jsonl: Path, src_meta: Path
+) -> Path:
+    """Write `agent-<id>.{jsonl,meta.json}` into session_dir/subagents/ by
+    copying the given fixture pair. Creates the dir tree on demand. Returns
+    the jsonl path (callers rarely need it — mostly for parse-count asserts).
+    """
+    subagents_dir = session_dir / "subagents"
+    subagents_dir.mkdir(parents=True, exist_ok=True)
+    dst_jsonl = subagents_dir / f"{agent_id}.jsonl"
+    dst_meta = subagents_dir / f"{agent_id}.meta.json"
+    dst_jsonl.write_bytes(src_jsonl.read_bytes())
+    dst_meta.write_bytes(src_meta.read_bytes())
+    return dst_jsonl
+
+
+def test_compute_agents_merges_agents_across_session_dirs(
+    tmp_path: Path,
+) -> None:
+    """Agents with DIFFERENT agentIds spread over two session dirs → the
+    result is the union of both (each CC project dir owns part of the
+    session's subagents; neither dir alone has the full picture)."""
+    dir_main = tmp_path / "project-main" / "session-abc"
+    dir_worktree = tmp_path / "project-worktree" / "session-abc"
+    _add_agent_to_session(dir_main, "agent-one", AGENT_RUNNING, META_NORMAL)
+    _add_agent_to_session(dir_worktree, "agent-two", AGENT_OK, META_NORMAL)
+    agents_cache = tmp_path / "agents_cache.json"
+
+    agents = _compute_agents([dir_main, dir_worktree], agents_cache)
+
+    assert {a["agentId"] for a in agents} == {"agent-one", "agent-two"}
+    statuses = {a["agentId"]: a["status"] for a in agents}
+    assert statuses["agent-one"] == "run"
+    assert statuses["agent-two"] == "ok"
+
+
+def test_compute_agents_dedups_same_agent_id_first_dir_wins(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The SAME agentId in two session dirs → exactly one snapshot, built
+    from the FIRST directory of the list (first-dir wins), and the duplicate
+    is skipped at the path level — compute_agent_snapshot never parses it.
+    Distinguished by content: dir A holds agent_running (status "run"),
+    dir B holds agent_ok (status "ok") under the same filename."""
+    dir_a = tmp_path / "project-a" / "session-abc"
+    dir_b = tmp_path / "project-b" / "session-abc"
+    jsonl_a = _add_agent_to_session(dir_a, "agent-test", AGENT_RUNNING, META_NORMAL)
+    jsonl_b = _add_agent_to_session(dir_b, "agent-test", AGENT_OK, META_NORMAL)
+    agents_cache = tmp_path / "agents_cache.json"
+
+    real_snapshot = status_line.compute_agent_snapshot
+    parsed: list[Path] = []
+
+    def counting_snapshot(jsonl_path, meta_path, cache_entry):
+        parsed.append(jsonl_path)
+        return real_snapshot(jsonl_path, meta_path, cache_entry)
+
+    monkeypatch.setattr(
+        status_line, "compute_agent_snapshot", counting_snapshot
+    )
+    agents = _compute_agents([dir_a, dir_b], agents_cache)
+
+    assert len(agents) == 1
+    assert agents[0]["agentId"] == "agent-test"
+    assert agents[0]["status"] == "run", (
+        f"first dir must win; got {agents[0]['status']!r} "
+        f"(looks like dir B's copy was used)"
+    )
+    assert parsed == [jsonl_a], (
+        f"duplicate must be skipped before parsing; parsed={parsed!r}, "
+        f"dir B copy is {jsonl_b!r}"
+    )
+
+
+def test_compute_agents_single_path_back_compat(tmp_path: Path) -> None:
+    """A bare Path (the pre-multi-dir call shape) keeps working and gives
+    the same result as the equivalent one-element list."""
+    session_dir, agents_cache, _ = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+
+    from_path = _compute_agents(session_dir, agents_cache)
+    from_list = _compute_agents([session_dir], agents_cache)
+
+    assert len(from_path) == 1
+    assert from_path[0]["agentId"] == "agent-test"
+    assert from_path[0]["status"] == "run"
+    # Same call, list-wrapped → identical outcome (agentId + status).
+    assert [(a["agentId"], a["status"]) for a in from_list] == [
+        (a["agentId"], a["status"]) for a in from_path
+    ]
+
+
+def test_compute_agents_single_str_path_is_normalized(tmp_path: Path) -> None:
+    """A bare str path (easy call-site mistake: `str(path)`) is normalized
+    to a one-element list instead of being iterated character by character
+    — which would silently yield [] (every 1-char "dir" fails the
+    subagents/ existence check) and make the agents vanish."""
+    session_dir, agents_cache, _ = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+
+    agents = _compute_agents(str(session_dir), agents_cache)
+
+    assert len(agents) == 1
+    assert agents[0]["agentId"] == "agent-test"
+    assert agents[0]["status"] == "run"
+
+
+def test_compute_agents_empty_dirs_list_returns_empty(tmp_path: Path) -> None:
+    """An empty list of session dirs → no agents (no crash, no fs access)."""
+    agents_cache = tmp_path / "agents_cache.json"
+
+    assert _compute_agents([], agents_cache) == []
+
+
+def test_compute_agents_skips_dir_without_subagents(
+    tmp_path: Path,
+) -> None:
+    """A directory lacking subagents/ (e.g. an empty worktree copy) is
+    skipped; the rest of the list is still processed."""
+    dir_empty = tmp_path / "project-worktree" / "session-abc"
+    dir_empty.mkdir(parents=True)  # exists, but no subagents/ inside
+    dir_full = tmp_path / "project-main" / "session-abc"
+    _add_agent_to_session(dir_full, "agent-test", AGENT_RUNNING, META_NORMAL)
+    agents_cache = tmp_path / "agents_cache.json"
+
+    agents = _compute_agents([dir_empty, dir_full], agents_cache)
+
+    assert [a["agentId"] for a in agents] == ["agent-test"]
+    assert agents[0]["status"] == "run"
+
+
+def test_compute_agents_queue_override_reaches_second_dir_agent(
+    tmp_path: Path,
+) -> None:
+    """The orchestrator queue override applies AFTER the merge, to agents
+    from EVERY directory — an agent living only in the second dir must be
+    overridden just like a first-dir agent (a refactor moving the override
+    into the per-dir loop would otherwise drop or mis-apply it)."""
+    dir_a = tmp_path / "project-main" / "session-abc"
+    dir_b = tmp_path / "project-worktree" / "session-abc"
+    _add_agent_to_session(dir_a, "agent-aaa", AGENT_RUNNING, META_NORMAL)
+    _add_agent_to_session(dir_b, "agent-bbb", AGENT_RUNNING, META_NORMAL)
+    agents_cache = tmp_path / "agents_cache.json"
+
+    agents = _compute_agents(
+        [dir_a, dir_b], agents_cache, task_notifications={"bbb": "kill"}
+    )
+
+    statuses = {a["agentId"]: a["status"] for a in agents}
+    assert statuses["agent-bbb"] == "kill", (
+        f"override must reach second-dir agents; got {statuses!r}"
+    )
+    # the notification targets only bbb — aaa keeps its snapshot status
+    assert statuses["agent-aaa"] == "run"
 
 
 # ---------------------------------------------------------------------------

@@ -86,6 +86,12 @@ Option A+ (согласовано в брейншторме):
   фильтром `is_dir()`, что и `find_session_dir`; возвращает список в порядке
   glob (OS-dependent, как задокументировано); пустой `session_id` или
   несуществующий `projects_root` → `[]`.
+  [deviation] (review fix, 2026-08-26) glob заменён на одноуровневый
+  `*/<sid>` + проверка корневого `<sid>`: рекурсивный `**` обходил все
+  `subagents/` и `tool-results/` поддеревья (~110ms vs ~6ms на реальном
+  дереве) ради совпадений, которых конвенция `<encoded-project>/<sid>/`
+  не порождает — проверено на реальном дереве: все session-каталоги на
+  глубине 1. Семантика для реальных данных идентична.
 - `_resolve_session_dirs`: если `transcript_path` непустой и
   `Path(transcript_path).parent / session_id` — существующий каталог, он идёт
   первым; если glob вернул его же — не дублируем; остальные совпадения — в
@@ -116,18 +122,22 @@ Option A+ (согласовано в брейншторме):
 - Modify: `status_line.py`
 - Modify: `tests/test_find_session_dir.py`
 
-- [ ] TDD: написать тесты `find_session_dirs`: два одноимённых каталога в
+- [x] TDD: написать тесты `find_session_dirs`: два одноимённых каталога в
       разных проектах → оба в результате; один каталог → список из одного;
       несуществующий sid → `[]`; пустой sid → `[]`; несуществующий
       projects_root → `[]`; файлы (не каталоги) с именем sid игнорируются
-- [ ] убедиться, что новые тесты падают (функции ещё нет)
-- [ ] реализовать `find_session_dirs` в `status_line.py` (glob `**/<sid>`,
+- [x] убедиться, что новые тесты падают (функции ещё нет)
+- [x] реализовать `find_session_dirs` в `status_line.py` (glob `**/<sid>`,
       фильтр `is_dir()`, список в порядке glob)
-- [ ] переписать `find_session_dir` как обёртку: первый элемент
+      [deviation] (review fix) заменено на одноуровневый `*/<sid>` +
+      корневой `<sid>` — см. Technical Details; все реальные
+      session-каталоги на глубине 1, полный обход дерева стоил ~110ms
+      за вызов хука
+- [x] переписать `find_session_dir` как обёртку: первый элемент
       `find_session_dirs` или `None` (докстринг обновить; заодно модульный
       докстринг `tests/test_find_session_dir.py` — «returns the first match»
       больше не вся правда)
-- [ ] прогнать `python -m pytest tests/test_find_session_dir.py` — все
+- [x] прогнать `python -m pytest tests/test_find_session_dir.py` — все
       (старые + новые) зелёные
 
 ### Task 2: _resolve_session_dirs — приоритет transcript_path
@@ -137,15 +147,15 @@ Option A+ (согласовано в брейншторме):
 - Modify: `status_line.py`
 - Create: `tests/test_resolve_session_dirs.py`
 
-- [ ] TDD: написать тесты: transcript-каталог существует и есть среди
+- [x] TDD: написать тесты: transcript-каталог существует и есть среди
       glob-совпадений → он первый, без дубля; transcript-каталог существует, но
       glob его не вернул (лежит вне projects_root) → он первый + glob-совпадения
       следом; пустой transcript_path → порядок чистого glob; transcript_path
       указывает на несуществующий файл/каталог → fallback на чистый glob
-- [ ] убедиться, что тесты падают
-- [ ] реализовать `_resolve_session_dirs(transcript_path, session_id,
+- [x] убедиться, что тесты падают
+- [x] реализовать `_resolve_session_dirs(transcript_path, session_id,
 projects_root=None) -> list[Path]`
-- [ ] прогнать `python -m pytest tests/test_resolve_session_dirs.py` — зелёные
+- [x] прогнать `python -m pytest tests/test_resolve_session_dirs.py` — зелёные
 
 ### Task 3: _compute_agents — объединение и дедуп по agentId
 
@@ -154,16 +164,16 @@ projects_root=None) -> list[Path]`
 - Modify: `status_line.py`
 - Modify: `tests/test_compute_agent_snapshot.py`
 
-- [ ] TDD: написать тесты: агенты распределены по двум session-каталогам
+- [x] TDD: написать тесты: агенты распределены по двум session-каталогам
       (разные agentId) → в результате объединение всех; одинаковый agentId в
       двух каталогах → один снапшот, из первого каталога списка; один `Path`
       вместо списка → поведение как раньше (back-compat); пустой список → `[]`;
       каталог без `subagents/` в списке → пропускается, остальные обрабатываются
-- [ ] убедиться, что новые тесты падают
-- [ ] изменить `_compute_agents`: нормализация аргумента в список, обход
+- [x] убедиться, что новые тесты падают
+- [x] изменить `_compute_agents`: нормализация аргумента в список, обход
       каталогов по порядку, дедуп по `agentId` на уровне путей до
       `compute_agent_snapshot`; orchestrator queue override — без изменений
-- [ ] прогнать `python -m pytest tests/test_compute_agent_snapshot.py` —
+- [x] прогнать `python -m pytest tests/test_compute_agent_snapshot.py` —
       все зелёные (старые вызовы с одним `Path` работают)
 
 ### Task 4: интеграция в _main_unsafe
@@ -173,7 +183,7 @@ projects_root=None) -> list[Path]`
 - Modify: `status_line.py`
 - Modify: `tests/test_main_integration.py`
 
-- [ ] TDD: написать интеграционный тест: payload с `transcript_path` и
+- [x] TDD: написать интеграционный тест: payload с `transcript_path` и
       `session_id`, два проектных каталога с `<sid>/subagents/` (агенты
       распределены, одинаковый agentId в обоих) → вывод содержит строки всех
       агентов без дублей; кейс «воркtree-каталог первый по алфавиту и пустой»
@@ -183,28 +193,46 @@ projects_root=None) -> list[Path]`
       pre-seed кэша `agents_<sid>.json` значением `{}` (артефакт бага) →
       агенты всё равно рендерятся, кэш перезаписывается непустым
       (self-heal из Solution Overview п. 5)
-- [ ] убедиться, что тесты падают на текущем коде
-- [ ] `_main_unsafe`: заменить `find_session_dir` на `_resolve_session_dirs`,
+- [x] убедиться, что тесты падают на текущем коде
+- [x] `_main_unsafe`: заменить `find_session_dir` на `_resolve_session_dirs`,
       передать список в `_compute_agents`, `dirs[0] if dirs else None` —
       в `_find_main_jsonl`; запись кэша — только если список непуст
-- [ ] прогнать `python -m pytest tests/test_main_integration.py` — зелёные
+- [x] прогнать `python -m pytest tests/test_main_integration.py` — зелёные
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] verify all requirements from Overview are implemented
-- [ ] verify edge cases are handled (дедуп, dirless-сессия, пустой payload)
-- [ ] run full test suite: `python -m pytest tests/`
-- [ ] ручная проверка на реальных данных: прогнать `status_line.py` с
+- [x] verify all requirements from Overview are implemented
+- [x] verify edge cases are handled (дедуп, dirless-сессия, пустой payload)
+- [x] run full test suite: `python -m pytest tests/` — 236 passed
+- [x] ручная проверка на реальных данных: прогнать `status_line.py` с
       payload сессии `eacc81d9-0a13-4f6f-ae40-5ba51190cfd9` → в выводе 18+
-      строк агентов (раньше — ни одной)
-- [ ] замер wall-clock одного прогона на реальном дереве `~/.claude/projects`
+      строк агентов (раньше — ни одной) — 20 строк агентов; старый код
+      (2ad09b9~1) на том же payload — 0 строк, кэш {} vs 20 записей
+- [x] замер wall-clock одного прогона на реальном дереве `~/.claude/projects`
       (до/после) — убедиться, что полный обход дерева glob не замедлил хук
-      патологически
+      патологически — медианы N=5: new 0.40s vs old 0.25s (1.58x, <2x);
+      чистый delta glob-обхода ~0ms (87.9 vs 89.7ms) — остальное это парсинг
+      20 агентов, который старый код пропускал
 
 ### Task 6: [Final] Update documentation
 
-- [ ] update README.md если описание поведения session dir затронуто
-- [ ] move this plan to `docs/plans/completed/`
+- [x] ➕ (найдено при верификации Task 5) нормализовать backslash'и в
+      `transcript_path` внутри `_resolve_session_dirs`: в проде хук работает
+      под cygwin python3, CC присылает windows-пути с backslash, и
+      `PosixPath('C:\\Users\\...').parent` даёт `'.'` — transcript-приоритет
+      молча деградирует до чистого glob (merge не задет, но дедуп-приоритет
+      не включается). TDD: красный тест в
+      `tests/test_resolve_session_dirs.py`, затем фикс — сделано
+      (7985a52): красный тест подтверждён на cygwin python, фикс
+      `.replace("\\", "/")`; `_find_main_jsonl` проверен ad-hoc —
+      `is_file()` на backslash-пути под cygwin работает (True), не тронут
+- [x] update README.md если описание поведения session dir затронуто —
+      обновлены шаги 2 и 4 «How it works» (e26e077): `_resolve_session_dirs`
+      (все одноимённые каталоги, transcript-каталог первым) и merge агентов
+      с дедупом по `agentId`
+- [x] move this plan to `docs/plans/completed/` — [x] move handled by
+      orchestrator post-run (move-plan.sh); файл не перемещался в этом
+      прогоне
 
 ## Post-Completion
 

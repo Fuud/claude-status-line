@@ -894,45 +894,163 @@ def _jsonl_mtime(jsonl_path: Path) -> float:
 
 
 # ---------------------------------------------------------------------------
-# find_session_dir
+# find_session_dir(s)
 # ---------------------------------------------------------------------------
 
-def find_session_dir(
+def find_session_dirs(
     session_id: str, projects_root: Path | None = None
-) -> Path | None:
-    """Locate the directory for `session_id` under `projects_root`.
+) -> list[Path]:
+    """Locate ALL directories named `session_id` under `projects_root`.
 
-    Walks `<projects_root>/**/<session_id>` and returns the first matching
-    *directory* as a Path. Returns None if `session_id` is empty, if
-    `projects_root` does not exist, or if no matching directory is found.
+    Globs `<projects_root>/*/<session_id>` (one level) plus a root-level
+    `<projects_root>/<session_id>` check, and returns every matching
+    *directory* as a list of Paths — root-level match first, then glob
+    order (OS-dependent, but stable per tree). Returns [] if
+    `session_id` is empty, if `projects_root` does not exist, or if
+    no matching directory is found.
+
+    The same session id can legitimately live in more than one encoded
+    project directory — e.g. the main checkout and a worktree copy of the
+    same repo, each with its own `subagents/` tree. Callers that need the
+    complete picture (agents, tokens) must merge results across ALL of
+    these directories, which is why this exists alongside the historical
+    single-match `find_session_dir`.
 
     If `projects_root` is None, defaults to `<home>/.claude/projects`.
 
-    The `projects_root` parameter is preserved for backward compatibility
-    with existing callers; tests can also drive this function via
+    The `projects_root` parameter mirrors `find_session_dir`'s parameter
+    contract; tests can also drive this function via
     `monkeypatch.setattr(Path, "home", lambda: tmp_path)` and pass
     `projects_root=None`, which avoids the public surface carrying a
     test-only parameter.
     """
     if not session_id:
-        return None
+        return []
     if projects_root is None:
         projects_root = Path.home() / ".claude" / "projects"
     if not projects_root.exists():
-        return None
-    # glob for a directory whose name matches session_id anywhere under
-    # projects_root. We use **/<session_id> (not the bare name) so we
-    # also pick up project-name directories nested one level deep
-    # (the convention is `<encoded-project>/<session_id>/`).
-    # recurse_symlinks=False avoids following symlinked project trees into
-    # infinite loops or surprising locations; glob ordering is OS-
-    # dependent but stable per tree on the same kernel.
-    for candidate in projects_root.glob(
-        f"**/{session_id}"
-    ):  # default follows filesystem order; we don't depend on it
-        if candidate.is_dir():
-            return candidate
-    return None
+        return []
+    # [deviation] The glob is one level (`*/`), not recursive (`**/`):
+    # the on-disk convention is `<encoded-project>/<session_id>/` with
+    # encoded project dirs as direct children of projects/ (verified on
+    # the real tree: every session dir sits at depth 1), and a recursive
+    # walk would descend into every session dir's `subagents/` and
+    # `tool-results/` subtrees for matches the convention never produces
+    # — ~110ms vs ~6ms per hook invocation on the real tree. The bare
+    # root-level check below covers the zero-directory case that `**`
+    # additionally matched (`<projects_root>/<session_id>`). The
+    # one-level glob does not recurse through symlinked subtrees the way
+    # a full `**` walk would, though it does resolve `<session_id>`
+    # through a direct-child symlinked project dir (one level deep, no
+    # further).
+    matches: list[Path] = []
+    root_level = projects_root / session_id
+    if root_level.is_dir():
+        matches.append(root_level)
+    matches.extend(d for d in projects_root.glob(f"*/{session_id}") if d.is_dir())
+    return matches
+
+
+def find_session_dir(
+    session_id: str, projects_root: Path | None = None
+) -> Path | None:
+    """Locate the FIRST directory named `session_id` under `projects_root`.
+
+    Thin wrapper over `find_session_dirs`: returns the first element of
+    its result (root-level match first, then glob order), or None when
+    the list is empty — `session_id`
+    is empty, `projects_root` does not exist, or nothing matches. See
+    `find_session_dirs` for the all-matches variant and the rationale for
+    needing more than one directory per session id.
+    """
+    dirs = find_session_dirs(session_id, projects_root=projects_root)
+    return dirs[0] if dirs else None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_session_dirs
+# ---------------------------------------------------------------------------
+
+def _resolve_session_dirs(
+    transcript_path: str,
+    session_id: str,
+    projects_root: Path | None = None,
+) -> list[Path]:
+    """Resolve ALL session dirs for `session_id`, transcript dir first.
+
+    Starts from `find_session_dirs` (every `*/<session_id>` directory under
+    `projects_root`) and, when `transcript_path` is non-empty and
+    `Path(transcript_path).parent / session_id` is an existing directory,
+    moves that directory to the front of the list (without duplicating it
+    if glob already returned it — matched by filesystem identity, not path
+    spelling; see `_same_file`). Backslashes in `transcript_path` are
+    normalized to forward slashes first: Windows CC sends `C:\\...` paths,
+    and under a posix-flavoured python (cygwin) posixpath would otherwise
+    treat the whole string as one component, making `.parent` degenerate
+    to "." and the priority below silently never engage.
+
+    Priority rationale: transcript_path is CC's own authoritative statement
+    of where the session lives (the same source `_find_main_jsonl` trusts
+    first). The first entry of the result wins agent-id dedup downstream,
+    so the authoritative directory must lead even when glob's OS-dependent
+    ordering would put an empty worktree copy first (the bug this fixes).
+
+    Degradations: empty `transcript_path`, or one whose sibling session dir
+    does not exist on disk, yields the pure `find_session_dirs` order
+    unchanged. Empty
+    `session_id` → [] (no filesystem statement to trust, and the glob has
+    nothing to match).
+
+    Like `find_session_dirs`, `projects_root` defaults to
+    `<home>/.claude/projects` and is injectable for tests.
+    """
+    dirs = find_session_dirs(session_id, projects_root=projects_root)
+    if not (session_id and transcript_path):
+        return dirs
+    # Windows CC sends backslash-separated transcript paths, and the hook
+    # may run under a posix-flavoured python (cygwin): there backslash is
+    # NOT a separator, so PosixPath("C:\\Users\\...") is one opaque
+    # component and .parent degenerates to "." — silently disabling the
+    # priority below. Forward slashes are native on POSIX and equally
+    # valid on Windows python, so normalizing is safe on both.
+    normalized = transcript_path.replace("\\", "/")
+    preferred = Path(normalized).parent / session_id
+    if not preferred.is_dir():
+        return dirs
+    # The transcript dir may already be among the glob matches under a
+    # DIFFERENT spelling: under the cygwin production interpreter glob
+    # results are rooted at Path.home() (/cygdrive/c/Users/...) while the
+    # normalized transcript path spells the same directory C:/Users/...
+    # PurePath equality compares spellings, so the two never compare equal
+    # — match by filesystem identity instead and move the glob-spelling
+    # twin to the front (one entry per physical directory, spelled the
+    # glob way — the spelling every downstream scan already exercised).
+    twin = next((d for d in dirs if _same_file(d, preferred)), None)
+    if twin is None:
+        # only reachable when the transcript dir sits outside the globbed
+        # tree — no twin to reorder, so prepend the transcript spelling
+        return [preferred] + dirs
+    return [twin] + [d for d in dirs if d is not twin]
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """True when `a` and `b` name the same existing filesystem object.
+
+    Spelling equality is checked first (cheap, no syscalls); otherwise
+    os.path.samefile resolves both through the OS — under the cygwin
+    production interpreter it sees through /cygdrive/c/... vs C:/...
+    spellings of the same directory. NOTE: Path.resolve()/realpath is NOT
+    a usable canonicalization here — posixpath treats "C:/..." as
+    relative and would prepend the CWD to it.
+    """
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        # either path vanished between the caller's is_dir()/glob() check
+        # and now — treat as different rather than crash the hook
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -956,12 +1074,13 @@ def _find_main_jsonl(
            `main()` used to derive the jsonl exclusively this way).
         3. One-level glob `<projects_root>/*/<session_id>.jsonl`.
 
-    [deviation] The glob is one level (`*/`), not recursive (`**/`):
-    the on-disk convention is `<encoded-project>/<sid>.jsonl` with encoded
+    [deviation] The glob is one level (`*/`), not recursive (`**/`), for
+    the same reason as `find_session_dirs`' `*/<sid>` glob above — the
+    on-disk convention is `<encoded-project>/<sid>.jsonl` with encoded
     project dirs as direct children of `projects/`, and a recursive walk
     would descend into every session dir (incl. `subagents/` trees) for
-    no gain. `find_session_dir` above stays recursive for directories —
-    its historical contract.
+    no gain; see that function's `[deviation]` note for the measured
+    cost of the recursive variant.
 
     Returns None when `session_id` is empty or nothing matches — the
     orchestrator then degrades to a header-only line.
@@ -1347,19 +1466,32 @@ def _cache_path(data_dir: Path | None, name: str, session_id: str) -> Path:
 
 
 def _compute_agents(
-    session_dir: Path,
+    session_dirs: Path | str | os.PathLike | list[Path],
     agents_cache_path: Path,
     task_notifications: dict[str, str] | None = None,
 ) -> list:
-    """Build per-agent snapshots for every agent-*.jsonl under session_dir,
-    using agents_cache_path as the source of stale cache entries.
+    """Build per-agent snapshots for every agent-*.jsonl under each session
+    directory, using agents_cache_path as the source of stale cache entries.
 
-    After building all snapshots, apply the orchestrator-level queue override:
-    for each agent whose `agentId` (with the `agent-` prefix stripped)
-    appears in `task_notifications` (extracted from the main jsonl's
-    queue-operation events), set `status` to the notification value — BUT
-    only when the current status is not already `err` or `stop` (those win
-    by priority; see module docstring + CLAUDE.md "Status priority and overrides").
+    `session_dirs` accepts a single directory (Path/str — the
+    backward-compatible call shape) or a list of Paths — ALL directories CC
+    created for this session id (see `find_session_dirs` /
+    `_resolve_session_dirs`): the main checkout and a worktree copy each
+    hold part of the session's `subagents/` tree, so the
+    directories are scanned in list order and the results merged. Dedup is
+    by agentId (the jsonl stem) at the PATH level, BEFORE calling
+    compute_agent_snapshot: an agentId already produced by an earlier
+    directory is skipped, so the first directory wins and a duplicate is
+    never parsed twice. A directory without `subagents/` is skipped (the
+    rest of the list still runs); an empty list → [].
+
+    After building all snapshots, apply the orchestrator-level queue override
+    to the MERGED list: for each agent whose `agentId` (with the `agent-`
+    prefix stripped) appears in `task_notifications` (extracted from the
+    main jsonl's queue-operation events), set `status` to the notification
+    value — BUT only when the current status is not already `err` or `stop`
+    (those win by priority; see the module docstring's invariant on the
+    orchestrator override).
 
     [deviation] The override lives here rather than inside
     compute_agent_snapshot because the queue signal originates in the main
@@ -1368,25 +1500,39 @@ def _compute_agents(
     its narrow contract and makes it easy to cache.
 
     Args:
-        session_dir: session directory; `<sid>/subagents/agent-*.jsonl` files
-            live under it.
+        session_dirs: session directory or list of them; each dir's
+            `<dir>/subagents/agent-*.jsonl` files are scanned. A single
+            directory may be a Path, a str, or any os.PathLike (all are
+            normalized to a one-element list — a bare str would otherwise
+            be iterated character by character and silently yield no
+            agents).
         agents_cache_path: cache file holding previous per-agent snapshots,
             used to short-circuit re-parse when file mtimes haven't changed.
         task_notifications: dict mapping `<task-id>` → one of {"ok","kill","err"}
             (extracted from `<task-notification>` queue-operation events in the
             main jsonl by compute_main_cum). May be empty or None.
     """
+    if isinstance(session_dirs, (str, os.PathLike)):
+        dirs = [Path(session_dirs)]
+    else:
+        dirs = list(session_dirs)
     agents: list = []
     agents_cache = _load_dict_cache(agents_cache_path)
-    subagents_dir = session_dir / "subagents"
-    if not subagents_dir.exists():
-        return agents
-    for jsonl_path in sorted(subagents_dir.glob("agent-*.jsonl")):
-        agent_id = jsonl_path.stem
-        meta_path = jsonl_path.parent / f"{agent_id}.meta.json"
-        cache_entry = agents_cache.get(agent_id)
-        snapshot = compute_agent_snapshot(jsonl_path, meta_path, cache_entry)
-        agents.append(snapshot)
+    seen_agent_ids: set[str] = set()
+    for session_dir in dirs:
+        subagents_dir = session_dir / "subagents"
+        if not subagents_dir.exists():
+            continue
+        for jsonl_path in sorted(subagents_dir.glob("agent-*.jsonl")):
+            agent_id = jsonl_path.stem
+            if agent_id in seen_agent_ids:
+                # first dir wins; skip before parsing (dedup at path level)
+                continue
+            seen_agent_ids.add(agent_id)
+            meta_path = jsonl_path.parent / f"{agent_id}.meta.json"
+            cache_entry = agents_cache.get(agent_id)
+            snapshot = compute_agent_snapshot(jsonl_path, meta_path, cache_entry)
+            agents.append(snapshot)
 
     # Orchestrator-level queue override (with err/stop guard). See [deviation]
     # note above for why this lives here, not in compute_agent_snapshot.
@@ -1421,6 +1567,7 @@ def _main_unsafe() -> int:
     See main() docstring for the never-crash contract."""
     parsed = parse_stdin(sys.stdin.read())
     session_id = parsed.get("session_id", "") or ""
+    transcript_path = parsed.get("transcript_path", "") or ""
 
     if not session_id:
         # empty session_id → header only, exit 0. Context segment still
@@ -1428,14 +1575,21 @@ def _main_unsafe() -> int:
         print(_build_header(parsed, _context_segment(parsed, None)))
         return 0
 
-    session_dir = find_session_dir(session_id)
-    # main jsonl: transcript_path payload → session_dir sibling → projects
-    # glob (see _find_main_jsonl). The session dir itself is NOT a gate —
-    # CC only materializes `<sid>/` once the session spawns its first
-    # subagent, and a subagentless session still deserves its main-row
-    # table + jsonl-derived Context.
+    # All session dirs CC created for this id (usually 1; a resumed-in-
+    # worktree session splits across the main checkout and the worktree
+    # copy — see _resolve_session_dirs). The transcript dir leads the
+    # list, which both anchors agent-id dedup (first dir wins) and feeds
+    # _find_main_jsonl below.
+    session_dirs = _resolve_session_dirs(transcript_path, session_id)
+    # main jsonl: transcript_path payload → first session dir's sibling →
+    # projects glob (see _find_main_jsonl). The session dirs are NOT a
+    # gate — CC only materializes `<sid>/` once the session spawns its
+    # first subagent, and a subagentless session still deserves its
+    # main-row table + jsonl-derived Context.
     main_jsonl = _find_main_jsonl(
-        parsed.get("transcript_path", ""), session_id, session_dir
+        transcript_path,
+        session_id,
+        session_dirs[0] if session_dirs else None,
     )
     if main_jsonl is None:
         # no main jsonl anywhere → header only (payload context)
@@ -1460,13 +1614,17 @@ def _main_unsafe() -> int:
     task_notifications = main_cum.get("task_notifications", {})
 
     agents: list = []
-    if session_dir is not None:
-        agents = _compute_agents(session_dir, agents_cache, task_notifications)
+    if session_dirs:
+        # Scan EVERY session dir's subagents/ tree (a worktree-resumed
+        # session holds part of its agents in the copy's dir) and merge
+        # with agent-id dedup — see _compute_agents.
+        agents = _compute_agents(session_dirs, agents_cache, task_notifications)
         _write_agents_cache(agents_cache, agents)
-    # else: no session dir → no subagents ever spawned → agents stays [].
-    # The agents cache write is skipped too: there is nothing to cache,
-    # and writing an empty dict would litter data/ with agents_<sid>.json
-    # files for every dirless session.
+    # else: no session dirs at all → no subagents ever spawned → agents
+    # stays [] and the cache write is skipped (an empty write would only
+    # litter data/ for dirless sessions). With dirs present the write
+    # happens even at 0 agents — that is what rewrites stale `{}` cache
+    # artifacts (see "Edge cases" in README).
 
     # sort_agents calls .get(...) on the second argument, so it MUST be a
     # dict. A malformed cache (e.g. tool_use_positions accidentally written
