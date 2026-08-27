@@ -76,7 +76,7 @@ def _run_main(
 # section 13) or mask durations away (legacy cross-invocation equality).
 # ---------------------------------------------------------------------------
 
-_DUR_CELL = r"\d{1,}:[0-5]\d:[0-5]\d"
+_DUR_CELL = r"\d+:[0-5]\d:[0-5]\d"
 _DUR_CELL_RE = re.compile(_DUR_CELL)
 
 
@@ -1864,6 +1864,7 @@ FROZEN_SID_OPEN_MAIN = "71d1e100-0000-4000-8000-0000000000e5"
 FROZEN_SID_CLAMP = "71d1e100-0000-4000-8000-0000000000f6"
 FROZEN_SID_SKEW = "71d1e100-0000-4000-8000-0000000000a7"
 FROZEN_SID_NULLCACHE = "71d1e100-0000-4000-8000-0000000000b8"
+FROZEN_SID_NANCACHE = "71d1e100-0000-4000-8000-0000000000c9"
 
 
 def test_frozen_run_agent_extends_to_now(
@@ -2080,6 +2081,68 @@ def test_cache_null_time_fields_hit_path_renders_empty_cells(
     second_agent = next(l for l in second if "[ok]" in l)
     assert not any(_is_duration_cell(c) for c in second_agent.split()[-3:]), (
         f"null agent stamps must degrade to empty cells: {second_agent!r}"
+    )
+
+
+def test_cache_stray_nan_transient_time_field_hit_path_renders_empty_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A hand-corrupted agents cache carrying STRAY transient time_* fields
+    with bare NaN/Infinity (json.loads parses both extensions) survives the
+    cache-HIT path: compute_agent_snapshot returns the entry unfiltered and
+    the orchestrator only OVERWRITES time_* when the agent's own stamps are
+    usable (here nulled ⇒ no overwrite). The render must BLANK those cells
+    (_is_num's finite check in _time_row_cells) instead of raising ValueError
+    out of format_duration — which would degrade the whole status line."""
+    sid = FROZEN_SID_NANCACHE
+    _build_synth_session(
+        tmp_path, sid, _fz_main_done_turn(),
+        [("agent-nan", _fz_agent_jsonl(60, 300),
+          _agent_meta("Nan: cache fields", "toolu_nn"))],
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        status_line,
+        "_PRICES_PATH",
+        tmp_path / ".claude" / "status_line" / "prices.json",
+    )
+    payload = json.dumps({"session_id": sid, "model": {"display_name": "X"}})
+
+    # 1st run: miss → real durations rendered, caches written.
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    rc1 = status_line._main_unsafe(now=_fzep(_FROZEN_NOW_OFFSET))
+    first = capsys.readouterr().out.splitlines()
+    assert rc1 == 0 and len(first) == 6, f"first run: {first!r}"
+
+    # Hand-corrupt the agents cache: null the lifetime stamps (forces the
+    # orchestrator to leave the transient fields alone) and seed stray
+    # non-finite time_* values. json.dumps round-trips float("nan") as the
+    # bare NaN extension, and json.loads parses it right back.
+    data_dir = tmp_path / ".claude" / "status_line" / "data"
+    agents_cache = data_dir / f"agents_{sid}.json"
+    loaded_agents = json.loads(agents_cache.read_text(encoding="utf-8"))
+    for entry in loaded_agents.values():
+        entry["ts_first"] = None
+        entry["ts_last"] = None
+        entry["time_work"] = float("nan")
+        entry["time_wait"] = float("inf")
+        entry["time_total"] = float("nan")
+    agents_cache.write_text(json.dumps(loaded_agents, indent=2), encoding="utf-8")
+
+    # 2nd run: cache-hit with stray non-finite transients → the agent's
+    # cells blank, the rest of the table intact, exit 0.
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    rc2 = status_line._main_unsafe(now=_fzep(_FROZEN_NOW_OFFSET))
+    second = capsys.readouterr().out.splitlines()
+    assert rc2 == 0, f"second run rc={rc2}; lines={second[:3]!r}"
+    assert len(second) == 6, f"fallback header rendered: {second!r}"
+    second_main = next(l for l in second if l.startswith("| main:"))
+    assert any(_is_duration_cell(c) for c in second_main.split()), (
+        f"main row must keep its durations: {second_main!r}"
+    )
+    second_agent = next(l for l in second if "[ok]" in l)
+    assert not any(_is_duration_cell(c) for c in second_agent.split()[-3:]), (
+        f"stray NaN transient must blank the agent cells: {second_agent!r}"
     )
 
 

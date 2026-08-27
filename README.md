@@ -377,7 +377,7 @@ cd ~/.claude/status_line
 python3 -m pytest tests/ -v
 ```
 
-488 tests cover: pure functions (`format_tokens`, `format_duration`,
+490 tests cover: pure functions (`format_tokens`, `format_duration`,
 `union_work`, `_parse_ts` in `tests/test_format_duration.py` /
 `tests/test_union_work.py`, the agent pause/trim/extension geometry in
 `tests/test_agent_time_segments.py`, `detect_status`, `parse_stdin`),
@@ -395,9 +395,10 @@ and the work/wait/total invariants (`work + wait == total` within ±1s,
 identical `main:` / `sum:` triples) checked in a now-independent way — a
 frozen-clock suite calling `_main_unsafe(now=…)` in-process that also
 pins the live-now extensions (open main turn, run agent), the hanging-QA
-agent triple, the `min(work, total)` and clock-skew clamps, and the
-null-time-fields cache-hit degrade — a runtime smoke test — and the bash
-wrapper.
+agent triple, the `min(work, total)` and clock-skew clamps, the
+null-time-fields cache-hit degrade, and stray bare-NaN/Infinity transient
+time fields in a hand-corrupted agents cache (blank cells, never a crash)
+— a runtime smoke test — and the bash wrapper.
 
 ### Real-session fixture
 

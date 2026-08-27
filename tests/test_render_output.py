@@ -1495,6 +1495,27 @@ def test_boolean_time_values_rejected_as_junk() -> None:
     assert "00:00:0" not in agent_line, agent_line
 
 
+def test_nonfinite_time_values_rejected_as_junk() -> None:
+    """NaN/Infinity parse straight out of a hand-corrupted agents cache
+    (json.loads accepts the bare extensions), PASS isinstance(int, float),
+    and would raise ValueError out of format_duration's int() — degrading
+    the WHOLE status line through main()'s catch-all. _time_row_cells uses
+    the full _is_num predicate (finite, non-bool), so they blank the cell
+    like any other junk."""
+    agents = [{
+        "status": "ok", "tokens_in": 100, "tokens_out": 0,
+        "tokens_cached": 0, "description": "nan junk",
+        "time_work": float("nan"),
+        "time_wait": float("inf"),
+        "time_total": float("-inf"),
+    }]
+    out = render_output("Session: x", 0, 0, 0, _main(0, 0, 0), agents)
+    agent_line = out.split("\n")[5]
+    assert agent_line.split() == [
+        "|", "[ok]", "nan", "junk", "100", "0", "0",
+    ], agent_line
+
+
 def test_agent_time_cells_first_group_row_only_prices_mode() -> None:
     """An agent's transient time_* triple rides ONLY the FIRST row of its
     prices-mode group; per-model continuation rows end at their cost cell.

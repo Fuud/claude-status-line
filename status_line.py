@@ -48,7 +48,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -135,7 +135,7 @@ def _parse_ts(value: Any) -> float | None:
     return dt.timestamp()
 
 
-def union_work(intervals: Any) -> float:
+def union_work(intervals: object) -> float:
     """Return the total covered length of a union of [start, end] intervals.
 
     Used for session `work` time: turns (split into sub-intervals by
@@ -671,10 +671,26 @@ def _to_float(value: object) -> float | None:
     format_duration's int() — degrading the WHOLE status line through
     main()'s catch-all. Non-finite ⇒ None ⇒ the owning agent/session
     renders empty time cells instead."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        number = float(value)
-        return number if math.isfinite(number) else None
-    return None
+    return float(value) if _is_num(value) else None
+
+
+def _to_span(pair: object) -> tuple[float, float] | None:
+    """Coerce one untrusted [start, end] pair to a (start, end) float
+    tuple, or None when the pair is not a 2-element list/tuple or either
+    endpoint fails _to_float (null / junk string / bool / NaN / Infinity).
+
+    Shared by the orchestrator's turn-span coercion and the agent pause
+    validation — both read intervals a hand-corrupted cache may have
+    rewritten. ORDERING is deliberately not judged here: union_work drops
+    degenerate spans on its own, while agent pauses need the explicit
+    inverted-pair skip their wait arithmetic requires."""
+    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+        return None
+    start = _to_float(pair[0])
+    end = _to_float(pair[1])
+    if start is None or end is None:
+        return None
+    return start, end
 
 
 def _accumulate_model(
@@ -721,6 +737,205 @@ def _iter_events(jsonl_path: Path) -> Iterator[tuple[int, dict]]:
                 yield index, event
 
 
+def _message_has_qa(msg_dict: dict) -> bool:
+    """True when an assistant message's content list carries an
+    AskUserQuestion tool_use block — the pause-opening signal BOTH jsonl
+    scans key on (same shared-scan-logic pattern as _iter_events /
+    _accumulate_model). Sentinel bookkeeping AROUND the verdict stays at
+    each call site: the main scan tracks the open pause as None/epoch,
+    the agent scan as 0.0/epoch."""
+    content = msg_dict.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("name") == "AskUserQuestion"
+        ):
+            return True
+    return False
+
+
+class _TurnSegmenter:
+    """Time-segmentation state machine for the main scan (plan
+    20260827-status-line-time-columns): _scan_main_jsonl feeds it every
+    STAMPED event via apply() and reads the results off .time_turns /
+    .time_open after finish() — extracting it from the scan body keeps
+    the scan loop a plain dispatcher (the closure nest it replaced held
+    four functions over nine nonlocals).
+
+    Mechanics (the agent scan mirrors the pause rules in a simpler
+    shape — see _scan_agent_jsonl):
+        - turns are keyed on "real" user events (type=user,
+          message.content a STRING — prompts, commands, interrupts);
+          list-content user events (tool_results) are activity inside
+          the current turn, not boundaries;
+        - a turn spans [prompt → last activity]; an AskUserQuestion
+          pause ([QA-assistant → next user event of any kind]) cuts it
+          into sub-intervals, and an UNANSWERED QA trims the tail at the
+          question moment;
+        - a turn without any activity degrades to its [[u, u]] degenerate
+          marker (union_work drops those later);
+        - activity before the first real prompt turns into nothing;
+        - unstamped events never reach apply(); stamped queue-operation /
+          system / snapshot events do not extend or open turns.
+
+    State-machine invariant (what lets apply() skip re-checks): once a
+    turn is anchored, _chunk_start is None ONLY inside an open QA pause
+    — the sole mid-turn clearer of _chunk_start is the QA cut, which
+    sets _qa_open_ts in the same stroke. Hence every _qa_open_ts-is-None
+    path below may assume _chunk_start is not None (the only other
+    clearer, _flush_chunk, runs inside _close_turn together with
+    _anchor=None, returning the machine to dormancy-gate protection).
+    """
+
+    def __init__(self) -> None:
+        self.time_turns: list[list[list[float]]] = []
+        self.time_open = False
+        # live-turn state, reset at each turn boundary (except
+        # _qa_open_ts, which survives until the answering user event)
+        self._anchor: float | None = None      # opening real-user-event ts
+        self._interrupt = False                # turn opened by an interrupt
+        self._has_assistant = False            # assistant event in turn
+        self._trailing_results = False         # last activity a tool_result
+        self._last_stop: str | None = None     # last assistant stop_reason
+        self._subints: list[list[float]] = []  # live turn sub-intervals
+        # the live work-chunk [_chunk_start, _chunk_end]; end None ⇒ no
+        # activity since the anchor yet
+        self._chunk_start: float | None = None
+        self._chunk_end: float | None = None
+        # unresolved AskUserQuestion question ts
+        self._qa_open_ts: float | None = None
+
+    def _flush_chunk(self) -> None:
+        """Fold the live work chunk into the turn's sub-intervals; a chunk
+        that never saw activity degrades to its degenerate [[u, u]] marker."""
+        if self._chunk_start is None:
+            return
+        if self._chunk_end is None:
+            self._subints.append([self._chunk_start, self._chunk_start])
+        else:
+            self._subints.append([self._chunk_start, self._chunk_end])
+        self._chunk_start = self._chunk_end = None
+
+    def _close_turn(self) -> None:
+        """Finalize the live turn's geometry and park it in time_turns."""
+        if self._anchor is None:
+            return
+        self._flush_chunk()
+        self.time_turns.append(self._subints)
+        self._subints = []
+        self._anchor = None
+        self._interrupt = False
+        self._has_assistant = False
+        self._trailing_results = False
+        self._last_stop = None
+
+    def _live_turn_is_open(self) -> bool:
+        """Verdict for the LAST, still-live turn only ('live-now'):
+        historical turns are never consulted — their geometry is already
+        recorded."""
+        if self._anchor is None:
+            return False
+        if self._qa_open_ts is not None:
+            # an unanswered AskUserQuestion is waiting on the human — the
+            # gap grows as wait, not as work
+            return False
+        if not self._has_assistant:
+            # prompt with no response yet stays open; the dead air after
+            # an interrupt does not
+            return not self._interrupt
+        if self._trailing_results:
+            return True
+        return self._last_stop in ("tool_use", "pause_turn")
+
+    def apply(self, event: dict, ts: float) -> None:
+        """Feed one stamped event into the machine (the event is
+        guaranteed anchored: a real prompt has already been seen)."""
+        etype = event.get("type")
+        message = event.get("message")
+        msg_dict = message if isinstance(message, dict) else {}
+
+        # Dormant before the first real prompt — activity there turns
+        # into nothing; only string-content user events matter
+        # pre-anchor, since they are the boundaries that open the first
+        # turn.
+        if self._anchor is None and not (
+            etype == "user"
+            and isinstance(msg_dict.get("content"), str)
+        ):
+            return
+
+        if etype == "user":
+            content = msg_dict.get("content")
+            if isinstance(content, str):
+                # REAL boundary: prompts/commands/interrupts close the
+                # current turn and open the next one. Any user event
+                # resolves a hanging QA pause (the just-resumed window
+                # would die at the boundary anyway).
+                self._qa_open_ts = None
+                self._close_turn()
+                self._anchor = ts
+                self._interrupt = _content_contains_marker(
+                    content, _INTERRUPT_MARKER
+                )
+                self._subints = []
+                self._chunk_start, self._chunk_end = ts, None
+                self._has_assistant = False
+                self._trailing_results = False
+                self._last_stop = None
+                return
+            # list-content user event — a tool_result: activity (and the
+            # QA pause resolver, being "a user event of any kind").
+            if self._qa_open_ts is not None:
+                # pause ends here; work resumes FROM this stroke
+                self._qa_open_ts = None
+                self._chunk_start, self._chunk_end = ts, ts
+            elif self._chunk_end is None or ts > self._chunk_end:
+                # chunk_end None ⇒ open chunk since the anchor: this is
+                # its first registered activity (chunk_start is not None
+                # here — see the state-machine invariant in the class
+                # docstring)
+                self._chunk_end = ts
+            self._trailing_results = True
+            return
+
+        if etype != "assistant":
+            # queue-operation / system / snapshot events never extend a
+            # turn (a background-agent notification must not shift
+            # waiting into work), even when they carry a timestamp
+            return
+
+        if self._qa_open_ts is not None:
+            return  # frozen inside an unresolved AskUserQuestion pause
+
+        if _message_has_qa(msg_dict):
+            # cut the turn AT the question moment: everything elapsed up
+            # to now is work; nothing accrues until a user event answers
+            # the pause (chunk_start is not None here — see the
+            # state-machine invariant in the class docstring)
+            self._subints.append([self._chunk_start, ts])
+            self._chunk_start = self._chunk_end = None
+            self._qa_open_ts = ts
+            return
+
+        # ordinary assistant activity
+        if self._chunk_end is None or ts > self._chunk_end:
+            # chunk_end None ⇒ open chunk since the anchor: first activity
+            self._chunk_end = ts
+        self._has_assistant = True
+        self._trailing_results = False
+        stop = msg_dict.get("stop_reason")
+        self._last_stop = stop if isinstance(stop, str) else None
+
+    def finish(self) -> None:
+        """End of scan: judge the still-live turn ("live-now"), then park
+        its geometry alongside the historical turns."""
+        self.time_open = self._live_turn_is_open()
+        self._close_turn()
+
+
 def _scan_main_jsonl(jsonl_path: Path) -> dict:
     """Forward-scan a main jsonl collecting token usage and tool_use
     positions.
@@ -755,25 +970,15 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
             count); 0.0 when no event has one. Anchors the session's
             "total" wall-clock column downstream.
         time_turns — list (one entry per TURN) of lists of [start, end]
-            epoch sub-intervals. Turns are keyed on "real" user events
-            (type=user, message.content a string — prompts, commands,
-            interrupts); list-content user events (tool_results) are
-            activity inside the current turn, not boundaries. A turn spans
-            [prompt → last activity]; an AskUserQuestion pause
-            ([QA-assistant → next user event of any kind]) cuts it into
-            sub-intervals, and an UNANSWERED QA trims the tail at the
-            question moment. A turn without any activity degrades to its
-            [[u, u]] degenerate marker (union_work drops those later).
-            Activity before the first real prompt turns into nothing.
-            Events without a parseable ts, stamped queue-operation /
-            system / snapshot events do not extend or open turns.
+            epoch sub-intervals produced by the _TurnSegmenter state
+            machine (turn-boundary rules, the AskUserQuestion pause cuts
+            and the [[u, u]] degenerate no-activity marker are documented
+            on the class).
         time_open — whether the LAST, still-live turn should be extended
-            to now by the orchestrator ("live-now"). True when the turn
-            ended with an assistant stop_reason in {tool_use, pause_turn},
-            with trailing tool_results, or holds a real prompt with no
-            assistant response yet. An unresolved AskUserQuestion or an
-            interrupt forces False. Only the final turn is evaluated —
-            historical turns' geometry is recorded as-is.
+            to now by the orchestrator ("live-now"); the verdict rules
+            (stop_reason / trailing tool_results / unanswered prompt, the
+            AskUserQuestion and interrupt overrides) live on
+            _TurnSegmenter._live_turn_is_open.
 
     [deviation vs the pre-model-columns scan] The flat cum_in / cum_out /
     cum_cache_create / cum_cache_read sums were removed together with the
@@ -792,168 +997,23 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
     last_uuid = ""
     seen_first_usage = False
 
-    # ---- time segmentation state (plan 20260827-status-line-time-columns) ----
+    # ---- time segmentation (plan 20260827-status-line-time-columns):
+    # ---- the scan loop only DISPATCHES stamped events into the
+    # ---- module-level state machine; all turn/pause geometry lives on
+    # ---- the _TurnSegmenter class.
     time_first_ts = 0.0
-    time_turns: list[list[list[float]]] = []
-    time_open = False
-    turn_anchor: float | None = None      # opening real-user-event ts, or None
-    turn_is_interrupt = False             # current turn was opened by an interrupt
-    turn_has_assistant = False            # an assistant event landed in this turn
-    turn_trailing_tool_results = False    # last registered activity was a tool_result
-    turn_last_stop: str | None = None     # last assistant stop_reason this turn
-    cur_subints: list[list[float]] = []   # sub-intervals of the live turn
-    chunk_start: float | None = None      # live work-chunk [chunk_start, chunk_end]
-    chunk_end: float | None = None        # (None end ⇒ no activity since the anchor)
-    qa_open_ts: float | None = None       # unresolved AskUserQuestion question ts
-    # State-machine invariant (what lets _seg_apply skip re-checks): once a
-    # turn is anchored, chunk_start is None ONLY inside an open QA pause —
-    # the sole mid-turn clearer of chunk_start is the QA cut, which sets
-    # qa_open_ts in the same stroke. Hence every qa_open_ts-is-None path
-    # below may assume chunk_start is not None (the only other clearer,
-    # _flush_chunk, runs inside _close_current_turn together with
-    # turn_anchor=None, returning the machine to dormancy-gate protection).
-
-    def _flush_chunk() -> None:
-        """Fold the live work chunk into the turn's sub-intervals; a chunk
-        that never saw activity degrades to its degenerate [[u, u]] marker."""
-        nonlocal chunk_start, chunk_end
-        if chunk_start is None:
-            return
-        cur_subints.append(
-            [chunk_start, chunk_end if chunk_end is not None else chunk_start]
-        )
-        chunk_start = chunk_end = None
-
-    def _close_current_turn() -> None:
-        """Finalize the live turn's geometry and park it in time_turns."""
-        nonlocal cur_subints, turn_anchor
-        nonlocal turn_is_interrupt, turn_has_assistant
-        nonlocal turn_trailing_tool_results, turn_last_stop
-        if turn_anchor is None:
-            return
-        _flush_chunk()
-        time_turns.append(cur_subints)
-        cur_subints = []
-        turn_anchor = None
-        turn_is_interrupt = False
-        turn_has_assistant = False
-        turn_trailing_tool_results = False
-        turn_last_stop = None
-
-    def _live_turn_is_open() -> bool:
-        """Verdict for the LAST, still-live turn only ('live-now'): historical
-        turns are never consulted — their geometry is already recorded."""
-        if turn_anchor is None:
-            return False
-        if qa_open_ts is not None:
-            # an unanswered AskUserQuestion is waiting on the human — the gap
-            # grows as wait, not as work
-            return False
-        if not turn_has_assistant:
-            # prompt with no response yet stays open; the dead air after an
-            # interrupt does not
-            return not turn_is_interrupt
-        if turn_trailing_tool_results:
-            return True
-        return turn_last_stop in ("tool_use", "pause_turn")
-
-    def _seg_apply(event: dict, ts: float) -> None:
-        """Feed one stamped event into the segmentation machine (the event
-        is guaranteed anchored: a real prompt has already been seen)."""
-        nonlocal turn_is_interrupt, turn_has_assistant
-        nonlocal turn_trailing_tool_results, turn_last_stop
-        nonlocal chunk_start, chunk_end, qa_open_ts, turn_anchor
-        nonlocal cur_subints
-
-        etype = event.get("type")
-        message = event.get("message")
-        msg_dict = message if isinstance(message, dict) else {}
-
-        # Dormant before the first real prompt — activity there turns into
-        # nothing; only string-content user events matter pre-anchor, since
-        # they are the boundaries that open the first turn.
-        if turn_anchor is None and not (
-            etype == "user"
-            and isinstance(msg_dict.get("content"), str)
-        ):
-            return
-
-        if etype == "user":
-            content = msg_dict.get("content")
-            if isinstance(content, str):
-                # REAL boundary: prompts/commands/interrupts close the current
-                # turn and open the next one.
-                qa_open_ts = None  # any user event resolves a hanging QA pause;
-                # the just-resumed window would die at the boundary anyway
-                _close_current_turn()
-                turn_anchor = ts
-                turn_is_interrupt = _content_contains_marker(
-                    content, _INTERRUPT_MARKER
-                )
-                cur_subints = []
-                chunk_start, chunk_end = ts, None
-                turn_has_assistant = False
-                turn_trailing_tool_results = False
-                turn_last_stop = None
-                return
-            # list-content user event — a tool_result: activity (and the QA
-            # pause resolver, being "a user event of any kind").
-            if qa_open_ts is not None:
-                # pause ends here; work resumes FROM this stroke
-                qa_open_ts = None
-                chunk_start, chunk_end = ts, ts
-            elif chunk_end is None or ts > chunk_end:
-                # chunk_end None ⇒ open chunk since the anchor: this is its
-                # first registered activity (chunk_start is not None here —
-                # see the state-machine invariant above)
-                chunk_end = ts
-            turn_trailing_tool_results = True
-            return
-
-        if etype != "assistant":
-            # queue-operation / system / snapshot events never extend a turn
-            # (a background-agent notification must not shift waiting into
-            # work), even when they carry a timestamp
-            return
-
-        if qa_open_ts is not None:
-            return  # frozen inside an unresolved AskUserQuestion pause
-
-        if isinstance(msg_dict.get("content"), list):
-            for block in msg_dict["content"]:
-                if (
-                    isinstance(block, dict)
-                    and block.get("type") == "tool_use"
-                    and block.get("name") == "AskUserQuestion"
-                    and qa_open_ts is None
-                ):
-                    # cut the turn AT the question moment: everything elapsed
-                    # up to now is work; nothing accrues until a user event
-                    # answers the pause (chunk_start is not None here — see
-                    # the state-machine invariant above the closures)
-                    cur_subints.append([chunk_start, ts])
-                    chunk_start = chunk_end = None
-                    qa_open_ts = ts
-                    return
-
-        # ordinary assistant activity
-        if chunk_end is None or ts > chunk_end:
-            # chunk_end None ⇒ open chunk since the anchor: first activity
-            chunk_end = ts
-        turn_has_assistant = True
-        turn_trailing_tool_results = False
-        stop = msg_dict.get("stop_reason")
-        turn_last_stop = stop if isinstance(stop, str) else None
+    segmenter = _TurnSegmenter()
 
     for index, event in _iter_events(jsonl_path):
-        # --- timestamp probe: any typed event's first stamp anchors total;
-        # --- everything else ignores unstamped events entirely (the machine
-        # --- itself stays dormant until the first real prompt).
+        # ---- timestamp probe: any typed event's first stamp anchors
+        # ---- total; everything else ignores unstamped events entirely
+        # ---- (the machine itself stays dormant until the first real
+        # ---- prompt).
         seg_ts = _parse_ts(event.get("timestamp"))
         if seg_ts is not None:
             if time_first_ts == 0.0:
                 time_first_ts = seg_ts
-            _seg_apply(event, seg_ts)
+            segmenter.apply(event, seg_ts)
 
         if event.get("type") == "assistant":
             # record uuid for this assistant event
@@ -1027,8 +1087,7 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
 
     # End of scan: judge the still-live turn ("live-now"), then park its
     # geometry alongside the historical turns.
-    time_open = _live_turn_is_open()
-    _close_current_turn()
+    segmenter.finish()
 
     return {
         "start_in": start_in,
@@ -1041,8 +1100,8 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
         "task_notifications": task_notifications,
         "per_model": per_model,
         "time_first_ts": time_first_ts,
-        "time_turns": time_turns,
-        "time_open": time_open,
+        "time_turns": segmenter.time_turns,
+        "time_open": segmenter.time_open,
     }
 
 
@@ -1262,6 +1321,26 @@ def _load_meta_dict(meta_path: Path) -> dict:
 # files that are tens of KB. Same trade-off compute_main_cum's single
 # forward scan already documents; accepted so agent rows show honest
 # cumulative per-model totals (plan 20260826-status-line-model-cost-columns).
+
+# The zeroed agent scan — the OSError degradation payload and the base
+# of the success payload (same role as _EMPTY_MAIN_RESULT for the main
+# scan). A single literal so a future scan field can never be added to
+# one return path and forgotten in the other.
+_EMPTY_AGENT_SCAN: dict = {
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "tokens_cached": 0,
+    "models": {},
+    "last_uuid": None,
+    "last_assistant": None,
+    "last_event": None,
+    "ts_first": 0.0,
+    "ts_last": 0.0,
+    "qa_pauses": [],
+    "qa_open_ts": 0.0,
+}
+
+
 def _scan_agent_jsonl(jsonl_path: Path) -> dict:
     """Single forward scan of one subagent jsonl.
 
@@ -1336,18 +1415,9 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
                 if etype == "assistant":
                     msg_t = event.get("message")
                     msg_dict_t = msg_t if isinstance(msg_t, dict) else {}
-                    content_t = msg_dict_t.get("content")
-                    if isinstance(content_t, list):
-                        for block in content_t:
-                            if (
-                                isinstance(block, dict)
-                                and block.get("type") == "tool_use"
-                                and block.get("name") == "AskUserQuestion"
-                                and qa_open_ts == 0.0
-                            ):
-                                # open (or keep) the hanging question
-                                qa_open_ts = seg_ts
-                                break
+                    if qa_open_ts == 0.0 and _message_has_qa(msg_dict_t):
+                        # open (or keep) the hanging question
+                        qa_open_ts = seg_ts
                 elif etype == "user" and qa_open_ts > 0.0:
                     # any user event resolves the hanging question;
                     # work accounting resumes at this stroke downstream
@@ -1371,19 +1441,10 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
             # scan's per_model (see _accumulate_model).
             _accumulate_model(models, msg, in_v, out_v, cached_v)
     except OSError:
-        return {
-            "tokens_in": 0,
-            "tokens_out": 0,
-            "tokens_cached": 0,
-            "models": {},
-            "last_uuid": None,
-            "last_assistant": None,
-            "last_event": None,
-            "ts_first": 0.0,
-            "ts_last": 0.0,
-            "qa_pauses": [],
-            "qa_open_ts": 0.0,
-        }
+        # Degradation: the zeroed scan (fresh shallow copy — the
+        # constant's empty list/dict values must never be handed out
+        # mutable).
+        return dict(_EMPTY_AGENT_SCAN)
     # Same non-str guard as the main scan's last_uuid: a corrupt uuid
     # must not leak into the snapshot, the agents cache and the
     # cache-key equality check.
@@ -1393,6 +1454,7 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
         if isinstance(uuid, str) and uuid:
             last_uuid = uuid
     return {
+        **_EMPTY_AGENT_SCAN,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "tokens_cached": tokens_cached,
@@ -1837,8 +1899,14 @@ def sort_agents(
 _TOKEN_COLUMN_WIDTH = 7
 # Floor for the work/wait/total duration columns ("HH:MM:SS" is exactly
 # 8 characters and the labels are shorter, so typical sessions never widen
-# them; plan 20260827-status-line-time-columns).
-_TIME_COLUMN_FLOOR = 8
+# them; plan 20260827-status-line-time-columns). Named after the same
+# "column width floor" concept as _TOKEN_COLUMN_WIDTH.
+_TIME_COLUMN_WIDTH = 8
+# The three blank work/wait/total cells — the shared degradation value
+# for the start row, session rows without a time triple, and per-model
+# continuation rows (a tuple: every use SPLATS it into a fresh row, so
+# nothing can ever mutate the constant itself).
+_EMPTY_TIME_CELLS = ("", "", "")
 # Gap between the status tag and the description column (2 spaces).
 _STATUS_GAP = "  "
 # Gap between the description column and the token column (2 spaces).
@@ -1998,7 +2066,7 @@ def _group_model_rows(
     models: dict | None,
     prices: dict | None,
     host: str,
-    time_cells: list[str] | None = None,
+    time_cells: Sequence[str],
 ) -> list:
     """Wide rows (label, model, in, out, cached, cost, units, work/wait/
     total) for one group.
@@ -2010,21 +2078,19 @@ def _group_model_rows(
     model cell — groups are never skipped (the "agents never skipped"
     invariant, extended to main and sum).
 
-    `time_cells` — the group's THREE pre-formatted work/wait/total cells
-    (the exact-arity output of _time_row_cells, the sole constructor at
-    every call site); they ride ONLY the FIRST row of the group too
-    (continuation per-model rows carry empty cells), mirroring the
-    single-label rule: a group is one logical entity whose durations are
-    session/group-wide, not per-model quantities. Zero-fallback rows are
-    first rows and keep the cells.
+    `time_cells` — REQUIRED (every call site passes it): the group's
+    THREE pre-formatted work/wait/total cells, either _time_row_cells
+    output or the shared _EMPTY_TIME_CELLS blank triple. They ride ONLY
+    the FIRST row of the group (continuation per-model rows carry
+    _EMPTY_TIME_CELLS), mirroring the single-label rule: a group is one
+    logical entity whose durations are session/group-wide, not per-model
+    quantities. Zero-fallback rows are first rows and keep the cells.
 
     Records are coerced ONCE via _coerce_record (the untrusted-cache
     boundary) and the coerced values are what both the token cells and
     the cost cell consume — a None/non-numeric field must not raise from
     compute_cost.
     """
-    if time_cells is None:
-        time_cells = ["", "", ""]
     rows: list = []
     for model, rec in (models or {}).items():
         coerced = _coerce_record(rec)
@@ -2046,7 +2112,7 @@ def _group_model_rows(
             ]
         )
         label = ""
-        time_cells = ["", "", ""]
+        time_cells = _EMPTY_TIME_CELLS
     if not rows:
         rows.append([label, "", "0", "0", "0", "", "", *time_cells])
     return rows
@@ -2087,7 +2153,7 @@ def _time_columns() -> list[dict]:
     """The work/wait/total duration-column specs shared by both
     render_output layouts (plan 20260827-status-line-time-columns).
 
-    All three are right-aligned with the _TIME_COLUMN_FLOOR=8 floor
+    All three are right-aligned with the _TIME_COLUMN_WIDTH=8 floor
     ("HH:MM:SS" fills it exactly), separated by single spaces inside the
     block. The WIDE separator marking the block off from whatever
     precedes it is NOT carried here: render_table renders every column's
@@ -2097,12 +2163,24 @@ def _time_columns() -> list[dict]:
     column in the prices layout.
     """
     return [
-        {"label": "work", "align": "right", "floor": _TIME_COLUMN_FLOOR,
-         "gap": " "},
-        {"label": "wait", "align": "right", "floor": _TIME_COLUMN_FLOOR,
-         "gap": " "},
-        {"label": "total", "align": "right", "floor": _TIME_COLUMN_FLOOR,
-         "gap": " "},
+        {
+            "label": "work",
+            "align": "right",
+            "floor": _TIME_COLUMN_WIDTH,
+            "gap": " ",
+        },
+        {
+            "label": "wait",
+            "align": "right",
+            "floor": _TIME_COLUMN_WIDTH,
+            "gap": " ",
+        },
+        {
+            "label": "total",
+            "align": "right",
+            "floor": _TIME_COLUMN_WIDTH,
+            "gap": " ",
+        },
     ]
 
 
@@ -2115,14 +2193,13 @@ def _time_row_cells(*durations: object) -> list[str]:
     absent timestamps mean unknown elapsed time, not zero. The loose
     object contract mirrors _coerce_record — agent dicts arrive through
     untrusted cache reads, so one garbage field blanks its cell instead
-    of raising out of the render.
+    of raising out of the render. The numeric predicate is _is_num
+    wholesale (finite int/float, bool rejected): the bare-NaN/Infinity
+    json extensions parse back out of a hand-corrupted agents cache and
+    would otherwise raise ValueError out of format_duration's int(),
+    degrading the WHOLE status line through main()'s catch-all.
     """
-    return [
-        format_duration(d)
-        if isinstance(d, (int, float)) and not isinstance(d, bool)
-        else ""
-        for d in durations
-    ]
+    return [format_duration(d) if _is_num(d) else "" for d in durations]
 
 
 def render_output(
@@ -2200,7 +2277,7 @@ def render_output(
     (label/description/icon) is left-aligned with floor
     _LABEL_COL_FLOOR, token columns right-aligned with floor
     _TOKEN_COLUMN_WIDTH, duration columns right-aligned with floor
-    _TIME_COLUMN_FLOOR. Description is truncated to 40 chars with
+    _TIME_COLUMN_WIDTH. Description is truncated to 40 chars with
     U+2026 (re-applied defensively). Defensive _to_int / isinstance
     handling covers pre-upgrade caches and hand-corrupted cache files.
     """
@@ -2212,7 +2289,7 @@ def render_output(
     # frame up (the repo's degrade-never-crash armor targets untrusted
     # boundaries — stdin, jsonl, cache — not internal arguments).
     session_cells = (
-        ["", "", ""] if main_time is None else _time_row_cells(*main_time)
+        _EMPTY_TIME_CELLS if main_time is None else _time_row_cells(*main_time)
     )
 
     # 1. Project agents into render-ready rows: the group label (icon +
@@ -2276,9 +2353,8 @@ def render_output(
                 format_tokens(start_in),
                 format_tokens(start_out),
                 format_tokens(start_cached),
-                "",  # start never carries time cells
-                "",
-                "",
+                # start never carries time cells
+                *_EMPTY_TIME_CELLS,
             ]
         )
         if projected:
@@ -2347,9 +2423,8 @@ def render_output(
                 format_tokens(start_cached),
                 start_cost,
                 start_units,
-                "",  # start never carries time cells
-                "",
-                "",
+                # start never carries time cells
+                *_EMPTY_TIME_CELLS,
             ]
         )
         if projected:
@@ -2594,7 +2669,7 @@ def _write_agents_cache(agents_cache_path: Path, agents: list) -> None:
 
 def _agent_time_segments(
     agent: dict, now: float
-) -> tuple[list, float, float, float] | None:
+) -> tuple[list[list[float]], float, float, float] | None:
     """Work sub-intervals + durations for ONE agent snapshot.
 
     Returns (work_intervals, work_sec, wait_sec, total_sec), or None when
@@ -2640,13 +2715,10 @@ def _agent_time_segments(
     raw_pauses = agent.get("qa_pauses")
     if isinstance(raw_pauses, list):
         for pair in raw_pauses:
-            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            span = _to_span(pair)
+            if span is None or span[1] <= span[0]:
                 continue
-            p_start = _to_float(pair[0])
-            p_end = _to_float(pair[1])
-            if p_start is None or p_end is None or p_end <= p_start:
-                continue
-            pauses.append((p_start, p_end))
+            pauses.append(span)
     pauses.sort()
 
     if qa_open_ts > 0.0:
@@ -2681,6 +2753,70 @@ def _agent_time_segments(
     return sub_intervals, work, wait, total
 
 
+def _session_time(
+    main_cum: dict, agents: list, now: float
+) -> tuple[float, float, float] | None:
+    """Assemble the SESSION's (work, wait, total) triple and every
+    agent's transient durations — the orchestrator-level counterpart of
+    _agent_time_segments' per-agent geometry (plan
+    20260827-status-line-time-columns).
+
+    The session union's intervals start from the main scan's time_turns
+    sub-intervals (each pair coerced via _to_span — main_cum may be a
+    hand-corrupted cache read), and when time_open marks the final turn
+    live its LAST sub-interval is stretched to `now` ("live-now";
+    max() keeps a stamp already ahead of a skewed clock from shrinking).
+    time_open must be literally True — a truthy junk cache value ("yes")
+    must not stretch anything (same type-strictness as _to_float). Each
+    agent then contributes its life-minus-pauses intervals via
+    _agent_time_segments (running agents extend to now, open questions
+    trim at the question) and receives its personal work/wait/total as
+    TRANSIENT time_work/time_wait/time_total keys on its dict — the
+    caller invokes this AFTER the agents-cache write so they never
+    persist; unstamped/corrupt agents (None segments) keep whatever
+    cells their dict already carries.
+
+    Returns None when the session's wall-clock anchor is unusable
+    (time_first_ts missing/null/0 — degraded anchors leave the session
+    cells empty while agent cells still render from the agents' own
+    stamps). Otherwise: total = now − first_ts (clamped ≥ 0 against
+    skewed clocks), work = min(union_work(intervals), total), wait =
+    max(0, total − work) — the min-clamp preserves work + wait == total
+    even when an agent's clock-stamped work nominally starts before
+    main's first ts (resumed / multi-dir sessions), per the plan's
+    edge-case note.
+    """
+    intervals: list[list[float]] = []
+    raw_turns = main_cum.get("time_turns")
+    if isinstance(raw_turns, list):
+        for turn in raw_turns:
+            if not isinstance(turn, list):
+                continue
+            for span in turn:
+                coerced = _to_span(span)
+                if coerced is not None:
+                    intervals.append([coerced[0], coerced[1]])
+    if intervals and main_cum.get("time_open") is True:
+        intervals[-1][1] = max(intervals[-1][1], now)
+    for agent in agents:
+        segments = _agent_time_segments(agent, now)
+        if segments is None:
+            # unstamped / corrupt agent — its cells stay empty
+            continue
+        ag_intervals, ag_work, ag_wait, ag_total = segments
+        intervals.extend(ag_intervals)
+        agent["time_work"] = ag_work
+        agent["time_wait"] = ag_wait
+        agent["time_total"] = ag_total
+    first_ts = _to_float(main_cum.get("time_first_ts")) or 0.0
+    if first_ts <= 0.0:
+        return None
+    total_sec = max(0.0, now - first_ts)
+    work_sec = min(union_work(intervals), total_sec)
+    wait_sec = max(0.0, total_sec - work_sec)
+    return work_sec, wait_sec, total_sec
+
+
 def _main_unsafe(now: float) -> int:
     """Internal implementation — assumes the caller (main) wraps OSError.
     See main() docstring for the never-crash contract.
@@ -2694,27 +2830,12 @@ def _main_unsafe(now: float) -> int:
     empty cells instead of failing loudly); the render-level degrade
     (render_output's main_time=None) stays for direct/pre-upgrade calls.
 
-    Time assembly:
-        - intervals start from the main scan's time_turns sub-intervals;
-          when time_open marks the final turn live its LAST sub-interval is
-          stretched to now ("live-now"; max() keeps a stamp already ahead
-          of a skewed clock from shrinking). time_open must be literally
-          True — a hand-corrupted truthy cache value ("yes") must not
-          stretch anything;
-        - each agent contributes its life-minus-pauses intervals via
-          _agent_time_segments (running agents extend to now, open
-          questions trim at the question), and receive their personal
-          work/wait/total as TRANSIENT time_work/time_wait/time_total keys
-          injected AFTER _write_agents_cache — deliberately absent from
-          _AGENT_CACHE_FIELDS so they never persist;
-        - session triple: total = now − time_first_ts,
-          work = min(union_work(intervals), total),
-          wait = max(0, total − work). The min-clamp preserves
-          work + wait == total even when an agent's clock-stamped work
-          nominally starts before main's first ts (resumed / multi-dir
-          sessions), per the plan's edge-case note. Degraded anchors
-          (time_first_ts missing/0/null) leave the session cells empty
-          while agent cells still render from the agents' own stamps.
+    Time assembly lives in _session_time — the orchestrator counterpart
+    of _agent_time_segments: turn sub-intervals and agent lifetimes union
+    into the session's work/wait/total, open turns and running agents
+    stretch to now, and each agent's personal triple is injected as
+    TRANSIENT time_* keys after the agents-cache write (deliberately
+    absent from _AGENT_CACHE_FIELDS so they never persist).
     """
     parsed = parse_stdin(sys.stdin.read())
     session_id = parsed.get("session_id", "") or ""
@@ -2784,44 +2905,11 @@ def _main_unsafe(now: float) -> int:
     tool_use_positions = main_cum.get("tool_use_positions")
     agents = sort_agents(agents, tool_use_positions if isinstance(tool_use_positions, dict) else {})
 
-    # ---- time columns (plan 20260827-status-line-time-columns) — see the
-    # ---- _main_unsafe docstring for the assembly contract.
-    intervals: list[list[float]] = []
-    raw_turns = main_cum.get("time_turns")
-    if isinstance(raw_turns, list):
-        for turn in raw_turns:
-            if not isinstance(turn, list):
-                continue
-            for span in turn:
-                if not isinstance(span, (list, tuple)) or len(span) != 2:
-                    continue
-                s = _to_float(span[0])
-                e = _to_float(span[1])
-                if s is not None and e is not None:
-                    intervals.append([s, e])
-    # Live-now: an open final turn keeps working until the render moment —
-    # stretch its LAST sub-interval up to now. `is True`: the field is a
-    # bool from the scan; a truthy junk value in a hand-corrupted cache
-    # must not stretch anything (same type-strictness as _to_float).
-    if intervals and main_cum.get("time_open") is True:
-        intervals[-1][1] = max(intervals[-1][1], now)
-    for agent in agents:
-        segments = _agent_time_segments(agent, now)
-        if segments is None:
-            # unstamped / corrupt agent — its cells stay empty
-            continue
-        ag_intervals, ag_work, ag_wait, ag_total = segments
-        intervals.extend(ag_intervals)
-        agent["time_work"] = ag_work
-        agent["time_wait"] = ag_wait
-        agent["time_total"] = ag_total
-    first_ts = _to_float(main_cum.get("time_first_ts")) or 0.0
-    main_time: tuple[float, float, float] | None = None
-    if first_ts > 0.0:
-        total_sec = max(0.0, now - first_ts)
-        work_sec = min(union_work(intervals), total_sec)
-        wait_sec = max(0.0, total_sec - work_sec)
-        main_time = (work_sec, wait_sec, total_sec)
+    # ---- time columns (plan 20260827-status-line-time-columns): the
+    # ---- session triple + per-agent transient keys (injected after the
+    # ---- agents-cache write above) — see _session_time for the
+    # ---- assembly contract.
+    main_time = _session_time(main_cum, agents, now)
 
     # Task 4/5 — model/cost columns: render_output consumes the per-model
     # dict (the main row's totals are the sum of its records — the flat

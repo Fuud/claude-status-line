@@ -39,7 +39,7 @@ def _iso(offset: float) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
-def ep(offset: float) -> float:
+def _ep(offset: float) -> float:
     """Epoch expectation for fixture offset `offset` (via _parse_ts)."""
     return _parse_ts(_iso(offset))
 
@@ -136,8 +136,8 @@ def test_single_turn_bounds(tmp_path: Path) -> None:
     j = _write(tmp_path, _snapshot(0), _user_prompt(1), _assistant(5))
     r = _scan_main_jsonl(j)
 
-    assert r["time_first_ts"] == ep(0)
-    assert r["time_turns"] == [[[ep(1), ep(5)]]]
+    assert r["time_first_ts"] == _ep(0)
+    assert r["time_turns"] == [[[_ep(1), _ep(5)]]]
     assert r["time_open"] is False
 
 
@@ -155,11 +155,11 @@ def test_several_turns_with_gaps_between_them(tmp_path: Path) -> None:
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_first_ts"] == ep(0)
+    assert r["time_first_ts"] == _ep(0)
     assert r["time_turns"] == [
-        [[ep(0), ep(10)]],
-        [[ep(70), ep(80)]],
-        [[ep(600), ep(610)]],
+        [[_ep(0), _ep(10)]],
+        [[_ep(70), _ep(80)]],
+        [[_ep(600), _ep(610)]],
     ]
     assert r["time_open"] is False
 
@@ -177,8 +177,8 @@ def test_activity_before_first_prompt_is_ignored(tmp_path: Path) -> None:
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_first_ts"] == ep(0)
-    assert r["time_turns"] == [[[ep(100), ep(150)]]]
+    assert r["time_first_ts"] == _ep(0)
+    assert r["time_turns"] == [[[_ep(100), _ep(150)]]]
     assert r["time_open"] is False
 
 
@@ -219,7 +219,7 @@ def test_open_when_last_assistant_stop_extends(
     j = _write(tmp_path, _user_prompt(0), _assistant(5, stop_reason))
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(5)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(5)]]]
     assert r["time_open"] is True
 
 
@@ -230,7 +230,7 @@ def test_closed_on_terminal_stop_reasons(tmp_path: Path, stop_reason: str) -> No
     j = _write(tmp_path, _user_prompt(0), _assistant(5, stop_reason))
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(5)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(5)]]]
     assert r["time_open"] is False
 
 
@@ -247,7 +247,7 @@ def test_trailing_tool_results_keep_turn_open(tmp_path: Path) -> None:
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(7)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(7)]]]
     assert r["time_open"] is True
 
 
@@ -263,7 +263,7 @@ def test_assistant_after_tool_results_closes_turn_again(tmp_path: Path) -> None:
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(5)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(5)]]]
     assert r["time_open"] is False
 
 
@@ -274,7 +274,7 @@ def test_unanswered_real_prompt_keeps_turn_open(tmp_path: Path) -> None:
     r = _scan_main_jsonl(j)
 
     # A turn without activity records its degenerate marker [[u, u]].
-    assert r["time_turns"] == [[[ep(0), ep(0)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(0)]]]
     assert r["time_open"] is True
 
 
@@ -290,8 +290,8 @@ def test_interrupt_closes_unanswered_turn(tmp_path: Path) -> None:
     r = _scan_main_jsonl(j)
 
     assert r["time_turns"] == [
-        [[ep(0), ep(0)]],
-        [[ep(10), ep(10)]],
+        [[_ep(0), _ep(0)]],
+        [[_ep(10), _ep(10)]],
     ]
     assert r["time_open"] is False
 
@@ -310,8 +310,8 @@ def test_interrupt_closes_midwork_tool_use_tail(tmp_path: Path) -> None:
     r = _scan_main_jsonl(j)
 
     assert r["time_turns"] == [
-        [[ep(0), ep(8)]],
-        [[ep(30), ep(30)]],  # the interrupt boundary itself
+        [[_ep(0), _ep(8)]],
+        [[_ep(30), _ep(30)]],  # the interrupt boundary itself
     ]
     assert r["time_open"] is False
 
@@ -335,7 +335,7 @@ def test_no_ts_events_and_queue_ops_do_not_extend_turn(tmp_path: Path) -> None:
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(30)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(30)]]]
     assert r["time_open"] is False
 
 
@@ -350,7 +350,7 @@ def test_stamped_non_activity_types_do_not_extend_turn(tmp_path: Path) -> None:
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(20)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(20)]]]
     assert r["time_open"] is False
 
 
@@ -372,7 +372,7 @@ def test_qa_pause_splits_sub_intervals(tmp_path: Path) -> None:
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(60)], [ep(180), ep(240)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(60)], [_ep(180), _ep(240)]]]
     assert r["time_open"] is False
 
 
@@ -393,7 +393,7 @@ def test_two_sequential_qa_pauses_produce_three_sub_intervals(
     r = _scan_main_jsonl(j)
 
     assert r["time_turns"] == [
-        [[ep(0), ep(60)], [ep(180), ep(300)], [ep(400), ep(500)]]
+        [[_ep(0), _ep(60)], [_ep(180), _ep(300)], [_ep(400), _ep(500)]]
     ]
     assert r["time_open"] is False
 
@@ -411,7 +411,7 @@ def test_immediate_qa_question_counts_work_up_to_the_question(
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(40)], [ep(120), ep(120)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(40)], [_ep(120), _ep(120)]]]
     # Trailing tool_result after the resumed chunk keeps the turn open...
     assert r["time_open"] is True
 
@@ -428,7 +428,7 @@ def test_open_qa_trims_turn_and_forces_closed(tmp_path: Path) -> None:
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(100)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(100)]]]
     assert r["time_open"] is False
 
 
@@ -445,8 +445,8 @@ def test_new_prompt_while_qa_hanging_closes_previous_turn(tmp_path: Path) -> Non
     r = _scan_main_jsonl(j)
 
     assert r["time_turns"] == [
-        [[ep(0), ep(50)]],
-        [[ep(400), ep(400)]],
+        [[_ep(0), _ep(50)]],
+        [[_ep(400), _ep(400)]],
     ]
     assert r["time_open"] is True
 
@@ -465,5 +465,5 @@ def test_assistant_during_open_qa_pause_does_not_extend_turn(
     )
     r = _scan_main_jsonl(j)
 
-    assert r["time_turns"] == [[[ep(0), ep(100)]]]
+    assert r["time_turns"] == [[[_ep(0), _ep(100)]]]
     assert r["time_open"] is False
