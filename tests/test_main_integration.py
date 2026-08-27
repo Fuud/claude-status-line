@@ -698,19 +698,19 @@ def test_synth_queue_event_after_assistant_rerun_uses_cached_data(
 # 9. Header "Context: NK (P%)" field (2026-08-24). Sources: payload
 #    context_window.total_input_tokens first, jsonl last-assistant occupancy
 #    as fallback; divisor: env CLAUDE_CODE_CONTEXT_LIMIT, else "[1m]" model
-#    → 1M, else 200k.
+#    → 1M, else 200K.
 # ---------------------------------------------------------------------------
 
 # Payload context value used across these tests: 15500 tokens.
-# Against 200k → "16K (8%)" (round(15.5)=16, round(7.75)=8).
+# Against 200K → "16K (8%)" (round(15.5)=16, round(7.75)=8).
 # Against 1M   → "16K (2%)"  (round(1.55)=2).
-# Against 500k → "16K (3%)"  (round(3.1)=3).
+# Against 500K → "16K (3%)"  (round(3.1)=3).
 CTX_TOKENS = 15_500
 
 
 def test_header_context_from_payload(fake_home_with_real_session) -> None:
     """Payload carries context_window.total_input_tokens → header shows it
-    after User, percent vs the 200k default (plain model, no env)."""
+    after User, percent vs the 200K default (plain model, no env)."""
     tmp_path, sid = fake_home_with_real_session
     stdin = json.dumps({
         "session_id": sid,
@@ -788,7 +788,7 @@ def test_header_context_jsonl_fallback(fake_home_with_real_session) -> None:
 def test_header_context_payload_wins_over_jsonl(fake_home_with_real_session) -> None:
     """Both sources available → payload wins (fresher; provided by CC)."""
     tmp_path, sid = fake_home_with_real_session
-    # A distinct payload value (30000 → "30K (15%)" vs 200k) that the jsonl
+    # A distinct payload value (30000 → "30K (15%)" vs 200K) that the jsonl
     # fallback would never produce for this fixture.
     stdin = json.dumps({
         "session_id": sid,
@@ -825,12 +825,12 @@ _DIRLESS_MAIN_LINES = [
     # event 2 (last): in=800, out=50, cache_read=1000
     '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"b"}],"model":"x","stop_reason":"end_turn","usage":{"input_tokens":800,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000,"output_tokens":50}},"uuid":"d2","sessionId":"x","timestamp":"2026-08-24T21:00:01.000Z"}',
 ]
-# Expected aggregates: cum_in=1800 → "2k", cum_out=150 → "150",
-# cum_cache_read=4000 → "4k"; last-event occupancy 800+0+1000=1800 → "2K (1%)".
-_DIRLESS_EXPECTED_CELLS = ["2k", "150", "4k"]
-# First event breakdown (the "start:" row): in=1000 → "1k", out=100 → "100",
-# cache_read=3000 → "3k".
-_DIRLESS_EXPECTED_START_CELLS = ["1k", "100", "3k"]
+# Expected aggregates: cum_in=1800 → "2K", cum_out=150 → "150",
+# cum_cache_read=4000 → "4K"; last-event occupancy 800+0+1000=1800 → "2K (1%)".
+_DIRLESS_EXPECTED_CELLS = ["2K", "150", "4K"]
+# First event breakdown (the "start:" row): in=1000 → "1K", out=100 → "100",
+# cache_read=3000 → "3K".
+_DIRLESS_EXPECTED_START_CELLS = ["1K", "100", "3K"]
 
 
 def _build_dirless_session(tmp_path: Path, sid: str) -> Path:
@@ -1207,11 +1207,11 @@ _UNIT_PRICES_AT_HOST = [
 #   kimi-k3:     in=6613240 out=265021 cached=36263168
 #   glm-5.3:     in=414451  out=16739  cached=7183936
 #   <synthetic>: all zero → skipped at render
-# format_tokens → "6.6M"/"265k"/"36.3M" and "414k"/"17k"/"7.2M".
+# format_tokens → "6.6M"/"265K"/"36.3M" and "414K"/"17K"/"7.2M".
 # Cost with _UNIT_PRICES = (in+out+cached)/1e6 → 43.141429 → "$43.1" and
 # 7.615126 → "$7.6".
-_MAIN_KIMI_ROW = ["|", "main:", "kimi-k3", "6.6M", "265k", "36.3M", "$43.1"]
-_MAIN_GLM_ROW = ["|", "glm-5.3", "414k", "17k", "7.2M", "$7.6"]
+_MAIN_KIMI_ROW = ["|", "main:", "kimi-k3", "6.6M", "265K", "36.3M", "$43.1"]
+_MAIN_GLM_ROW = ["|", "glm-5.3", "414K", "17K", "7.2M", "$7.6"]
 
 # With prices the fixture renders 45 lines: header + table header + start
 # + sum(2 models) + main(2 models) + 38 agent rows (27 kimi-k3, 6 glm-5.3,
@@ -1397,7 +1397,7 @@ def test_synth_prices_per_model_rows_and_costs(tmp_path: Path) -> None:
         main_lines,
         [("agent-aaa111", agent_jsonl, agent_meta)],
     )
-    # Example prices: glm-5.3 in credits (per 10k), kimi-k3 in $ (per 1M).
+    # Example prices: glm-5.3 in credits (per 10K), kimi-k3 in $ (per 1M).
     _write_prices(
         tmp_path,
         [
@@ -1426,10 +1426,10 @@ def test_synth_prices_per_model_rows_and_costs(tmp_path: Path) -> None:
     # agent glm (12000*6.9+4000*24+100000*1.7)/10000 = 34.88 → 34.9.
     assert lines[1:] == [
         "|                      model         in     out  cached          cost",
-        "| start:                            10k      5k     20k",
-        "| sum:                 glm-5.3      22k      9k    120k  57.2 credits",
-        "|                      kimi-k3     2.0M    100k       0          $7.5",
-        "| main:                glm-5.3      10k      5k     20k  22.3 credits",
-        "|                      kimi-k3     2.0M    100k       0          $7.5",
-        "| [ok]    Synth agent  glm-5.3      12k      4k    100k  34.9 credits",
+        "| start:                            10K      5K     20K",
+        "| sum:                 glm-5.3      22K      9K    120K  57.2 credits",
+        "|                      kimi-k3     2.0M    100K       0          $7.5",
+        "| main:                glm-5.3      10K      5K     20K  22.3 credits",
+        "|                      kimi-k3     2.0M    100K       0          $7.5",
+        "| [ok]    Synth agent  glm-5.3      12K      4K    100K  34.9 credits",
     ], f"table mismatch:\n" + "\n".join(repr(l) for l in lines[1:])

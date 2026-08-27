@@ -163,7 +163,7 @@ def test_load_prices_no_model_string(tmp_path, entry) -> None:
         pytest.param(None, id="missing"),
         pytest.param(0, id="zero"),
         pytest.param(-1, id="negative"),
-        pytest.param("1k", id="non-numeric"),
+        pytest.param("1K", id="non-numeric"),
         pytest.param(True, id="bool"),
     ],
 )
@@ -320,11 +320,11 @@ def test_compute_cost_zero_components() -> None:
         (1_000_000, "1.0M"),
         (1_500_000, "1.5M"),
         (2_345_678, "2.3M"),
-        # 1000 ≤ v < 1e6 → "X.Xk"
-        (1000, "1.0k"),
-        (1500, "1.5k"),
-        (40200, "40.2k"),
-        (999_999, "1000.0k"),
+        # 1000 ≤ v < 1e6 → "X.XK"
+        (1000, "1.0K"),
+        (1500, "1.5K"),
+        (40200, "40.2K"),
+        (999_999, "1000.0K"),
         # 0.1 ≤ v < 1000 → 1 decimal, trailing ".0" stripped
         (402, "402"),
         (8.1, "8.1"),

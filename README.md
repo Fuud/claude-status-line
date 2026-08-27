@@ -15,14 +15,14 @@ row per model:
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
 |                                      model            in     out  cached          cost
-| start:                                               12k      1k       0
-| sum:                                 glm-5.3        1.1M     34k   50.8M  9.5k credits
-|                                      kimi-k3        150k     40k    3.0M          $1.9
-|                                      MiniMax-M3      500     200      3k           n/a
-| main:                                glm-5.3        1.1M     30k   50.7M  9.4k credits
-|                                      kimi-k3        150k     40k    3.0M          $1.9
-| [ok]    Review: implementation plan  glm-5.3         12k      4k    100k  34.9 credits
-| [err]   Review: quality              MiniMax-M3      500     200      3k           n/a
+| start:                                               12K      1K       0
+| sum:                                 glm-5.3        1.1M     34K   50.8M  9.5K credits
+|                                      kimi-k3        150K     40K    3.0M          $1.9
+|                                      MiniMax-M3      500     200      3K           n/a
+| main:                                glm-5.3        1.1M     30K   50.7M  9.4K credits
+|                                      kimi-k3        150K     40K    3.0M          $1.9
+| [ok]    Review: implementation plan  glm-5.3         12K      4K    100K  34.9 credits
+| [err]   Review: quality              MiniMax-M3      500     200      3K           n/a
 | [run]   Task 4: MissingGlyphLog                        0       0       0
 ```
 
@@ -32,11 +32,11 @@ single totals row — the exact pre-cost layout:
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
 |                                           in     out  cached
-| start:                                   12k      1k       0
-| sum:                                    1.3M     74k   53.8M
-| main:                                   1.2M     70k   53.7M
-| [ok]    Review: implementation plan      12k      4k    100k
-| [err]   Review: quality                  500     200      3k
+| start:                                   12K      1K       0
+| sum:                                    1.3M     74K   53.8M
+| main:                                   1.2M     70K   53.7M
+| [ok]    Review: implementation plan      12K      4K    100K
+| [err]   Review: quality                  500     200      3K
 | [run]   Task 4: MissingGlyphLog            0       0       0
 ```
 
@@ -73,7 +73,7 @@ strips leading whitespace from status-line rows, and the marker keeps the
 all-spaces table-header row aligned with the rows below it.
 
 Each numeric cell is formatted via `format_tokens` (so `1000` renders
-as `1k`, `1_500_000` as `1.5M`). Every column's width — including the
+as `1K`, `1_500_000` as `1.5M`). Every column's width — including the
 `sum:` row's cells — is the widest cell under it (floored at 7 for the
 token columns), so at extreme totals the columns can be one character
 wider than the other rows suggested.
@@ -130,7 +130,7 @@ Fields:
   after a space (`402 credits`); empty/missing → the bare number.
 
 Number formatting of the cost cell: `>= 1M` → `X.XM`, `>= 1000` →
-`X.Xk`, `>= 0.1` → one decimal with a trailing `.0` dropped (`402`),
+`X.XK`, `>= 0.1` → one decimal with a trailing `.0` dropped (`402`),
 otherwise two decimals (`0.04`).
 
 Cost of one per-model row =

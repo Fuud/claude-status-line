@@ -30,7 +30,7 @@ Every table row (all lines except the session header) starts with the
 "| " prefix (_TABLE_ROW_PREFIX) so Claude Code's leading-whitespace strip
 cannot left-shift the all-spaces token-header row.
 
-Every numeric cell is formatted through format_tokens() (so 1000 → "1k")
+Every numeric cell is formatted through format_tokens() (so 1000 → "1K")
 and right-aligned to a per-column width (max of label length, the widest
 formatted cell value, and _TOKEN_COLUMN_WIDTH=7). Each column's width is
 computed independently.
@@ -110,14 +110,14 @@ def test_single_ok_agent() -> None:
     assert "100" in lines[2]
     assert "30" in lines[2]
     assert "200" in lines[2]
-    # sum line: in=1300→"1k", out=900→"900", cached=300→"300"
+    # sum line: in=1300→"1K", out=900→"900", cached=300→"300"
     assert lines[3].startswith(_TABLE_ROW_PREFIX + "sum:")
-    assert "1k" in lines[3]
+    assert "1K" in lines[3]
     assert "900" in lines[3]
     assert "300" in lines[3]
-    # main line: 1000→"1k", 500→"500", 200→"200"
+    # main line: 1000→"1K", 500→"500", 200→"200"
     assert lines[4].startswith(_TABLE_ROW_PREFIX + "main:")
-    assert "1k" in lines[4]
+    assert "1K" in lines[4]
     assert "500" in lines[4]
     assert "200" in lines[4]
     # agent line: starts with [ok], contains description and three numbers
@@ -194,7 +194,7 @@ def test_38_agents_produce_43_lines() -> None:
 def test_token_alignment_right_aligned() -> None:
     """Each numeric column is right-aligned to its own fixed width, and
     integer values are formatted via format_tokens BEFORE padding to
-    width (1234567 → "1.2M", 50000 → "50k", NOT the raw digits). This
+    width (1234567 → "1.2M", 50000 → "50K", NOT the raw digits). This
     exercises the format_tokens-before-:>W rule with a wide range of
     magnitudes."""
     header = "Session: x"
@@ -209,7 +209,7 @@ def test_token_alignment_right_aligned() -> None:
     lines = out.split("\n")
     agent_lines = lines[5:]  # header + table header + start + sum + main + agents
 
-    formatted_in = ["10", "50k", "1.2M"]
+    formatted_in = ["10", "50K", "1.2M"]
     # The "in" column width is W1 = max(_TOKEN_COLUMN_WIDTH=7, 2, 4) = 7.
     # Each value is right-aligned to width 7 → ends at column position
     # len(prefix) + W1. The prefix is "[ok]  <desc>  " (variable desc width).
@@ -241,8 +241,8 @@ def test_three_columns_right_aligned() -> None:
     identical across the three rows — that lets us check END positions
     directly."""
     header = "Session: x"
-    # tokens_in widest=2000 → "2k" (2 chars)
-    # tokens_out widest=1234 → "1k" (2 chars)
+    # tokens_in widest=2000 → "2K" (2 chars)
+    # tokens_out widest=1234 → "1K" (2 chars)
     # tokens_cached widest=1234567 → "1.2M" (4 chars)
     # widths: max(7, 2, len("1.2M")=4) = 7 for cached; 7 for in; 7 for out
     # all three columns are width 7.
@@ -404,16 +404,16 @@ def test_run_agent_shows_current_values() -> None:
 
     assert agent_line.startswith(_TABLE_ROW_PREFIX + "[run]")
     assert "Working on it" in agent_line
-    # 2500 → round(2.5)=2 (banker's) → "2k"
+    # 2500 → round(2.5)=2 (banker's) → "2K"
     # 800 → "800"
-    # 1500 → round(1.5)=2 → "2k"
-    # Both in and cached collapse to "2k"; exactly two "2k" substrings
+    # 1500 → round(1.5)=2 → "2K"
+    # Both in and cached collapse to "2K"; exactly two "2K" substrings
     # must appear in the line (one for in, one for cached). Verify the
     # count to guard against silent format regressions where only one
     # field collapses.
-    assert agent_line.count("2k") == 2, (
-        f"expected exactly 2 '2k' substrings (in=2500 + cached=1500), "
-        f"got {agent_line.count('2k')} in line {agent_line!r}"
+    assert agent_line.count("2K") == 2, (
+        f"expected exactly 2 '2K' substrings (in=2500 + cached=1500), "
+        f"got {agent_line.count('2K')} in line {agent_line!r}"
     )
     assert "800" in agent_line
 
@@ -548,7 +548,7 @@ def test_agent_no_assistant_events_renders_zeros() -> None:
 # ---------------------------------------------------------------------------
 
 def test_large_values_format_as_k() -> None:
-    """2000 input_tokens renders as '2k', not '2000'. format_tokens is
+    """2000 input_tokens renders as '2K', not '2000'. format_tokens is
     applied BEFORE :>W, not after."""
     header = "Session: x"
     agents = [
@@ -559,11 +559,11 @@ def test_large_values_format_as_k() -> None:
     lines = out.split("\n")
     agent_line = lines[5]
 
-    # The "in" cell of the agent line should contain "2k" (formatted) and
+    # The "in" cell of the agent line should contain "2K" (formatted) and
     # NOT contain the literal "2000" as a substring (which would mean
     # format_tokens wasn't applied before :>W).
-    assert "2k" in agent_line, (
-        f"expected formatted '2k' in agent line {agent_line!r}"
+    assert "2K" in agent_line, (
+        f"expected formatted '2K' in agent line {agent_line!r}"
     )
     assert "2000" not in agent_line, (
         f"raw '2000' should have been formatted: {agent_line!r}"
@@ -633,8 +633,8 @@ def test_table_header_row() -> None:
 def test_format_tokens_used_for_cell_values() -> None:
     """Sanity: format_tokens is what we expect — guards against accidental
     changes to the formatter that would silently break render_output."""
-    # 1000 → "1k" (round to nearest k)
-    assert format_tokens(1000) == "1k"
+    # 1000 → "1K" (round to nearest k)
+    assert format_tokens(1000) == "1K"
     # 999 < 1000 → "999"
     assert format_tokens(999) == "999"
     # 1_500_000 → "1.5M"
@@ -724,20 +724,20 @@ def test_negative_number_renders_as_zero() -> None:
 def test_start_row_is_first_table_row() -> None:
     """The start row renders right after the labels row (line 2), BEFORE
     sum/main, carrying the first message's in/out/cached values formatted
-    via format_tokens (1000 → "1k")."""
+    via format_tokens (1000 → "1K")."""
     header = "Session: x"
     agents = [
         {"status": "ok", "tokens_in": 5, "tokens_out": 5, "tokens_cached": 5, "description": "a"},
     ]
 
-    # start: in=1000→"1k", out=30→"30", cached=200→"200"
+    # start: in=1000→"1K", out=30→"30", cached=200→"200"
     out = render_output(header, 1000, 30, 200, _main(5000, 2000, 1000), agents)
     lines = out.split("\n")
 
     start_line = lines[2]
     assert start_line.startswith(_TABLE_ROW_PREFIX + "start:")
     # Cells formatted via format_tokens BEFORE right-alignment.
-    assert "1k" in start_line, f"expected formatted '1k' in start row: {start_line!r}"
+    assert "1K" in start_line, f"expected formatted '1K' in start row: {start_line!r}"
     assert "1000" not in start_line, f"raw '1000' should be formatted: {start_line!r}"
     assert "30" in start_line
     assert "200" in start_line
@@ -757,7 +757,7 @@ def test_start_row_not_included_in_sum() -> None:
     ]
     # main: in=50, out=30, cached=10 → sum: in=150, out=40, cached=15.
     # start is (900000, 900000, 900000): if it leaked into the sum, the sum
-    # cells would show "900k" (format_tokens(900050)) instead of the small
+    # cells would show "900K" (format_tokens(900050)) instead of the small
     # values below. No correct sum cell contains "900".
     out = render_output(header, 900_000, 900_000, 900_000, _main(50, 30, 10), agents)
     lines = out.split("\n")
@@ -880,11 +880,11 @@ def test_multi_model_groups_first_row_labels_and_order() -> None:
     assert len(lines) == 10, f"expected 10 lines, got {len(lines)}: {lines!r}"
     # sum group: merged per model (main first-appearance order, then the
     # agent-only MiniMax-M3), NO cross-model aggregation.
-    assert lines[3].split() == ["|", "sum:", "kimi-k3", "2.0M", "100k", "0", "$7.5"], lines[3]
+    assert lines[3].split() == ["|", "sum:", "kimi-k3", "2.0M", "100K", "0", "$7.5"], lines[3]
     assert lines[4].split() == ["|", "glm-5.3", "150", "30", "5", "n/a"], lines[4]
     assert lines[5].split() == ["|", "MiniMax-M3", "300", "0", "0", "n/a"], lines[5]
     # main group: one row per model, "main:" only on the first
-    assert lines[6].split() == ["|", "main:", "kimi-k3", "2.0M", "100k", "0", "$7.5"], lines[6]
+    assert lines[6].split() == ["|", "main:", "kimi-k3", "2.0M", "100K", "0", "$7.5"], lines[6]
     assert lines[7].split() == ["|", "glm-5.3", "100", "10", "5", "n/a"], lines[7]
     # agent group: icon+description only on the first row; continuation
     # row carries just the model + cells.
@@ -1067,11 +1067,11 @@ def test_prices_layout_byte_exact() -> None:
         "Session: x",
         "|            model         in     out  cached          cost",
         "| start:                    1       2       3",
-        "| sum:       glm-5.3      10k      5k     20k  22.3 credits",
-        "|            kimi-k3     2.0M    100k       0          $7.5",
-        "| main:      glm-5.3      10k      5k     20k  22.3 credits",
+        "| sum:       glm-5.3      10K      5K     20K  22.3 credits",
+        "|            kimi-k3     2.0M    100K       0          $7.5",
+        "| main:      glm-5.3      10K      5K     20K  22.3 credits",
         "| [ok]    a  glm-5.3       10       5       2  0.02 credits",
-        "|            kimi-k3     2.0M    100k       0          $7.5",
+        "|            kimi-k3     2.0M    100K       0          $7.5",
     ], out
 
 

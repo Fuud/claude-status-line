@@ -8,7 +8,7 @@ Format rules (from Technical Details):
 [decision] format_tokens uses Python's round() (banker's rounding) for the
 k and M buckets. 999500 / 1000 = 999.5 → rounds to 1000 (not 999) because
 banker's rounding still rounds .5 to even — and 1000 is the next even
-integer — yielding "1000k" per the explicit test requirement.
+integer — yielding "1000K" per the explicit test requirement.
 """
 from __future__ import annotations
 
@@ -29,10 +29,10 @@ from status_line import format_tokens
         (850, "850"),
         (999, "999"),
         # k boundary
-        (1000, "1k"),
-        (1500, "2k"),     # round-half-up: 1.5 → 2
-        (78000, "78k"),
-        (999500, "1000k"),  # [decision] round-half-up to nearest k
+        (1000, "1K"),
+        (1500, "2K"),     # round-half-up: 1.5 → 2
+        (78000, "78K"),
+        (999500, "1000K"),  # [decision] round-half-up to nearest k
         # M boundary
         (1_000_000, "1.0M"),
         (1_234_567, "1.2M"),
@@ -40,7 +40,7 @@ from status_line import format_tokens
         # rounding up M (9.96 → 10.0, not 10)
         (9_960_000, "10.0M"),
         # exact threshold
-        (999_999, "1000k"),
+        (999_999, "1000K"),
         (10_000_000, "10.0M"),
     ],
 )
@@ -61,20 +61,20 @@ def test_format_tokens_negative_clamped_to_zero(n: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Boundary: 999 → "999" (just under k threshold), 1000 → "1k"
+# Boundary: 999 → "999" (just under k threshold), 1000 → "1K"
 # ---------------------------------------------------------------------------
 
 def test_format_tokens_just_below_k_threshold() -> None:
     assert format_tokens(999) == "999"
-    assert format_tokens(999_499) == "999k"  # 999499 / 1000 = 999.499 → 999
+    assert format_tokens(999_499) == "999K"  # 999499 / 1000 = 999.499 → 999
 
 
 def test_format_tokens_just_above_k_threshold() -> None:
-    assert format_tokens(1000) == "1k"
-    assert format_tokens(1001) == "1k"
+    assert format_tokens(1000) == "1K"
+    assert format_tokens(1001) == "1K"
 
 
 def test_format_tokens_just_below_m_threshold() -> None:
     # 999_999 is still in the k branch (< 1_000_000); 999_999 / 1000 = 999.999
-    # → rounds to 1000 → "1000k" (not "1.0M").
-    assert format_tokens(999_999) == "1000k"
+    # → rounds to 1000 → "1000K" (not "1.0M").
+    assert format_tokens(999_999) == "1000K"

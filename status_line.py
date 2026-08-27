@@ -51,10 +51,10 @@ def format_tokens(n: int) -> str:
 
     Rules:
         n < 1_000           → "N"          (e.g. "850")
-        1_000 <= n < 1e6    → "Nk"         (e.g. "78k")
+        1_000 <= n < 1e6    → "NK"         (e.g. "78K")
         n >= 1_000_000      → "N.NM"       (e.g. "1.2M", 1 decimal)
 
-    [decision] Round-half-to-even for k: 999500 → "1000k". Python's built-in
+    [decision] Round-half-to-even for K: 999500 → "1000K". Python's built-in
     round() uses banker's rounding, which still gives 1000 for 999.5, so this
     matches the test expectation.
     """
@@ -64,9 +64,9 @@ def format_tokens(n: int) -> str:
     if n < 1_000:
         return str(n)
     if n < 1_000_000:
-        # round to nearest k
+        # round to nearest K
         k = round(n / 1_000)
-        return f"{k}k"
+        return f"{k}K"
     # millions branch — 1 decimal place
     m = round(n / 1_000_000, 1)
     # if rounding produced a value that rounds up to next integer (e.g. 9.96),
@@ -79,7 +79,7 @@ def format_tokens(n: int) -> str:
 # ---------------------------------------------------------------------------
 
 # Fallback context-window limits when CLAUDE_CODE_CONTEXT_LIMIT is unset:
-# "[1m]" models get 1M, everything else 200k (the API default).
+# "[1m]" models get 1M, everything else 200K (the API default).
 _CONTEXT_LIMIT_1M = 1_000_000
 _CONTEXT_LIMIT_DEFAULT = 200_000
 # Env var that, when set to a positive int, overrides both fallbacks.
@@ -245,7 +245,7 @@ def compute_cost(tokens: dict, price: dict) -> float:
 def format_cost(value: float, units: str) -> str:
     """Format a cost for the table's cost cell.
 
-    Precision buckets: >= 1e6 → "X.XM"; >= 1000 → "X.Xk";
+    Precision buckets: >= 1e6 → "X.XM"; >= 1000 → "X.XK";
     0.1 <= v < 1000 → one decimal with a trailing ".0" stripped ("402");
     < 0.1 → two decimals ("0.04"). Units whose first char is not alnum
     glue as a prefix ("$8.1"); otherwise they append after a space
@@ -254,7 +254,7 @@ def format_cost(value: float, units: str) -> str:
     if value >= 1_000_000:
         num = f"{value / 1_000_000:.1f}M"
     elif value >= 1000:
-        num = f"{value / 1_000:.1f}k"
+        num = f"{value / 1_000:.1f}K"
     elif value >= 0.1:
         num = f"{value:.1f}"
         if num.endswith(".0"):
@@ -1399,7 +1399,7 @@ def sort_agents(
 # ---------------------------------------------------------------------------
 
 # Token column width — sized to fit the widest format produced by
-# format_tokens (e.g. "999.5k", "1.2M" → 5 chars max, plus a small
+# format_tokens (e.g. "999.5K", "1.2M" → 5 chars max, plus a small
 # safety margin).
 _TOKEN_COLUMN_WIDTH = 7
 # Gap between the status tag and the description column (2 spaces).

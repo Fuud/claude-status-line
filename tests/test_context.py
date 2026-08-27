@@ -25,12 +25,12 @@ ENV = "CLAUDE_CODE_CONTEXT_LIMIT"
 # resolve_context_limit
 # ---------------------------------------------------------------------------
 
-def test_no_env_plain_model_is_200k(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_env_plain_model_is_200K(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(ENV, raising=False)
     assert resolve_context_limit("claude-opus-4") == 200_000
 
 
-def test_no_env_empty_model_is_200k(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_env_empty_model_is_200K(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(ENV, raising=False)
     assert resolve_context_limit("") == 200_000
 
@@ -47,7 +47,7 @@ def test_1m_match_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_1m_must_be_bracketed_suffix_not_substring(monkeypatch: pytest.MonkeyPatch) -> None:
     """A model merely containing "1m" without the bracket marker is NOT a
-    1M-context model — e.g. "1m-token-mini" stays at the 200k default."""
+    1M-context model — e.g. "1m-token-mini" stays at the 200K default."""
     monkeypatch.delenv(ENV, raising=False)
     assert resolve_context_limit("1m-token-mini") == 200_000
 
@@ -87,11 +87,11 @@ def test_format_context_zero() -> None:
 
 
 def test_format_context_typical_values() -> None:
-    # 15500 tokens vs 200k: round(15.5)=16 (half-to-even → 16), round(7.75)=8.
+    # 15500 tokens vs 200K: round(15.5)=16 (half-to-even → 16), round(7.75)=8.
     assert format_context(15_500, 200_000) == "16K (8%)"
     # 154321 vs 1M: round(154.321)=154, round(15.4321)=15.
     assert format_context(154_321, 1_000_000) == "154K (15%)"
-    # exactly half: 100k of 200k.
+    # exactly half: 100K of 200K.
     assert format_context(100_000, 200_000) == "100K (50%)"
 
 
