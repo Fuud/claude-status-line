@@ -124,6 +124,41 @@ def _parse_ts(value: Any) -> float | None:
     return dt.timestamp()
 
 
+def union_work(intervals: Any) -> float:
+    """Return the total covered length of a union of [start, end] intervals.
+
+    Used for session `work` time: turns (split into sub-intervals by
+    AskUserQuestion pauses) plus agent lifetimes are unioned so that
+    waiting on agents counts once as work and parallel agents do not
+    double-count overlapping wall-clock time.
+
+    Rules:
+        overlapping AND adjacent intervals merge ([0,10] + [10,20] → 20)
+        — adjacency must not leak a zero-width seam between QA-split
+        sub-intervals;
+        degenerate intervals (end <= start) are silently dropped;
+        empty / all-degenerate input → 0.0;
+        the input list itself is never mutated (scan-result lists outlive
+        the call).
+    """
+    spans = sorted((iv[0], iv[1]) for iv in intervals if iv[1] > iv[0])
+    total = 0.0
+    cur_start = cur_end = None
+    for s, e in spans:
+        if cur_start is None:
+            cur_start, cur_end = s, e
+        elif s <= cur_end:
+            # overlap or exact adjacency — extend the current span
+            if e > cur_end:
+                cur_end = e
+        else:
+            total += cur_end - cur_start
+            cur_start, cur_end = s, e
+    if cur_start is not None:
+        total += cur_end - cur_start
+    return total
+
+
 # ---------------------------------------------------------------------------
 # context limit / format_context
 # ---------------------------------------------------------------------------
