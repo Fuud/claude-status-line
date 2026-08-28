@@ -1,9 +1,9 @@
 """Tests for format_duration / _parse_ts pure functions.
 
 Format rules (from Technical Details):
-- format_duration(seconds) -> "HH:MM:SS", hours with no upper bound,
-  minutes/seconds zero-padded, negative input clamps to "00:00:00",
-  fractional seconds truncate toward zero.
+- format_duration(seconds) -> "HH:MM" (seconds dropped), hours with no
+  upper bound, minutes zero-padded, negative input clamps to "00:00",
+  seconds truncate toward zero (never round a minute up).
 - _parse_ts(value) -> POSIX epoch float | None. Handles the "Z" suffix
   by hand (Python 3.9 fromisoformat rejects it), timezone offsets,
   naive stamps assumed UTC; garbage/None/empty return None.
@@ -25,15 +25,15 @@ from status_line import _parse_ts, format_duration
     ("seconds", "expected"),
     [
         # base cases from the plan
-        (0, "00:00:00"),
-        (59.9, "00:00:59"),          # fractional truncates, no carry-up
-        (60, "00:01:00"),
-        (3599, "00:59:59"),
-        (3600, "01:00:00"),
-        (86_400, "24:00:00"),        # 24h — hours stay unpadded past 99 below
-        (372_310, "103:25:10"),      # 100h+ case — hours field grows freely
+        (0, "00:00"),
+        (59.9, "00:00"),             # sub-minute truncates away entirely
+        (60, "00:01"),
+        (3599, "00:59"),             # 59m59s — seconds never round the minute up
+        (3600, "01:00"),
+        (86_400, "24:00"),           # 24h — hours stay unpadded past 99 below
+        (372_310, "103:25"),         # 100h+ case — hours field grows freely
         # hour field below 10 keeps two digits
-        (3 * 3600 + 45 * 60 + 12, "03:45:12"),
+        (3 * 3600 + 45 * 60 + 12, "03:45"),
     ],
 )
 def test_format_duration(seconds: float, expected: str) -> None:
@@ -44,18 +44,18 @@ def test_format_duration(seconds: float, expected: str) -> None:
     "seconds", [-1, -0.5, -100, -3600, -(2**31)]
 )
 def test_format_duration_negative_clamped_to_zero(seconds: float) -> None:
-    """Negative durations clamp to "00:00:00"; wait computation already
+    """Negative durations clamp to "00:00"; wait computation already
     clamps >= 0 upstream, so this is a defensive guard mirroring
     format_tokens."""
-    assert format_duration(seconds) == "00:00:00"
+    assert format_duration(seconds) == "00:00"
 
 
 @pytest.mark.parametrize(
     ("seconds", "expected"),
     [
-        (0.999, "00:00:00"),         # < 1s truncated away entirely
-        (1.5, "00:00:01"),           # truncate, never round up
-        (62.7, "00:01:02"),          # truncation applies to whole number
+        (0.999, "00:00"),            # < 1s truncated away entirely
+        (1.5, "00:00"),              # truncate, never round up
+        (62.7, "00:01"),             # truncation applies to whole number
     ],
 )
 def test_format_duration_fractional_seconds_truncate(

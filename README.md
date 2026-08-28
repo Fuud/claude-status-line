@@ -16,16 +16,16 @@ columns — `model` (the model id from the jsonl events) and `cost`
 
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
-|                                      model            in     out  cached  cost              work     wait    total
+|                                      model            in     out  cached  cost           work  wait total
 | start:                               glm-5.3         12K      1K       0  10.7 credits
-| sum:                                 glm-5.3        1.1M     34K   50.8M  9.5K credits  28:03:20 00:08:20 28:11:40
+| sum:                                 glm-5.3        1.1M     34K   50.8M  9.5K credits  28:03 00:08 28:11
 |                                      kimi-k3        150K     40K    3.0M  $1.9
 |                                      MiniMax-M3      500     200      3K   n/a
-| main:                                glm-5.3        1.1M     30K   50.7M  9.4K credits  28:03:20 00:08:20 28:11:40
+| main:                                glm-5.3        1.1M     30K   50.7M  9.4K credits  28:03 00:08 28:11
 |                                      kimi-k3        150K     40K    3.0M  $1.9
-| [ok]    Review: implementation plan  glm-5.3         12K      4K    100K  34.9 credits  01:12:30 00:03:00 01:15:30
-| [err]   Review: quality              MiniMax-M3      500     200      3K   n/a          00:26:40 00:05:00 00:31:40
-| [run]   Task 4: MissingGlyphLog                        0       0       0                00:02:04 00:00:00 00:02:04
+| [ok]    Review: implementation plan  glm-5.3         12K      4K    100K  34.9 credits  01:12 00:03 01:15
+| [err]   Review: quality              MiniMax-M3      500     200      3K   n/a          00:26 00:05 00:31
+| [run]   Task 4: MissingGlyphLog                        0       0       0                00:02 00:00 00:02
 ```
 
 Without `prices.json` both columns disappear, each group renders a single
@@ -34,13 +34,13 @@ stay:
 
 ```
 Session: <sid> | Branch: <git-branch> | Model: <model> | User: n/a | Context: 215K (107%)
-|                                           in     out  cached      work     wait    total
+|                                           in     out  cached   work  wait total
 | start:                                   12K      1K       0
-| sum:                                    1.3M     74K   53.8M  28:03:20 00:08:20 28:11:40
-| main:                                   1.2M     70K   53.7M  28:03:20 00:08:20 28:11:40
-| [ok]    Review: implementation plan      12K      4K    100K  01:12:30 00:03:00 01:15:30
-| [err]   Review: quality                  500     200      3K  00:26:40 00:05:00 00:31:40
-| [run]   Task 4: MissingGlyphLog            0       0       0  00:02:04 00:00:00 00:02:04
+| sum:                                    1.3M     74K   53.8M  28:03 00:08 28:11
+| main:                                   1.2M     70K   53.7M  28:03 00:08 28:11
+| [ok]    Review: implementation plan      12K      4K    100K  01:12 00:03 01:15
+| [err]   Review: quality                  500     200      3K  00:26 00:05 00:31
+| [run]   Task 4: MissingGlyphLog            0       0       0  00:02 00:00 00:02
 ```
 
 Line layout:
@@ -81,9 +81,9 @@ all-spaces table-header row aligned with the rows below it.
 
 Each numeric cell is formatted via `format_tokens` (so `1000` renders
 as `1K`, `1_500_000` as `1.5M`) and each duration cell via
-`format_duration` (`HH:MM:SS`). Every column's width — including the
+`format_duration` (`HH:MM`). Every column's width — including the
 `sum:` row's cells — is the widest cell under it (floored at 7 for the
-token columns, at 8 for the duration columns — `HH:MM:SS` fills that
+token columns, at 5 for the duration columns — `HH:MM` fills that
 exactly), so at extreme totals the columns can be one character
 wider than the other rows suggested.
 
@@ -217,13 +217,13 @@ How intervals are derived:
   (waiting on agents is work by the union rule), even though the agent's
   personal row accrues it as wait.
 
-Format: `HH:MM:SS` via `format_duration`; hours are unbounded
-(`03:45:12`, `103:25:10`); fractional seconds truncate.
+Format: `HH:MM` via `format_duration` — seconds are dropped; hours are
+unbounded (`03:45`, `103:25`); truncation never rounds a minute up.
 
 Degradation: an event without a parsable timestamp is silently skipped
 for timing; a session or agent with NO usable stamps (or a legacy direct
 call bypassing the orchestrator) renders EMPTY time cells — never
-`00:00:00`. Missing data means unknown, not zero. Transient clock-skew
+`00:00`. Missing data means unknown, not zero. Transient clock-skew
 protection: work is clamped with `min(work, total)` so the invariant
 `work + wait = total` survives resumed/multi-dir sessions where an
 agent's stamps start before main's first timestamp.
@@ -342,7 +342,7 @@ Both files are written atomically (`.tmp` → `os.replace()`).
   or blank duration cells until the next jsonl mutation.
 - **Missing / unparsable timestamps**: events without an ISO 8601 stamp
   are silently skipped for timing; a session or agent with no usable
-  stamps at all renders EMPTY work/wait/total cells (never `00:00:00`).
+  stamps at all renders EMPTY work/wait/total cells (never `00:00`).
   JSON `null` in cached time fields passes the presence hit-guard but
   coerces to "no data" by the repo's usual defensive-read convention
   (`_to_float`, which also rejects booleans and non-finite junk — a bare

@@ -71,17 +71,17 @@ def _run_main(
 # Time-cell plumbing shared by the Task 6 tests (plan
 # 20260827-status-line-time-columns). With the orchestrator wired
 # (main() passes now=time.time()) every session/agent row ends with three
-# live "HH:MM:SS" cells whose VALUES depend on wall-clock time. Tests
+# live "HH:MM" cells whose VALUES depend on wall-clock time. Tests
 # therefore either pin exact values (the frozen-now in-process runs in
 # section 13) or mask durations away (legacy cross-invocation equality).
 # ---------------------------------------------------------------------------
 
-_DUR_CELL = r"\d+:[0-5]\d:[0-5]\d"
+_DUR_CELL = r"\d+:[0-5]\d"
 _DUR_CELL_RE = re.compile(_DUR_CELL)
 
 
 def _mask_durations(text: str) -> str:
-    """Replace every HH:MM:SS duration cell with "<DUR>".
+    """Replace every HH:MM duration cell with "<DUR>".
 
     Consecutive hook invocations over unchanged files differ ONLY in the
     elapsed-time digits (live-now durations grow), so masking them makes
@@ -89,11 +89,12 @@ def _mask_durations(text: str) -> str:
     return _DUR_CELL_RE.sub("<DUR>", text)
 
 
-def _hms_seconds(cell: str) -> int:
-    """Parse "HH:MM:SS" into total seconds. Raises on anything else so a
-    shifted/missing time column fails loudly instead of silently passing."""
-    hours, minutes, secs = cell.split(":")
-    return int(hours) * 3600 + int(minutes) * 60 + int(secs)
+def _hm_seconds(cell: str) -> int:
+    """Parse "HH:MM" into total seconds (minute precision). Raises on
+    anything else so a shifted/missing time column fails loudly instead
+    of silently passing."""
+    hours, minutes = cell.split(":")
+    return int(hours) * 3600 + int(minutes) * 60
 
 
 def _is_duration_cell(cell: str) -> bool:
@@ -480,7 +481,7 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
     assert len(sum_cells) == 8 and all(
         _is_duration_cell(c) for c in sum_cells[-3:]
     ), (
-        f"sum row lacks HH:MM:SS work/wait/total cells: {first_lines[3]!r}"
+        f"sum row lacks HH:MM work/wait/total cells: {first_lines[3]!r}"
     )
 
 
@@ -929,7 +930,7 @@ def test_dirless_session_via_transcript_path_renders_main_row(
     assert cells[:2] == ["|", "main:"], f"main row: {main!r}"
     # Token totals unchanged, then the three live duration cells — values
     # depend on wall-clock now (fixture stamps are in the past), so only
-    # their HH:MM:SS shape is pinned here. Exact-value pins live in the
+    # their HH:MM shape is pinned here. Exact-value pins live in the
     # frozen-now tests of section 13.
     assert cells[2:5] == _DIRLESS_EXPECTED_CELLS, f"main row: {main!r}"
     assert len(cells) == 8 and all(
@@ -1336,7 +1337,7 @@ def test_prices_plain_key_adds_model_and_cost_columns(
     # sum group: two model rows, label only on the first, both with costs.
     # Since Task 6 wires live durations, time cells ride ONLY a group's
     # FIRST row (continuations rstrip to their cost), so each row's cost is
-    # located after trimming an optional trailing HH:MM:SS run.
+    # located after trimming an optional trailing HH:MM run.
     def _cost_of(cells: list) -> str:
         if len(cells) >= 3 and all(_is_duration_cell(c) for c in cells[-3:]):
             return cells[-4]
@@ -1537,7 +1538,7 @@ def test_synth_prices_per_model_rows_and_costs(tmp_path: Path) -> None:
     # (22000*6.9+9000*24+120000*1.7)/10000 = 57.18 → 57.2 credits;
     # agent glm (12000*6.9+4000*24+100000*1.7)/10000 = 34.88 → 34.9.
     # Since the orchestrator passes now=time.time(), each group's FIRST row
-    # also ends with three live HH:MM:SS cells whose values depend on
+    # also ends with three live HH:MM cells whose values depend on
     # wall-clock distance to the fixture stamps — only shape is pinned.
     # Continuation per-model rows keep EMPTY time cells (they are rstripped
     # away), and the reference start row never carries time cells at all.
@@ -1575,9 +1576,9 @@ def test_synth_prices_per_model_rows_and_costs(tmp_path: Path) -> None:
         if has_durations:
             assert len(body) >= 3 and all(
                 _is_duration_cell(c) for c in body[-3:]
-            ), f"row must end with 3 HH:MM:SS cells: {raw!r}"
+            ), f"row must end with 3 HH:MM cells: {raw!r}"
             # Zeros are legitimate here (the agent transcript is a single
-            # stamped event → a zero-length lifetime renders 00:00:00);
+            # stamped event → a zero-length lifetime renders 00:00);
             # strictly-positive durations are pinned by the frozen-now and
             # real-session tests instead.
             body = body[:-3]
@@ -1702,23 +1703,24 @@ def _fz_qa_agent_jsonl(user_off: float, qa_off: float) -> str:
 
 def _fz_main_done_turn() -> list[str]:
     """Main transcript with ONE finished turn: prompt at t=0 answered by an
-    end_turn assistant at t=20 — afterwards the session is idle (turn
-    closed, nothing extends toward now)."""
+    end_turn assistant at t=60 — afterwards the session is idle (turn
+    closed, nothing extends toward now). Durations are minute-exact so the
+    HH:MM display truncation loses nothing (assertions stay precise)."""
     return [
         _fz_user(0, "kick things off"),
-        _fz_assistant(20, "end_turn"),
+        _fz_assistant(60, "end_turn"),
     ]
 
 
 # Frozen geometry shared by both orchestrator tests (all in seconds):
-#   main turn work ................. 20   ([t=0, t=20])
-#   background agents' lifetimes ... 240  ([t=60, t=300])
+#   main turn work ................. 60   ([t=0, t=60])
+#   background agents' lifetimes ... 300  ([t=60, t=360])
 #   frozen now ..................... t=1200
-# Session union work = 20 + 240 = 260 → "00:04:20";
-# total = 1200 → "00:20:00"; wait = 940 → "00:15:40".
+# Session union work = 60 + 300 = 360 → "00:06";
+# total = 1200 → "00:20"; wait = 840 → "00:14".
 _FROZEN_NOW_OFFSET = 1200
-_FROZEN_SESSION_CELLS = ["00:04:20", "00:15:40", "00:20:00"]
-_FROZEN_AGENT_CELLS = ["00:04:00", "00:00:00", "00:04:00"]
+_FROZEN_SESSION_CELLS = ["00:06", "00:14", "00:20"]
+_FROZEN_AGENT_CELLS = ["00:05", "00:00", "00:05"]
 
 FROZEN_SID_IDLE = "71d1e100-0000-4000-8000-0000000000a1"
 FROZEN_SID_PARALLEL = "71d1e100-0000-4000-8000-0000000000b2"
@@ -1779,7 +1781,7 @@ def test_frozen_background_agent_fills_main_idle_gap(
         tmp_path,
         FROZEN_SID_IDLE,
         _fz_main_done_turn(),
-        [("agent-bgfill", _fz_agent_jsonl(60, 300),
+        [("agent-bgfill", _fz_agent_jsonl(60, 360),
           _agent_meta("Bg: filler", "toolu_bg"))],
     )
 
@@ -1796,10 +1798,10 @@ def test_frozen_background_agent_fills_main_idle_gap(
     # main's work (union consequence agreed in the plan Overview).
     assert sum_cells[-3:] == _FROZEN_SESSION_CELLS, f"sum row: {sum_cells!r}"
     assert main_cells[-3:] == _FROZEN_SESSION_CELLS, f"main row: {main_cells!r}"
-    work, wait_s, total_s = (_hms_seconds(c) for c in sum_cells[-3:])
-    # Without the agent, work would have stopped at 20s (main's own turn).
-    # The union raised it to 260 = 20 + 240 — the agent's life became work.
-    assert work == 260 > 20, f"union did not fold agent idle-gap time in: {work}s"
+    work, wait_s, total_s = (_hm_seconds(c) for c in sum_cells[-3:])
+    # Without the agent, work would have stopped at 60s (main's own turn).
+    # The union raised it to 360 = 60 + 300 — the agent's life became work.
+    assert work == 360 > 60, f"union did not fold agent idle-gap time in: {work}s"
     assert work + wait_s == total_s, f"invariant broken: {work}+{wait_s}!={total_s}"
     assert total_s == _FROZEN_NOW_OFFSET
 
@@ -1818,19 +1820,19 @@ def test_frozen_background_agent_fills_main_idle_gap(
         f"transient durations leaked into cache: {sorted(entry)!r}"
     )
     assert entry["ts_first"] == _fzep(60)
-    assert entry["ts_last"] == _fzep(300)
+    assert entry["ts_last"] == _fzep(360)
 
 
 def test_frozen_parallel_agents_union_does_not_double_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
     """Two agents covering the SAME wall-clock window add their duration to
-    the union ONCE: session work stays 260 (= main 20 + window 240), never
-    500 (naive per-agent summation)."""
+    the union ONCE: session work stays 360 (= main 60 + window 300), never
+    660 (naive per-agent summation)."""
     agents = [
-        ("agent-parA", _fz_agent_jsonl(60, 300),
+        ("agent-parA", _fz_agent_jsonl(60, 360),
          _agent_meta("Par: alpha", "toolu_pa")),
-        ("agent-parB", _fz_agent_jsonl(60, 300),
+        ("agent-parB", _fz_agent_jsonl(60, 360),
          _agent_meta("Par: beta", "toolu_pb")),
     ]
     rc, lines = _run_frozen_now(
@@ -1847,8 +1849,8 @@ def test_frozen_parallel_agents_union_does_not_double_count(
         f"parallel windows doubled: {sum_cells!r}"
     )
     assert main_cells[-3:] == sum_cells[-3:], "main/sum divergence"
-    work, wait_s, total_s = (_hms_seconds(c) for c in sum_cells[-3:])
-    assert work == 260, f"expected single-count union (260s), got {work}s"
+    work, wait_s, total_s = (_hm_seconds(c) for c in sum_cells[-3:])
+    assert work == 360, f"expected single-count union (360s), got {work}s"
     assert work + wait_s == total_s
 
     # EACH agent still shows its OWN full window as its personal duration.
@@ -1877,26 +1879,26 @@ def test_frozen_run_agent_extends_to_now(
     rc, lines = _run_frozen_now(
         monkeypatch, capsys, tmp_path, FROZEN_SID_RUN,
         _fz_main_done_turn(),
-        [("agent-runlive", _fz_run_agent_jsonl(60, 100),
+        [("agent-runlive", _fz_run_agent_jsonl(60, 120),
           _agent_meta("Run: live tail", "toolu_rl"))],
     )
     assert rc == 0, f"non-zero exit; lines[:2]={lines[:2]!r}"
     assert len(lines) == 6, f"unexpected line count: {lines!r}"
 
-    # Agent row: lifetime [60 → now=1200] despite ts_last=100 → 1140s.
+    # Agent row: lifetime [60 → now=1200] despite ts_last=120 → 1140s.
     agent_cells = next(l for l in lines if "[run]" in l).split()
-    assert agent_cells[-3:] == ["00:19:00", "00:00:00", "00:19:00"], (
+    assert agent_cells[-3:] == ["00:19", "00:00", "00:19"], (
         f"run agent row: {agent_cells!r}"
     )
 
-    # Session union absorbed the extension: main turn [0,20] + agent
-    # [60,1200] → work 1160 (without the extension it would cap at 60).
+    # Session union absorbed the extension: main turn [0,60] + agent
+    # [60,1200] → work 1200 (without the extension it would cap at 120).
     sum_cells = next(l for l in lines if l.startswith("| sum:")).split()
-    assert sum_cells[-3:] == ["00:19:20", "00:00:40", "00:20:00"], (
+    assert sum_cells[-3:] == ["00:20", "00:00", "00:20"], (
         f"sum row: {sum_cells!r}"
     )
-    work, wait_s, total_s = (_hms_seconds(c) for c in sum_cells[-3:])
-    assert work == 1160 == 20 + (1200 - 60), (
+    work, wait_s, total_s = (_hm_seconds(c) for c in sum_cells[-3:])
+    assert work == 1200 == 60 + (1200 - 60), (
         f"union missed the run extension: {work}s"
     )
     assert work + wait_s == total_s
@@ -1909,7 +1911,7 @@ def test_frozen_open_qa_agent_preserves_performed_work(
     been hanging since t=1800 (now=5400) keeps the work it performed
     before the question on its row — the open gap grows only its wait.
     The pre-fix bug subtracted the open gap from a total already trimmed
-    at the question moment, rendering work=00:00:00 and wait>total."""
+    at the question moment, rendering work=00:00 and wait>total."""
     rc, lines = _run_frozen_now(
         monkeypatch, capsys, tmp_path, FROZEN_SID_QA,
         _fz_main_done_turn(),
@@ -1924,17 +1926,17 @@ def test_frozen_open_qa_agent_preserves_performed_work(
     # work == total (no closed pauses), wait = 5400-1800 = 3600s — the
     # hanging gap. wait > total is EXPECTED here (honest reporting).
     agent_cells = next(l for l in lines if "[run]" in l).split()
-    assert agent_cells[-3:] == ["00:29:00", "01:00:00", "00:29:00"], (
+    assert agent_cells[-3:] == ["00:29", "01:00", "00:29"], (
         f"open-QA agent row: {agent_cells!r}"
     )
-    work, wait_s, total_s = (_hms_seconds(c) for c in agent_cells[-3:])
+    work, wait_s, total_s = (_hm_seconds(c) for c in agent_cells[-3:])
     assert work == total_s == 1740, f"performed work erased: {agent_cells!r}"
     assert wait_s == 3600 > total_s
 
     # Session: the agent's intervals are trimmed at the question → union
-    # = main 20 + agent 1740 = 1760; total 5400; wait 3640.
+    # = main 60 + agent 1740 = 1800; total 5400; wait 3600.
     sum_cells = next(l for l in lines if l.startswith("| sum:")).split()
-    assert sum_cells[-3:] == ["00:29:20", "01:00:40", "01:30:00"], (
+    assert sum_cells[-3:] == ["00:30", "01:00", "01:30"], (
         f"sum row: {sum_cells!r}"
     )
 
@@ -1947,20 +1949,20 @@ def test_frozen_open_main_turn_stretches_work_to_now(
     after the last recorded activity accrues as WORK, not wait."""
     rc, lines = _run_frozen_now(
         monkeypatch, capsys, tmp_path, FROZEN_SID_OPEN_MAIN,
-        [_fz_user(0, "keep going"), _fz_assistant(20, "tool_use")],
+        [_fz_user(0, "keep going"), _fz_assistant(60, "tool_use")],
         [],
     )
     assert rc == 0, f"non-zero exit; lines[:2]={lines[:2]!r}"
     # no agents → header, labels, start, main = 4 lines
     assert len(lines) == 4, f"unexpected line count: {lines!r}"
     main_cells = next(l for l in lines if l.startswith("| main:")).split()
-    assert main_cells[-3:] == ["00:20:00", "00:00:00", "00:20:00"], (
+    assert main_cells[-3:] == ["00:20", "00:00", "00:20"], (
         f"main row: {main_cells!r}"
     )
-    work, wait_s, total_s = (_hms_seconds(c) for c in main_cells[-3:])
-    # the turn's own recorded span is [0,20]; the stretch adds now-20=1180
+    work, wait_s, total_s = (_hm_seconds(c) for c in main_cells[-3:])
+    # the turn's own recorded span is [0,60]; the stretch adds now-60=1140
     # of live work on top — everything since the last activity is work.
-    assert work == 1200 == 20 + (1200 - 20), f"stretch miscounted: {work}s"
+    assert work == 1200 == 60 + (1200 - 60), f"stretch miscounted: {work}s"
     assert wait_s == 0, "post-activity elapsed time leaked into wait"
 
 
@@ -1972,22 +1974,22 @@ def test_frozen_union_clamped_to_total_when_agent_predates_main(
     clamp pins work == total, wait == 0 — the invariant survives."""
     rc, lines = _run_frozen_now(
         monkeypatch, capsys, tmp_path, FROZEN_SID_CLAMP,
-        [_fz_user(1000, "late anchor"), _fz_assistant(1020, "end_turn")],
+        [_fz_user(600, "late anchor"), _fz_assistant(660, "end_turn")],
         [("agent-early", _fz_agent_jsonl(60, 1500),
           _agent_meta("Early: predates main", "toolu_er"))],
     )
     assert rc == 0, f"non-zero exit; lines[:2]={lines[:2]!r}"
     assert len(lines) == 6, f"unexpected line count: {lines!r}"
     sum_cells = next(l for l in lines if l.startswith("| sum:")).split()
-    # raw union = [60,1500] = 1440s > total = 1200-1000 = 200s → clamped.
-    assert sum_cells[-3:] == ["00:03:20", "00:00:00", "00:03:20"], (
+    # raw union = [60,1500] = 1440s > total = 1200-600 = 600s → clamped.
+    assert sum_cells[-3:] == ["00:10", "00:00", "00:10"], (
         f"sum row: {sum_cells!r}"
     )
-    work, wait_s, total_s = (_hms_seconds(c) for c in sum_cells[-3:])
-    assert work == total_s == 200 and wait_s == 0
+    work, wait_s, total_s = (_hm_seconds(c) for c in sum_cells[-3:])
+    assert work == total_s == 600 and wait_s == 0
     # the agent's OWN row is not clamped — it reports its full 1440s life.
     agent_cells = next(l for l in lines if "[ok]" in l).split()
-    assert agent_cells[-3:] == ["00:24:00", "00:00:00", "00:24:00"], (
+    assert agent_cells[-3:] == ["00:24", "00:00", "00:24"], (
         f"agent row: {agent_cells!r}"
     )
 
@@ -2007,11 +2009,11 @@ def test_frozen_clock_skew_now_before_first_ts_clamps(
     assert rc == 0, f"non-zero exit; lines[:2]={lines[:2]!r}"
     assert len(lines) == 6, f"unexpected line count: {lines!r}"
     sum_cells = next(l for l in lines if l.startswith("| sum:")).split()
-    assert sum_cells[-3:] == ["00:00:00", "00:00:00", "00:00:00"], (
+    assert sum_cells[-3:] == ["00:00", "00:00", "00:00"], (
         f"sum row must clamp to zero, not go negative: {sum_cells!r}"
     )
     # the agent's own stamps predate the skewed now → its cells clamp to
-    # zero too (max(0, ...) guards), never a negative HH:MM:SS.
+    # zero too (max(0, ...) guards), never a negative HH:MM.
     agent_cells = next(l for l in lines if "[ok]" in l).split()
     for cell in agent_cells[-3:]:
         assert _is_duration_cell(cell) or cell == "", (
@@ -2150,8 +2152,9 @@ def test_real_session_time_columns_invariants(fake_home_with_real_session) -> No
     """End-to-end over the REAL fixture, historical subprocess format (every
     assertion here is invariant to wall-clock `now`):
 
-        work + wait == total   (±1s — flooring three values independently
-                                can diverge by exactly one second at most)
+        work + wait == total   (±2m — three values floor to minute
+                                granularity independently, so the sum can
+                                lag the total by up to two floored minutes)
         main: row == sum: row  (union consequence)
         all three values > 0   (a long real interactive session worked AND
                                 idled at some point)
@@ -2174,10 +2177,10 @@ def test_real_session_time_columns_invariants(fake_home_with_real_session) -> No
     session_triple = sum_cells[-3:]
     for cell in session_triple:
         assert _is_duration_cell(cell), f"non-duration session cell: {cell!r}"
-    work, wait_s, total_s = (_hms_seconds(c) for c in session_triple)
+    work, wait_s, total_s = (_hm_seconds(c) for c in session_triple)
 
-    assert abs((work + wait_s) - total_s) <= 1, (
-        f"work({work}) + wait({wait_s}) != total({total_s}) beyond ±1s "
+    assert abs((work + wait_s) - total_s) <= 120, (
+        f"work({work}) + wait({wait_s}) != total({total_s}) beyond ±120s "
         f"(raw cells: {session_triple!r})"
     )
     assert session_triple == main_cells[-3:], (

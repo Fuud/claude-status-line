@@ -91,13 +91,13 @@ def format_tokens(n: int) -> str:
 # ---------------------------------------------------------------------------
 
 def format_duration(seconds: float) -> str:
-    """Format a duration in seconds as "HH:MM:SS".
+    """Format a duration in seconds as "HH:MM" (seconds are dropped).
 
     Rules:
-        hours have no upper bound ("03:45:12", "103:25:10");
-        minutes/seconds are zero-padded;
-        fractional seconds truncate toward zero (59.9s → "00:00:59");
-        negative input clamps to "00:00:00" (defensive — wait is already
+        hours have no upper bound ("03:45", "103:25");
+        minutes are zero-padded;
+        seconds truncate toward zero (59m59s → "00:59", never rounded up);
+        negative input clamps to "00:00" (defensive — wait is already
         clamped upstream).
     """
     if seconds < 0:
@@ -105,8 +105,7 @@ def format_duration(seconds: float) -> str:
     total = int(seconds)
     hours = total // 3600
     minutes = (total % 3600) // 60
-    secs = total % 60
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{hours:02d}:{minutes:02d}"
 
 
 def _parse_ts(value: Any) -> float | None:
@@ -1897,11 +1896,11 @@ def sort_agents(
 # format_tokens (e.g. "999.5K", "1.2M" → 5 chars max, plus a small
 # safety margin).
 _TOKEN_COLUMN_WIDTH = 7
-# Floor for the work/wait/total duration columns ("HH:MM:SS" is exactly
-# 8 characters and the labels are shorter, so typical sessions never widen
+# Floor for the work/wait/total duration columns ("HH:MM" is exactly
+# 5 characters and the labels are shorter, so typical sessions never widen
 # them; plan 20260827-status-line-time-columns). Named after the same
 # "column width floor" concept as _TOKEN_COLUMN_WIDTH.
-_TIME_COLUMN_WIDTH = 8
+_TIME_COLUMN_WIDTH = 5
 # The three blank work/wait/total cells — the shared degradation value
 # for the start row, session rows without a time triple, and per-model
 # continuation rows (a tuple: every use SPLATS it into a fresh row, so
@@ -2153,8 +2152,8 @@ def _time_columns() -> list[dict]:
     """The work/wait/total duration-column specs shared by both
     render_output layouts (plan 20260827-status-line-time-columns).
 
-    All three are right-aligned with the _TIME_COLUMN_WIDTH=8 floor
-    ("HH:MM:SS" fills it exactly), separated by single spaces inside the
+    All three are right-aligned with the _TIME_COLUMN_WIDTH=5 floor
+    ("HH:MM" fills it exactly), separated by single spaces inside the
     block. The WIDE separator marking the block off from whatever
     precedes it is NOT carried here: render_table renders every column's
     gap AFTER it (see how cached_gap closes the token block), so the
@@ -2189,7 +2188,7 @@ def _time_row_cells(*durations: object) -> list[str]:
 
     Each input may be numeric seconds (→ format_duration — fractional
     values truncate inside), or anything else (None / mis-typed junk →
-    ""). Missing data degrades to an EMPTY cell, never to "00:00:00":
+    ""). Missing data degrades to an EMPTY cell, never to "00:00":
     absent timestamps mean unknown elapsed time, not zero. The loose
     object contract mirrors _coerce_record — agent dicts arrive through
     untrusted cache reads, so one garbage field blanks its cell instead
@@ -2246,8 +2245,8 @@ def render_output(
     main_time is the SESSION's (work_sec, wait_sec, total_sec) union
     triple; by construction it renders IDENTICALLY on the sum: and main:
     rows (waiting on agents already counts as main's work). Cells go
-    through _time_row_cells: numeric seconds → "HH:MM:SS", None/junk →
-    "" (degraded data shows blanks, never "00:00:00"). Passing nothing
+    through _time_row_cells: numeric seconds → "HH:MM", None/junk →
+    "" (degraded data shows blanks, never "00:00"). Passing nothing
     (a legacy direct call / pre-upgrade pipeline stage) leaves every
     session time cell blank. Agents carry their own transient time_work/
     time_wait/time_total keys (injected post-cache-write by _main_unsafe)
@@ -2675,7 +2674,7 @@ def _agent_time_segments(
     Returns (work_intervals, work_sec, wait_sec, total_sec), or None when
     the agent carries no usable lifetime stamps (ts_first/ts_last missing,
     null or 0.0 — degradation contract: EMPTY cells downstream, never
-    "00:00:00") or a corrupt inverted lifetime.
+    "00:00") or a corrupt inverted lifetime.
 
     Geometry (plan 20260827-status-line-time-columns):
         - lifetime [ts_first → ts_last] over all stamped events;

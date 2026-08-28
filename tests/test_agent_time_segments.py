@@ -146,7 +146,7 @@ def test_open_question_wait_grows_with_now_but_keeps_performed_work() -> None:
     ivs, work, wait, total = _agent_time_segments(
         _agent(qa_open_ts=600.0, status="run"), NOW
     )
-    assert work == 500.0            # [100 → 600] survived, NOT 00:00:00
+    assert work == 500.0            # [100 → 600] survived, NOT 00:00
     assert total == 500.0
     assert wait == NOW - 600.0      # 9400 — the open gap alone
     assert wait > total             # allowed on agent rows

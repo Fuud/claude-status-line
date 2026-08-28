@@ -18,7 +18,7 @@ prices=None (no prices.json) → NO model and NO cost columns: one row per
 group, group totals — the pre-model-columns ROW shape. [deviation] Since
 the time columns (plan 20260827-status-line-time-columns) BOTH layouts
 additionally close every row with the always-visible work/wait/total
-block: empty cells without time data, HH:MM:SS values when the caller
+block: empty cells without time data, HH:MM values when the caller
 supplies main_time / agent time_* fields. prices present → the model
 column sits between the description and `in` (left-aligned), the cost
 column after `cached` (right-aligned), and each group (sum/main/agent)
@@ -606,7 +606,7 @@ def test_table_header_row() -> None:
     # the column width, padded on the left by `w_desc + _ICON_COL_WIDTH +
     # 4` spaces (the prefix width that agent rows also use, after the icon
     # column is padded to a fixed width); the time block trails after the
-    # wide description gap, its labels right-aligned to the 8-char time
+    # wide description gap, its labels right-aligned to the 5-char time
     # floor (empty data → no cell widening). We can verify by
     # reconstructing what the renderer would produce, using the
     # token-column width formula (former _col_width helper, inlined at the
@@ -621,7 +621,7 @@ def test_table_header_row() -> None:
     expected_table_header = (
         f"{_TABLE_ROW_PREFIX}{' ' * header_pad}"
         f"{'in':>{in_width}} {'out':>{out_width}} {'cached':>{cached_width}}"
-        f"{_DESC_TOKEN_GAP}{'work':>8} {'wait':>8} {'total':>8}"
+        f"{_DESC_TOKEN_GAP}{'work':>5} {'wait':>5} {'total':>5}"
     )
     assert table_header == expected_table_header, (
         f"table header mismatch: got {table_header!r}, expected "
@@ -1057,8 +1057,8 @@ def test_prices_layout_byte_exact() -> None:
     sides), token columns RIGHT-aligned with the _TOKEN_COLUMN_WIDTH floor
     (single-space separators), cost RIGHT-aligned after `cached` (2-space
     gap), and the always-visible time block closing every row — labels at
-    their 8-char floor, block opened by the wide units-column gap, values
-    (when present) right-aligned HH:MM:SS cells riding ONLY a group's
+    their 5-char floor, block opened by the wide units-column gap, values
+    (when present) right-aligned HH:MM cells riding ONLY a group's
     FIRST row; the start row never carries time cells. All rows share the
     column x-positions computed over every cell, including the label
     row."""
@@ -1088,15 +1088,15 @@ def test_prices_layout_byte_exact() -> None:
     assert out.split("\n") == [
         "Session: x",
         "|            model         in     out  cached"
-        "  cost              work     wait    total",
+        "  cost           work  wait total",
         "| start:                    1       2       3",
         "| sum:       glm-5.3      10K      5K     20K"
-        "  22.3 credits  28:03:20 00:08:20 28:11:40",
+        "  22.3 credits  28:03 00:08 28:11",
         "|            kimi-k3     2.0M    100K       0  $7.5",
         "| main:      glm-5.3      10K      5K     20K"
-        "  22.3 credits  28:03:20 00:08:20 28:11:40",
+        "  22.3 credits  28:03 00:08 28:11",
         "| [ok]    a  glm-5.3       10       5       2"
-        "  0.02 credits  01:12:30 00:03:00 01:15:30",
+        "  0.02 credits  01:12 00:03 01:15",
         "|            kimi-k3     2.0M    100K       0  $7.5",
     ], out
 
@@ -1327,10 +1327,11 @@ def test_corrupt_cache_records_render_without_raising() -> None:
 # ---------------------------------------------------------------------------
 
 # Session union triple: 101000s / 500s / 101500s.
-# format_duration → 28:03:20 / 00:08:20 / 28:11:40 (and 28:03:20 + 00:08:20
-# == 28:11:40, the work + wait == total invariant the orchestrator keeps).
+# format_duration → 28:03 / 00:08 / 28:11 (and 28:03 + 00:08 == 28:11,
+# the work + wait == total invariant the orchestrator keeps — visible at
+# minute granularity too because both summands truncate downward).
 _SESSION_TIME = (101_000.0, 500.0, 101_500.0)
-_WORK_WAIT_TOTAL = ["28:03:20", "00:08:20", "28:11:40"]
+_WORK_WAIT_TOTAL = ["28:03", "00:08", "28:11"]
 
 # Agent lifetime triple: 4350s / 180s / 4530s (work + wait == total).
 _AGENT_TIME_KEYS = {
@@ -1338,7 +1339,7 @@ _AGENT_TIME_KEYS = {
     "time_wait": 180.0,
     "time_total": 4530.0,
 }
-_AGENT_WORK_WAIT_TOTAL = ["01:12:30", "00:03:00", "01:15:30"]
+_AGENT_WORK_WAIT_TOTAL = ["01:12", "00:03", "01:15"]
 
 
 def test_time_labels_in_both_modes() -> None:
@@ -1372,8 +1373,8 @@ def test_time_columns_order_and_placement() -> None:
     expected_tail = (
         "0".rjust(_TOKEN_COLUMN_WIDTH)          # cached cell
         + _DESC_TOKEN_GAP                       # block opener
-        + _WORK_WAIT_TOTAL[0].rjust(8) + " "    # work
-        + _WORK_WAIT_TOTAL[1].rjust(8) + " "    # wait
+        + _WORK_WAIT_TOTAL[0].rjust(5) + " "    # work
+        + _WORK_WAIT_TOTAL[1].rjust(5) + " "    # wait
         + _WORK_WAIT_TOTAL[2]                   # total (trailing gap rstripped)
     )
     assert main_line.endswith(expected_tail), (
@@ -1381,26 +1382,26 @@ def test_time_columns_order_and_placement() -> None:
     )
 
 
-def test_time_floor_eight_and_widening() -> None:
-    """Empty time data still reserves the 8-char floor per column ("HH:MM:SS"
-    never wraps); a wider cell ("103:25:10", 9 chars) widens the column and
+def test_time_floor_five_and_widening() -> None:
+    """Empty time data still reserves the 5-char floor per column ("HH:MM"
+    never wraps); a wider cell ("103:27", 6 chars) widens the column and
     the LABEL row's padding follows."""
     out = render_output("Session: x", 0, 0, 0, _main(0, 0, 0), [])
     labels = out.split("\n")[1]
-    assert labels.endswith(f"{'work':>8} {'wait':>8} {'total':>8}"), labels
+    assert labels.endswith(f"{'work':>5} {'wait':>5} {'total':>5}"), labels
 
     wide = render_output("Session: x", 0, 0, 0, _main(0, 0, 0), [],
                          main_time=(0.0, 0.0, 372_450.0))
     wide_lines = wide.split("\n")
     # 372450s == 103h 27m 30s — one char beyond the floor.
-    assert "103:27:30" in wide_lines[-1], wide_lines[-1]
+    assert "103:27" in wide_lines[-1], wide_lines[-1]
     assert "372450" not in wide, "raw seconds must never leak into the render"
     # Zeros ARE legitimate duration values (a rendered 0-second wait);
     # only MISSING data hides behind "".
-    assert "00:00:00" in wide_lines[-1], wide_lines[-1]
+    assert "00:00" in wide_lines[-1], wide_lines[-1]
     # Per-column independence (same rule as the token columns): ONLY the
-    # widened column grows — total to 9, work/wait stay at the floor.
-    assert wide_lines[1].endswith(f"{'work':>8} {'wait':>8} {'total':>9}"), (
+    # widened column grows — total to 6, work/wait stay at the floor.
+    assert wide_lines[1].endswith(f"{'work':>5} {'wait':>5} {'total':>6}"), (
         wide_lines[1]
     )
 
@@ -1418,7 +1419,7 @@ def test_start_row_time_cells_always_empty() -> None:
 def test_main_time_renders_on_sum_and_main_rows() -> None:
     """The session's union triple lands on BOTH the sum: and main: rows
     (identical by construction — waiting on agents is main's work), as
-    right-aligned HH:MM:SS cells in cell order work/wait/total."""
+    right-aligned HH:MM cells in cell order work/wait/total."""
     agents = [
         {"status": "ok", "tokens_in": 100, "tokens_out": 10,
          "tokens_cached": 5, "description": "a"},
@@ -1438,7 +1439,7 @@ def test_main_time_renders_on_sum_and_main_rows() -> None:
 
 def test_agent_without_time_fields_empty_cells() -> None:
     """An agent with NO time_* keys (pre-upgrade cache, orchestrator
-    degradation) renders EMPTY trailing cells — never "00:00:00" (absent
+    degradation) renders EMPTY trailing cells — never "00:00" (absent
     timestamps mean unknown, not zero elapsed)."""
     agents = [{"status": "ok", "tokens_in": 1000, "tokens_out": 900,
                "tokens_cached": 300, "description": "x"}]
@@ -1447,13 +1448,13 @@ def test_agent_without_time_fields_empty_cells() -> None:
     assert agent_line.split() == [
         "|", "[ok]", "x", "1K", "900", "300",
     ], agent_line
-    assert "00:00:00" not in out, out
+    assert "00:00" not in out, out
 
 
 def test_partial_and_junk_time_values_render_empty() -> None:
     """A PARTIAL session triple fills only its present cells; None cells and
     non-numeric junk (untrusted-cache convention) coerce to "" without
-    raising; sub-second durations truncate (0.4s → "00:00:00" — a REAL
+    raising; sub-minute durations truncate (0.4s → "00:00" — a REAL
     rendered value, distinct from "")."""
     agents = [{
         "status": "ok", "tokens_in": 100, "tokens_out": 0,
@@ -1465,19 +1466,19 @@ def test_partial_and_junk_time_values_render_empty() -> None:
     out = render_output("Session: x", 0, 0, 0, _main(0, 0, 0), agents,
                         main_time=(3600.0, None, None))
     lines = out.split("\n")
-    # main: work fills ("01:00:00"), wait/total are None → empty, and the
+    # main: work fills ("01:00"), wait/total are None → empty, and the
     # line rstrips back to the work cell.
-    assert lines[4].split()[-4:] == ["0", "0", "0", "01:00:00"], lines[4]
+    assert lines[4].split()[-4:] == ["0", "0", "0", "01:00"], lines[4]
     # agent: wait is garbage → "", work is None → ""; total 0.4s TRUNCATES
-    # to a real "00:00:00".
+    # to a real "00:00".
     assert lines[5].split() == [
-        "|", "[ok]", "a", "100", "0", "0", "00:00:00",
+        "|", "[ok]", "a", "100", "0", "0", "00:00",
     ], lines[5]
 
 
 def test_boolean_time_values_rejected_as_junk() -> None:
     """True/False are bools — int SUBCLASSES — and must render EMPTY cells,
-    not coerce to 1s/0s durations ("00:00:01"/"00:00:00"): a hand-corrupted
+    not coerce to 1s/0s durations ("00:00"): a hand-corrupted
     cache writing a boolean into a transient time field means unknown, not
     one second of work. Same bool-rejection convention as _to_float."""
     agents = [{
@@ -1492,7 +1493,7 @@ def test_boolean_time_values_rejected_as_junk() -> None:
     assert agent_line.split() == [
         "|", "[ok]", "bool", "junk", "100", "0", "0",
     ], agent_line
-    assert "00:00:0" not in agent_line, agent_line
+    assert "00:00" not in agent_line, agent_line
 
 
 def test_nonfinite_time_values_rejected_as_junk() -> None:
@@ -1571,7 +1572,7 @@ def test_legacy_call_keeps_historical_tokens() -> None:
     """A direct render_output call WITHOUT time arguments ([deviation]
     backward-compat contract): every historical token is intact — rows,
     ordering, values — only the header gains the three always-visible
-    labels; no "00:00:00" placeholders materialize from thin air."""
+    labels; no "00:00" placeholders materialize from thin air."""
     agents = [{"status": "ok", "tokens_in": 300, "tokens_out": 400,
                "tokens_cached": 100, "description": "foo bar"}]
     out = render_output("Session: abc", 100, 30, 200,
@@ -1584,13 +1585,13 @@ def test_legacy_call_keeps_historical_tokens() -> None:
     assert lines[5].split() == [
         "|", "[ok]", "foo", "bar", "300", "400", "100",
     ], lines[5]
-    assert "00:00:00" not in out, out
+    assert "00:00" not in out, out
 
 
 def test_malformed_main_time_argument_is_tolerated() -> None:
     """main_time=None (legacy direct call / pre-upgrade pipeline stage)
     leaves every session cell empty — the hook must never raise and must
-    not invent "00:00:00" placeholders. [deviation] the former
+    not invent "00:00" placeholders. [deviation] the former
     strict-triple shape normalization was removed with the render
     refactor: main_time is a typed same-module internal handoff whose
     sole production caller passes None or a strict 3-tuple."""
@@ -1600,4 +1601,4 @@ def test_malformed_main_time_argument_is_tolerated() -> None:
     assert main_line.split() == ["|", "main:", "0", "0", "0"], (
         f"None main_time leaked into {main_line!r}"
     )
-    assert "00:00:00" not in out, out
+    assert "00:00" not in out, out
