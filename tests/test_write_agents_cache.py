@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from status_line import _AGENT_CACHE_FIELDS, _write_agents_cache
+from status_line import _AGENT_CACHE_FIELDS, _STATUS_REV, _write_agents_cache
 
 
 def _snapshot(agent_id: str, **overrides) -> dict:
@@ -31,6 +31,7 @@ def _snapshot(agent_id: str, **overrides) -> dict:
     base = {
         "agentId": agent_id,
         "status": "ok",
+        "status_rev": _STATUS_REV,
         "tokens_in": 0,
         "tokens_out": 0,
         "tokens_cached": 0,

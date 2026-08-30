@@ -378,19 +378,37 @@ def _format_cost_number(value: float) -> str:
 # detect_status
 # ---------------------------------------------------------------------------
 
-def _is_assistant_error(last_event: dict) -> bool:
-    """True if last_event is an assistant event with an API error marker."""
-    if last_event.get("type") != "assistant":
+def _has_api_error_markers(payload: object) -> bool:
+    """True if `payload` (an event dict or a message dict) carries any of
+    the API error markers: truthy `error`, `isApiErrorMessage` is True, or
+    integer `apiErrorStatus` >= 400."""
+    if not isinstance(payload, dict):
         return False
-    msg = last_event.get("message", {}) or {}
-    if msg.get("error"):
+    if payload.get("error"):
         return True
-    if msg.get("isApiErrorMessage") is True:
+    if payload.get("isApiErrorMessage") is True:
         return True
-    api_status = msg.get("apiErrorStatus")
+    api_status = payload.get("apiErrorStatus")
     if isinstance(api_status, int) and api_status >= 400:
         return True
     return False
+
+
+def _is_assistant_error(last_event: dict) -> bool:
+    """True if last_event is an assistant event with an API error marker.
+
+    Claude Code versions disagree on WHERE the markers live: some nest
+    them inside `message` (next to stop_reason), while 2.1.224 writes the
+    synthetic error event with `error` / `isApiErrorMessage` /
+    `apiErrorStatus` at the EVENT top level (siblings of `message`) and
+    stop_reason='stop_sequence'. Both shapes are checked — that
+    top-level shape is a DEAD agent (observed: 429 rate limit), which
+    must classify as err, not run."""
+    if last_event.get("type") != "assistant":
+        return False
+    if _has_api_error_markers(last_event.get("message")):
+        return True
+    return _has_api_error_markers(last_event)
 
 
 _INTERRUPT_MARKER = "Request interrupted by user"
@@ -442,7 +460,8 @@ def detect_status(last_event: dict, meta: dict) -> str:
 
     Priority (highest first):
         err   — last event is assistant AND has error/isApiErrorMessage/
-                apiErrorStatus>=400
+                apiErrorStatus>=400 (checked BOTH inside `message` and at
+                the event top level — see _is_assistant_error)
         stop  — meta.stoppedByUser=true OR last event is user with
                 'Request interrupted by user' marker
         ok    — last event is assistant with stop_reason='end_turn'
@@ -1476,6 +1495,10 @@ def compute_agent_snapshot(
     Returns a dict with keys:
         agentId       — jsonl filename without `.jsonl` extension
         status        — one of {"ok","err","stop","run"} (see detect_status)
+        status_rev    — the status-logic revision the `status` was
+                        classified under (see _STATUS_REV): persisted and
+                        compared on cache hits so a classification fix
+                        rescans even never-again-mutating agent jsonls.
         tokens_in     — cumulative input_tokens across ALL assistant events
                         with a usage block (0 when there are none)
         tokens_out    — cumulative output_tokens, same accumulation rules
@@ -1516,10 +1539,14 @@ def compute_agent_snapshot(
     mtime_jsonl AND mtime_meta match the current on-disk state AND all
     three breakdown fields AND `models` AND the four time-segmentation
     fields (ts_first / ts_last / qa_pauses / qa_open_ts) are present in
-    cache_entry, the cache_entry is returned unchanged. The
-    field-presence checks guard against stale pre-upgrade caches (which
-    would render zeros via `int(a.get(field) or 0)` — and, for the time
-    fields, empty work/wait/total cells — until the next jsonl mutation).
+    cache_entry AND its status_rev equals the current _STATUS_REV, the
+    cache_entry is returned unchanged. The field-presence checks guard
+    against stale pre-upgrade caches (which would render zeros via
+    `int(a.get(field) or 0)` — and, for the time fields, empty
+    work/wait/total cells — until the next jsonl mutation); the
+    status_rev check guards against pre-rev STATUS LOGIC (a cached
+    "run" classified before an _is_assistant_error fix would otherwise
+    outlive the fix for agents whose jsonl never mutates again).
     This function does NOT write to any cache file — the caller
     (orchestrator) owns cache persistence.
 
@@ -1547,7 +1574,10 @@ def compute_agent_snapshot(
     # and the four time-segmentation fields are REQUIRED: a pre-upgrade
     # cache (old format) would otherwise satisfy the key-match but lack
     # the new fields, leading to render zeros / empty model cells / empty
-    # time cells until the next jsonl mutation.
+    # time cells until the next jsonl mutation. The status_rev equality
+    # check plays the same role for STATUS-LOGIC upgrades: a dead agent's
+    # jsonl never mutates again, so a cached "run" from a pre-rev
+    # classifier would otherwise survive the fix forever.
     mtime_meta_for_compare = _meta_mtime(meta_path)
     last_uuid_for_compare = scan["last_uuid"]
     # agent_id is needed both for the cache-hit dict-shape invariant (see
@@ -1568,6 +1598,7 @@ def compute_agent_snapshot(
             and breakdown_present
             and "models" in cache_entry
             and time_fields_present
+            and cache_entry.get("status_rev") == _STATUS_REV
         ):
             # Preserve the invariant: the returned snapshot always has
             # `agentId` inside, regardless of cache hit or miss. The
@@ -1607,6 +1638,7 @@ def compute_agent_snapshot(
     return {
         "agentId": agent_id,
         "status": status,
+        "status_rev": _STATUS_REV,
         "tokens_in": scan["tokens_in"],
         "tokens_out": scan["tokens_out"],
         "tokens_cached": scan["tokens_cached"],
@@ -2465,11 +2497,25 @@ def render_output(
 # only place main() knows about the disk layout, all compute_* helpers are
 # layout-agnostic.
 
+# Revision of the status-detection logic baked into each cached
+# `status`. Bump when detect_status / _is_assistant_error reclassify
+# events: rev 2 adds the event-TOP-LEVEL API-error markers (CC 2.1.224
+# writes the synthetic error event with error/isApiErrorMessage/
+# apiErrorStatus as siblings of `message`, not inside it — agents that
+# died mid-flow on such an event, e.g. a 429, were misclassified as
+# "run" forever). Stored per entry and part of the cache-hit check: an
+# entry whose status_rev differs from the current code is treated as a
+# miss, rescanned once and rewritten — the jsonl of a dead agent never
+# mutates again, so without this the pre-rev "run" would survive any
+# code fix.
+_STATUS_REV = 2
+
 # Fields persisted in agents_<sid>.json cache. agentId is the dict key,
 # so NOT stored inside each entry; compute_agent_snapshot re-injects
 # agentId on the cache-hit path to keep the returned dict shape stable
 # for downstream consumers (see _write_agents_cache and _AGENT_CACHE_FIELDS
-# invariant). mtime_jsonl/mtime_meta drive invalidation; the breakdown
+# invariant). mtime_jsonl/mtime_meta drive invalidation; `status` carries
+# the status_rev stamp explained above; the breakdown
 # fields are the render-ready shape (replacing the prior `tokens` sum);
 # `models` is the per-model breakdown feeding the model/cost columns —
 # its presence is part of the cache-hit check so pre-model-columns
@@ -2484,6 +2530,7 @@ _AGENT_CACHE_FIELDS = (
     "last_uuid",
     "mtime_jsonl",
     "status",
+    "status_rev",
     "tokens_in",
     "tokens_out",
     "tokens_cached",

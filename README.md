@@ -95,6 +95,13 @@ wider than the other rows suggested.
 |          | `[Request interrupted by user]` marker               |
 | `[run]`  | mid-flow (last assistant had `stop_reason=tool_use`) |
 
+The `[err]` markers (`error` / `isApiErrorMessage` / `apiErrorStatus>=400`)
+are looked up BOTH inside `message` (legacy event shape) AND at the event
+top level: Claude Code 2.1.224 writes the synthetic API-error event (e.g.
+a 429 death) with the markers as siblings of `message` and
+`stop_reason="stop_sequence"` — without the top-level lookup such dead
+agents classify as `[run]` forever.
+
 ## Costs (prices.json)
 
 The `model` and `cost` columns are opt-in: they appear only when a valid
@@ -299,20 +306,28 @@ rewritten in the new shape.
 
 Each per-agent entry in `agents_<sid>.json` is keyed by `agentId` and
 holds the fields `last_uuid`, `mtime_jsonl`, `mtime_meta`, `status`,
-`tokens_in`, `tokens_out`, `tokens_cached`, `models`, `description`,
-`toolUseId`, plus the four time-stamp fields `ts_first`, `ts_last`,
-`qa_pauses`, `qa_open_ts`. The three `tokens_*` fields are the CUMULATIVE
-breakdown columns rendered in the status line (input / output /
+`status_rev`, `tokens_in`, `tokens_out`, `tokens_cached`, `models`,
+`description`, `toolUseId`, plus the four time-stamp fields `ts_first`,
+`ts_last`, `qa_pauses`, `qa_open_ts`. The three `tokens_*` fields are the
+CUMULATIVE breakdown columns rendered in the status line (input / output /
 cache-read, summed over all of the agent's assistant events); `models`
 is the per-model breakdown feeding the `model`/`cost` columns; the four
 time fields persist so cache-HIT cycles can still apply live-now
 extensions and AskUserQuestion wait splits. Cache-hit requires ALL of
-these breakdown + time fields to be present — a pre-upgrade cache
+these breakdown + time fields to be present AND the entry's `status_rev`
+to equal the code's current status-logic revision — a pre-upgrade cache
 missing any of them invalidates and triggers a forward re-parse (see
 Edge cases). The derived durations (`time_work` / `time_wait` /
 `time_total`) are deliberately NOT here: they are recomputed and
 injected into the agent dicts after every cache write by the
 orchestrator.
+
+`status_rev` deserves its own word: a dead agent's jsonl never mutates
+again, so the `(last_uuid, mtime)` key would keep hitting a cache entry
+forever — including a `status` value classified by an older, buggier
+`detect_status`. The rev stamp (bumped whenever status classification
+changes) turns such entries into misses: they are rescanned once and
+rewritten with the corrected status.
 
 Both files are written atomically (`.tmp` → `os.replace()`).
 
@@ -335,11 +350,13 @@ Both files are written atomically (`.tmp` → `os.replace()`).
 - **Pre-upgrade agents cache (no breakdown fields)**: cache-hit
   requires `tokens_in`/`tokens_out`/`tokens_cached`/`models` plus the
   four time fields (`ts_first`/`ts_last`/`qa_pauses`/`qa_open_ts`) to be
-  present; if any are missing, the entry is treated as a miss and the
-  jsonl is re-scanned. After the first such re-scan the cache is
-  rewritten with the new shape and subsequent calls hit cleanly. Without
-  this check, a stale entry would render zeros (via `int(field or 0)`)
-  or blank duration cells until the next jsonl mutation.
+  present, and the entry's `status_rev` to match the current code; if
+  any fail, the entry is treated as a miss and the jsonl is re-scanned.
+  After the first such re-scan the cache is rewritten with the new shape
+  and subsequent calls hit cleanly. Without this check, a stale entry
+  would render zeros (via `int(field or 0)`), blank duration cells — or,
+  for a pre-rev `status`, a wrong `[run]`/`[err]` tag — until the next
+  jsonl mutation (which, for a dead agent, never comes).
 - **Missing / unparsable timestamps**: events without an ISO 8601 stamp
   are silently skipped for timing; a session or agent with no usable
   stamps at all renders EMPTY work/wait/total cells (never `00:00`).
@@ -377,7 +394,7 @@ cd ~/.claude/status_line
 python3 -m pytest tests/ -v
 ```
 
-490 tests cover: pure functions (`format_tokens`, `format_duration`,
+499 tests cover: pure functions (`format_tokens`, `format_duration`,
 `union_work`, `_parse_ts` in `tests/test_format_duration.py` /
 `tests/test_union_work.py`, the agent pause/trim/extension geometry in
 `tests/test_agent_time_segments.py`, `detect_status`, `parse_stdin`),

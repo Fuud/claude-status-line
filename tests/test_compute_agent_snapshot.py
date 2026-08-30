@@ -18,9 +18,12 @@ Cache semantics:
   mtime_meta all match the current file state AND breakdown fields
   (tokens_in/out/cached) AND `models` AND the four time-segmentation
   fields (ts_first/ts_last/qa_pauses/qa_open_ts) are present in
-  cache_entry → return the cache_entry unchanged (cache hit). The
-  field-presence checks guard against stale caches from pre-upgrade
-  schemas (including pre-time-column ones).
+  cache_entry AND its status_rev equals the current _STATUS_REV →
+  return the cache_entry unchanged (cache hit). The field-presence
+  checks guard against stale caches from pre-upgrade schemas (including
+  pre-time-column ones); the status_rev check guards against pre-rev
+  STATUS LOGIC — a cached "run" from before an _is_assistant_error fix
+  must not outlive the fix for agents whose jsonl never mutates again.
 - Otherwise → re-parse the jsonl, compute fields fresh, and return.
 
 The function does NOT write any cache file — the caller (orchestrator) owns
@@ -38,7 +41,12 @@ from pathlib import Path
 import pytest
 
 import status_line
-from status_line import _AGENT_CACHE_FIELDS, _compute_agents, compute_agent_snapshot
+from status_line import (
+    _AGENT_CACHE_FIELDS,
+    _STATUS_REV,
+    _compute_agents,
+    compute_agent_snapshot,
+)
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -54,6 +62,10 @@ AGENT_COMPLETED = FIXTURES_DIR / "agent-completed-after-tool-use.jsonl"
 AGENT_COMPLETED_META = FIXTURES_DIR / "agent-completed-after-tool-use.meta.json"
 AGENT_ERR_API = FIXTURES_DIR / "agent-err-in-tool-use.jsonl"
 AGENT_ERR_API_META = FIXTURES_DIR / "agent-err-in-tool-use.meta.json"
+# Real-shape CC 2.1.224 API-error death (session 9b7971ff): synthetic
+# final assistant event with the error markers at the EVENT top level,
+# stop_reason 'stop_sequence', <synthetic> model, zero usage.
+AGENT_ERR_TOP_LEVEL = FIXTURES_DIR / "agent_err_top_level.jsonl"
 # Agent that switches models mid-session: two kimi-k3 events (in=10+20,
 # out=5+8, cached=100+200) then one glm-5.3 event (in=30, out=12,
 # cached=300). Cumulative totals: in=60, out=25, cached=600.
@@ -555,6 +567,7 @@ def test_cache_hit_with_breakdown_fields() -> None:
     cache_entry = {
         "agentId": _agent_id(AGENT_OK),
         "status": "ok",
+        "status_rev": _STATUS_REV,
         "tokens_in": 11_111,
         "tokens_out": 22_222,
         "tokens_cached": 33_333,
@@ -688,6 +701,83 @@ def test_cache_miss_when_models_missing() -> None:
     assert result["description"] == "Fixer: smells findings"
 
 
+def test_cache_miss_when_status_rev_missing_or_old() -> None:
+    """[upgrade path] Cache entry matches the full key (last_uuid +
+    mtime_jsonl + mtime_meta) and carries every breakdown/models/time
+    field, but its status_rev is absent (pre-rev cache) or an OLD rev →
+    cache MISS, forward re-parse recomputes `status` under the current
+    logic. This is what heals already-dead agents after a
+    classification fix: their jsonl never mutates again, so the stale
+    cached "run" would otherwise survive the fix forever (observed in
+    session 9b7971ff: five 429-dead agents rendering as [run])."""
+    mtime = AGENT_OK.stat().st_mtime
+    mtime_meta = META_NORMAL.stat().st_mtime
+
+    def _entry(rev):
+        return {
+            "status": "run",  # the misclassification being healed
+            "tokens_in": 9_999_999,
+            "tokens_out": 9_999_999,
+            "tokens_cached": 9_999_999,
+            "models": {"stale-model": {"in": 1, "out": 1, "cached": 1}},
+            "description": "stale-pre-rev",
+            "toolUseId": "toolu_stale",
+            "last_uuid": "a0000000-0000-0000-0000-000000000004",
+            "mtime_jsonl": mtime,
+            "mtime_meta": mtime_meta,
+            "ts_first": 1000.0,
+            "ts_last": 1400.5,
+            "qa_pauses": [],
+            "qa_open_ts": 0.0,
+            **({"status_rev": rev} if rev is not None else {}),
+        }
+
+    # Case A: pre-rev entry (no status_rev key at all).
+    result_a = compute_agent_snapshot(
+        AGENT_OK, META_NORMAL, cache_entry=_entry(None)
+    )
+    assert result_a["status"] == "ok", (
+        "missing status_rev must be a miss: status recomputed from jsonl"
+    )
+    assert result_a["tokens_in"] == 150
+
+    # Case B: old rev (any value != current _STATUS_REV).
+    result_b = compute_agent_snapshot(
+        AGENT_OK, META_NORMAL, cache_entry=_entry(_STATUS_REV - 1)
+    )
+    assert result_b["status"] == "ok"
+    assert result_b["tokens_in"] == 150
+
+
+def test_snapshot_carries_current_status_rev() -> None:
+    """Every fresh (cache-miss) snapshot stamps the status-logic revision
+    it was classified under, so the NEXT cache-hit check can compare it."""
+    result = compute_agent_snapshot(AGENT_OK, META_NORMAL, cache_entry=None)
+    assert result["status_rev"] == _STATUS_REV
+
+
+def test_err_top_level_fixture_snapshot() -> None:
+    """Full snapshot over the real-shape 429-death fixture: status 'err'
+    (the fix under test), breakdown ONLY from the real assistant event
+    (in=200, out=50, cached=400 — the synthetic event's zero usage adds
+    nothing), models keeps the zero-token <synthetic> key (the render
+    layer skips zero rows), and the synthetic event's uuid is the
+    last_uuid (it IS an assistant event — the cache keys on it)."""
+    result = compute_agent_snapshot(
+        AGENT_ERR_TOP_LEVEL, META_NORMAL, cache_entry=None
+    )
+
+    assert result["status"] == "err"
+    assert result["tokens_in"] == 200
+    assert result["tokens_out"] == 50
+    assert result["tokens_cached"] == 400
+    assert result["models"] == {
+        "glm-5.3": {"in": 200, "out": 50, "cached": 400},
+        "<synthetic>": {"in": 0, "out": 0, "cached": 0},
+    }
+    assert result["last_uuid"] == "e0000000-0000-0000-0000-000000000004"
+
+
 def test_cache_miss_recomputes() -> None:
     """Cache entry has wrong last_uuid OR stale mtime → re-parse from jsonl,
     result reflects current state (NOT the cache_entry values)."""
@@ -757,11 +847,12 @@ def test_cache_miss_on_meta_mtime_change(tmp_path: Path) -> None:
     last_uuid = "a0000000-0000-0000-0000-000000000004"
 
     # Cache built when meta was at v1. Includes the three breakdown fields,
-    # `models` and the four time fields so the only thing invalidating the
-    # cache is mtime_meta.
+    # `models`, the four time fields and the current status_rev so the only
+    # thing invalidating the cache is mtime_meta.
     cache_v1 = {
         "agentId": "agent-test",
         "status": "ok",
+        "status_rev": _STATUS_REV,
         "tokens_in": 9_999_999,  # sentinel — should not survive
         "tokens_out": 9_999_999,
         "tokens_cached": 9_999_999,
@@ -1504,6 +1595,7 @@ def test_cache_hit_injects_agentid_into_returned_dict() -> None:
     cache_entry = {
         "agentId": "wrong-id-from-cache",
         "status": "ok",
+        "status_rev": _STATUS_REV,
         "tokens_in": 11_111,
         "tokens_out": 22_222,
         "tokens_cached": 33_333,

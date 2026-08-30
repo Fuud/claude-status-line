@@ -5,6 +5,10 @@ Status priority (highest first):
           - `error` field set (non-empty string)
           - `isApiErrorMessage: true`
           - `apiErrorStatus >= 400`
+        …checked BOTH inside `message` (legacy shape) AND at the event
+        top level (CC 2.1.224 synthetic error events — see the
+        agent_err_top_level fixture, a real 429 death miscategorized as
+        "run" before the fix).
 - stop: meta has `stoppedByUser: true` OR last event is type=user with content
         containing "[Request interrupted by user]"
 - ok:   last event is assistant with `stop_reason: end_turn` AND no error
@@ -123,6 +127,76 @@ def test_api_error_status_500_triggers_err() -> None:
     }
     meta = _load_meta("meta_normal.json")
     assert detect_status(last, meta) == "err"
+
+
+# ---------------------------------------------------------------------------
+# top-level error markers (CC 2.1.224 synthetic error events)
+# ---------------------------------------------------------------------------
+
+
+def test_agent_err_top_level_fixture_is_err() -> None:
+    """Real-world shape (session 9b7971ff): the synthetic API-error
+    assistant event carries error/isApiErrorMessage/apiErrorStatus at the
+    EVENT top level — siblings of `message` — with stop_reason
+    'stop_sequence' and a zero-usage <synthetic> model. Before the fix
+    every check missed and the dead agent rendered as 'run'."""
+    last = _load_last_event("agent_err_top_level.jsonl")
+    meta = _load_meta("meta_normal.json")
+    assert detect_status(last, meta) == "err"
+
+
+def test_top_level_error_string_triggers_err() -> None:
+    last = {
+        "type": "assistant",
+        "error": "rate_limit",
+        "message": {"role": "assistant", "stop_reason": "stop_sequence"},
+    }
+    assert detect_status(last, {}) == "err"
+
+
+def test_top_level_is_api_error_message_triggers_err() -> None:
+    last = {
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "message": {"role": "assistant", "stop_reason": "stop_sequence"},
+    }
+    assert detect_status(last, {}) == "err"
+
+
+def test_top_level_api_error_status_triggers_err() -> None:
+    last = {
+        "type": "assistant",
+        "apiErrorStatus": 429,
+        "message": {"role": "assistant", "stop_reason": "stop_sequence"},
+    }
+    assert detect_status(last, {}) == "err"
+
+
+def test_top_level_markers_below_400_do_not_trigger_err() -> None:
+    """apiErrorStatus is only an error from 400 up — same rule as the
+    message-level shape; a small status must fall through to run (here:
+    stop_sequence is not end_turn either)."""
+    last = {
+        "type": "assistant",
+        "apiErrorStatus": 302,
+        "message": {"role": "assistant", "stop_reason": "stop_sequence"},
+    }
+    assert detect_status(last, {}) == "run"
+
+
+def test_stop_sequence_without_any_marker_stays_run() -> None:
+    """Regression guard for the other half of the misclassification: an
+    assistant reply ending in stop_sequence WITHOUT error markers is NOT
+    err by itself — only the markers (at either level) make it one."""
+    last = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "stop_reason": "stop_sequence",
+            "content": [{"type": "text", "text": "partial output"}],
+        },
+    }
+    assert detect_status(last, {}) == "run"
 
 
 # ---------------------------------------------------------------------------
