@@ -116,7 +116,7 @@ def test_empty_jsonl_returns_zeros(tmp_path: Path) -> None:
     assert result["context_tokens"] == 0
     # fresh compute → cache file should exist and be valid JSON
     assert cache.exists()
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["per_model"] == {}
     assert on_disk["context_tokens"] == 0
 
@@ -268,7 +268,7 @@ def test_cache_miss_recomputes(tmp_path: Path) -> None:
         "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
     }
     # Cache file on disk should now reflect fresh values.
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["per_model"] == result["per_model"]
     assert on_disk["context_tokens"] == 1050
 
@@ -291,7 +291,7 @@ def test_broken_cache_recovered(tmp_path: Path) -> None:
     # Cache file was deleted (during the JSONDecodeError branch) and then
     # rewritten with fresh content — content must now be valid JSON.
     assert cache.exists()
-    parsed = json.loads(cache.read_text())
+    parsed = json.loads(cache.read_text(encoding="utf-8"))
     assert parsed["per_model"] == result["per_model"]
     assert parsed["last_uuid"] == "77777777-7777-7777-7777-777777777777"
 
@@ -308,7 +308,7 @@ def test_broken_cache_non_dict_recovered(tmp_path: Path) -> None:
         "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
     }
     assert cache.exists()
-    parsed = json.loads(cache.read_text())
+    parsed = json.loads(cache.read_text(encoding="utf-8"))
     assert isinstance(parsed, dict)
     assert parsed["per_model"] == result["per_model"]
 
@@ -484,7 +484,7 @@ def test_cache_invalidates_on_mtime_change(tmp_path: Path) -> None:
     # Copy fixture into tmp_path so we control its mtime
     src = MAIN_QUEUE_OPS
     jsonl = tmp_path / "main_for_mtime.jsonl"
-    jsonl.write_text(src.read_text())
+    jsonl.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
     # Pre-write cache with an obviously STALE mtime (1.0 — Jan 1970).
     cache = tmp_path / "main_mtime.json"
@@ -544,7 +544,7 @@ def test_atomic_write_contains_new_fields(tmp_path: Path) -> None:
     cache = tmp_path / "main_full.json"
     compute_main_cum(MAIN_QUEUE_OPS, cache)
 
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert "mtime_jsonl" in on_disk
     assert "task_notifications" in on_disk
     assert on_disk["task_notifications"] == {
@@ -588,7 +588,7 @@ def test_result_has_no_flat_cum_keys(tmp_path: Path) -> None:
             f"`{key}` should not be present in compute_main_cum result, "
             f"got: {sorted(result.keys())}"
         )
-        on_disk = json.loads(cache.read_text())
+        on_disk = json.loads(cache.read_text(encoding="utf-8"))
         assert key not in on_disk, (
             f"`{key}` must not be persisted to the cache either, "
             f"got keys: {sorted(on_disk.keys())}"
@@ -633,7 +633,7 @@ def test_cached_payload_has_no_total_key(tmp_path: Path) -> None:
     # Fresh compute path.
     result = compute_main_cum(MAIN_NORMAL, cache)
     assert "total" not in result
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert "total" not in on_disk, (
         f"`total` must not be persisted to the cache file either, "
         f"got keys: {sorted(on_disk.keys())}"
@@ -697,7 +697,7 @@ def test_context_tokens_is_last_assistant_not_cumulative(tmp_path: Path) -> None
     rec = result["per_model"]["claude-opus-4-1"]
     assert result["context_tokens"] != rec["in"] + rec["cached"]
     # Persisted to the cache file too.
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["context_tokens"] == 1050
 
 
@@ -748,7 +748,7 @@ def test_cache_hit_requires_context_tokens_field(tmp_path: Path) -> None:
     }
     assert result["context_tokens"] == 1050
     # Cache rewritten in the new shape.
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["context_tokens"] == 1050
 
 
@@ -781,7 +781,7 @@ def test_start_persisted_to_cache(tmp_path: Path) -> None:
     cache = tmp_path / "main_start_disk.json"
     compute_main_cum(MAIN_NORMAL, cache)
 
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["start_in"] == 100
     assert on_disk["start_out"] == 30
     assert on_disk["start_cached"] == 200
@@ -879,7 +879,7 @@ def test_cache_hit_requires_start_fields(tmp_path: Path) -> None:
     assert result["start_out"] == 30
     assert result["start_cached"] == 200
     # Cache rewritten in the new shape.
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["start_in"] == 100
 
 
@@ -975,7 +975,7 @@ def test_per_model_persisted_to_cache(tmp_path: Path) -> None:
     cache = tmp_path / "main_pm_disk.json"
     compute_main_cum(MAIN_NORMAL, cache)
 
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["per_model"] == {
         "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
     }
@@ -1014,7 +1014,7 @@ def test_cache_hit_requires_per_model_field(tmp_path: Path) -> None:
         "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
     }
     # Cache rewritten in the new shape.
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["per_model"] == result["per_model"]
 
 
@@ -1073,7 +1073,7 @@ def test_cache_hit_requires_time_fields(tmp_path: Path) -> None:
         "claude-opus-4-1": {"in": 450, "out": 230, "cached": 1400}
     }
     # Cache rewritten in the new shape.
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["time_first_ts"] == expected_first
 
 
@@ -1116,7 +1116,7 @@ def test_time_fields_persisted_to_cache(tmp_path: Path) -> None:
     expected_first = _parse_ts("2026-08-24T10:00:01.000Z")
     assert first["time_first_ts"] == expected_first
 
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert "time_first_ts" in on_disk
     assert "time_turns" in on_disk
     assert "time_open" in on_disk

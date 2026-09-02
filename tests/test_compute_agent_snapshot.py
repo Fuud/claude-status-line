@@ -506,7 +506,7 @@ def test_meta_long_description_truncated() -> None:
     is 40 chars long, ends with U+2026 '…', first 39 chars match original.
     """
     meta_path = FIXTURES_DIR / "meta_long_description.json"
-    original = json.loads(meta_path.read_text())["description"]
+    original = json.loads(meta_path.read_text(encoding="utf-8"))["description"]
     assert len(original) == 60
 
     result = compute_agent_snapshot(AGENT_OK, meta_path, cache_entry=None)

@@ -66,7 +66,7 @@ def test_writes_per_agent_dict_with_correct_keys(tmp_path: Path) -> None:
 
     _write_agents_cache(cache, agents)
 
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert set(on_disk.keys()) == {"agent-a", "agent-b"}, (
         f"cache should be keyed by agentId, got: {sorted(on_disk.keys())}"
     )
@@ -88,7 +88,7 @@ def test_empty_agents_writes_empty_dict(tmp_path: Path) -> None:
     _write_agents_cache(cache, [])
 
     assert cache.exists()
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk == {}
 
 
@@ -110,7 +110,7 @@ def test_models_field_round_trips(tmp_path: Path) -> None:
 
     _write_agents_cache(cache, agents)
 
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["agent-a"]["models"] == models, (
         f"models should persist verbatim, got: {on_disk['agent-a']['models']!r}"
     )
@@ -146,7 +146,7 @@ def test_time_fields_round_trip(tmp_path: Path) -> None:
 
     _write_agents_cache(cache, agents)
 
-    on_disk = json.loads(cache.read_text())
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
     entry_a = on_disk["agent-a"]
     assert entry_a["ts_first"] == 1000.5
     assert entry_a["ts_last"] == 1400.25

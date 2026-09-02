@@ -31,12 +31,12 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def _load_last_event(jsonl_name: str) -> dict:
     """Read the LAST non-empty line of a fixture jsonl and parse to dict."""
     path = FIXTURES_DIR / jsonl_name
-    lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     return json.loads(lines[-1])
 
 
 def _load_meta(meta_name: str) -> dict:
-    return json.loads((FIXTURES_DIR / meta_name).read_text())
+    return json.loads((FIXTURES_DIR / meta_name).read_text(encoding="utf-8"))
 
 
 def test_agent_ok_is_ok() -> None:

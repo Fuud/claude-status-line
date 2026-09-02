@@ -129,12 +129,18 @@ def fake_home_with_real_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     # Symlink the session dir (which contains subagents/) and copy the main
     # jsonl file alongside it. Symlinks are read-only proxies; shutil.copy
     # keeps the jsonl file local so cache writes against data/ stay isolated.
+    # Native Windows Python lacks symlink privilege without admin/Developer
+    # Mode (WinError 1314); a plain copy keeps the same isolation, just not
+    # a live view of the fixture.
     if target.is_symlink() or target.exists():
         if target.is_symlink():
             target.unlink()
         else:
             shutil.rmtree(target)
-    target.symlink_to(real_session_dir.resolve(), target_is_directory=True)
+    try:
+        target.symlink_to(real_session_dir.resolve(), target_is_directory=True)
+    except OSError:
+        shutil.copytree(real_session_dir.resolve(), target)
 
     main_jsonl_src = real_session_root / f"{REAL_SESSION_SID}.jsonl"
     main_jsonl_dst = target.parent / f"{REAL_SESSION_SID}.jsonl"
@@ -554,7 +560,7 @@ def test_real_session_fixture_has_no_subagent_queue_notifications() -> None:
     # agent stem. There should be zero — the existing fixture has only
     # background-bash task-notifications.
     matching_count = 0
-    for raw_line in main_jsonl_path.read_text().splitlines():
+    for raw_line in main_jsonl_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line.startswith("{"):
             continue

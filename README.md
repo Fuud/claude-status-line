@@ -238,7 +238,10 @@ agent's stamps start before main's first timestamp.
 ## Install
 
 This module lives at `~/.claude/status_line/`. Claude Code invokes it
-via the wrapper `status_line.sh`, which `exec`s `python3 status_line.py`.
+via the wrapper `status_line.sh`, which runs the first working Python
+interpreter (`python3`, then `python`, then `py`; the Microsoft Store
+`python3` stub is skipped by probing). Under Cygwin the script path is
+converted with `cygpath -w` so native Windows Python can read it.
 No additional setup is required — the wrapper is referenced from Claude
 Code's status-line hook configuration.
 
@@ -391,7 +394,7 @@ Run all tests:
 
 ```bash
 cd ~/.claude/status_line
-python3 -m pytest tests/ -v
+python -m pytest tests/ -v
 ```
 
 499 tests cover: pure functions (`format_tokens`, `format_duration`,
