@@ -13,6 +13,12 @@ Module-level invariants:
   (tokens_in/out/cached summed over all assistant events with usage,
   plus the `models` per-model breakdown) — not the last event's usage
   (agreed behavior change, plan 20260826-status-line-model-cost-columns).
+- usage sums in BOTH scans are deduplicated by message.id, first-wins:
+  a split assistant message is written as one jsonl record per content
+  block, each carrying the FULL message usage (native transcripts too,
+  not only split-message adapters), so each message.id is counted
+  exactly once; records without an id count as before (plan
+  20260903-usage-dedup-by-message-id).
 - render_output renders the model/cost columns only when a prices dict
   is passed. [deviation] The "prices=None reproduces the pre-model-columns
   layout byte-for-byte" promise ended with the always-visible time columns
@@ -1016,6 +1022,15 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
             AskUserQuestion and interrupt overrides) live on
             _TurnSegmenter._live_turn_is_open.
 
+    Usage accumulation (per_model and the start_* / context_tokens
+    captures gated alongside it) is deduplicated by message.id,
+    first-wins (see _is_duplicate_usage): a split assistant message is
+    one record per content block, EACH carrying the full message usage,
+    so counting every record would inflate the sums ~Nx. Records
+    without an id are counted as before. Only usage is deduped —
+    content processing (tool_use positions, task notifications, the
+    segmenter) sees ALL records.
+
     [deviation vs the pre-model-columns scan] The flat cum_in / cum_out /
     cum_cache_create / cum_cache_read sums were removed together with the
     model columns: their only remaining consumer was tests (render derives
@@ -1260,7 +1275,9 @@ def compute_main_cum(jsonl_path: Path, cache_path: Path) -> dict:
     per_model check above.
 
     per_model is the per-model token breakdown feeding the table's model
-    and cost columns (see _scan_main_jsonl for the accumulation rules).
+    and cost columns (see _scan_main_jsonl for the accumulation rules —
+    usage is deduplicated by message.id first-wins, so a split message
+    counts once; records without an id count as before).
 
     [deviation] The legacy `total` field was removed in Task 2 of the
     breakdown-table plan, and the flat `cum_in`/`cum_out`/
@@ -1428,6 +1445,14 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
               when no pause is open. The orchestrator extends this gap as
               the agent's wait time.
 
+    Usage accumulation (tokens_* and models) is deduplicated by
+    message.id, first-wins (see _is_duplicate_usage): a split assistant
+    message is one record per content block, EACH carrying the full
+    message usage, so counting every record would inflate the sums ~Nx.
+    Records without an id are counted as before. Only usage is deduped
+    — last_assistant/last_event, timestamps and QA bookkeeping see ALL
+    records.
+
     A missing/unreadable file, or an OSError mid-read, yields the
     all-zero empty scan (the degradation _read_last_event used to
     provide — the hook cannot crash the parent session).
@@ -1538,7 +1563,8 @@ def compute_agent_snapshot(
                         compared on cache hits so a classification fix
                         rescans even never-again-mutating agent jsonls.
         tokens_in     — cumulative input_tokens across ALL assistant events
-                        with a usage block (0 when there are none)
+                        with a usage block, deduplicated by message.id
+                        first-wins (0 when there are none)
         tokens_out    — cumulative output_tokens, same accumulation rules
         tokens_cached — cumulative cache_read_input_tokens, same rules.
                         cache_creation_input_tokens is NOT surfaced.
@@ -1567,6 +1593,11 @@ def compute_agent_snapshot(
     event's usage — agent rows show the agent's total spend, and `sum:`
     becomes an honest session total. Agreed visible behavior change (see
     plan 20260826-status-line-model-cost-columns, Overview).
+
+    The per-message.id dedup (first-wins; records without an id count as
+    before — see _is_duplicate_usage) keeps those totals honest for
+    split messages: one record per content block, each carrying the
+    FULL message usage (plan 20260903-usage-dedup-by-message-id).
 
     Breakdown fields (tokens_* / models) are ALWAYS populated, even for
     status="run" (mid-flow) — the user sees totals so far, not blanks.

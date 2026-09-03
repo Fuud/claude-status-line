@@ -9,6 +9,12 @@ jsonl. Results are cached in `cache_path` keyed by (last assistant uuid,
 jsonl mtime) — if neither changed, the cached values are returned without
 re-scanning.
 
+Usage sums are deduplicated by message.id, first-wins: a split assistant
+message is written as one jsonl record per content block, each carrying
+the FULL message usage — each message.id counts ONCE, while records
+without an id count as before (plan 20260903-usage-dedup-by-message-id;
+fixture `main_split_message.jsonl`).
+
 Cache semantics:
 - If `cache_path` exists, load and compare `last_uuid` + `mtime_jsonl` to
   the jsonl's state. If equal → return cached values.

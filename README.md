@@ -63,7 +63,10 @@ Line layout:
   counts as main's work (see [Time columns](#time-columns-work--wait--total)).
 - One group per agent — `[<status>]` icon and description on the FIRST
   row of the group only. Totals are cumulative across ALL of the agent's
-  events (not the last API call's usage); one row per model the agent
+  events (not the last API call's usage), deduplicated by `message.id`
+  first-wins: a split message is one record per content block each
+  carrying the FULL usage, so each message counts once (records without
+  an id count as-is); one row per model the agent
   used. The agent's personal work/wait/total render on that first row;
   continuation per-model rows leave the time cells blank.
 
@@ -313,7 +316,9 @@ holds the fields `last_uuid`, `mtime_jsonl`, `mtime_meta`, `status`,
 `description`, `toolUseId`, plus the four time-stamp fields `ts_first`,
 `ts_last`, `qa_pauses`, `qa_open_ts`. The three `tokens_*` fields are the
 CUMULATIVE breakdown columns rendered in the status line (input / output /
-cache-read, summed over all of the agent's assistant events); `models`
+cache-read, summed over all of the agent's assistant events, deduplicated
+by `message.id` first-wins — split-message records each carry the FULL
+usage and count once per message); `models`
 is the per-model breakdown feeding the `model`/`cost` columns; the four
 time fields persist so cache-HIT cycles can still apply live-now
 extensions and AskUserQuestion wait splits. Cache-hit requires ALL of
@@ -397,14 +402,15 @@ cd ~/.claude/status_line
 python -m pytest tests/ -v
 ```
 
-499 tests cover: pure functions (`format_tokens`, `format_duration`,
+508 tests cover: pure functions (`format_tokens`, `format_duration`,
 `union_work`, `_parse_ts` in `tests/test_format_duration.py` /
 `tests/test_union_work.py`, the agent pause/trim/extension geometry in
 `tests/test_agent_time_segments.py`, `detect_status`, `parse_stdin`),
 price helpers (`provider_host`, `load_prices`, `price_for`,
 `compute_cost`, `format_cost`), I/O helpers (`compute_main_cum`,
 `compute_agent_snapshot`, `find_session_dir(s)`, `_resolve_session_dirs`,
-`sort_agents`, `_write_agents_cache`) including the main/agent time
+`sort_agents`, `_write_agents_cache`) including the usage dedup by
+`message.id` (split-message fixtures for both scans), the main/agent time
 segmentation and cache presence guards (`tests/test_time_segmentation.py`),
 `render_table` and `render_output` (model/cost columns, per-model groups,
 the `start:` row, the always-visible work/wait/total block),

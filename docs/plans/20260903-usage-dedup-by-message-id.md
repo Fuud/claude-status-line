@@ -157,12 +157,12 @@ def _is_duplicate_usage(seen: set, msg: dict) -> bool:
 
 ### Task 6: Update documentation
 
-- [ ] модульный docstring (`status_line.py:13-14`): «summed over all assistant events with usage» → дедупликация по message.id
-- [ ] docstrings `compute_main_cum` и `compute_agent_snapshot`: уточнить семантику накопления (first-wins по message.id)
-- [ ] docstrings `_scan_main_jsonl` (`status_line.py:957-1008`) и `_scan_agent_jsonl` (`status_line.py:1362-1406`): правила накопления `per_model`/totals — дедупликация по message.id
-- [ ] docstrings тест-модулей `tests/test_compute_main_cum.py:1-24` и `tests/test_compute_agent_snapshot.py:9-14`: «CUMULATIVE sums over ALL assistant events» → с дедупликацией по message.id
-- [ ] README: обновить счёт тестов и, если описано, семантику подсчёта токенов
-- [ ] переместить план в `docs/plans/completed/`
+- [x] модульный docstring (`status_line.py:13-14`): «summed over all assistant events with usage» → дедупликация по message.id
+- [x] docstrings `compute_main_cum` и `compute_agent_snapshot`: уточнить семантику накопления (first-wins по message.id)
+- [x] docstrings `_scan_main_jsonl` (`status_line.py:957-1008`) и `_scan_agent_jsonl` (`status_line.py:1362-1406`): правила накопления `per_model`/totals — дедупликация по message.id
+- [x] docstrings тест-модулей `tests/test_compute_main_cum.py:1-24` и `tests/test_compute_agent_snapshot.py:9-14`: «CUMULATIVE sums over ALL assistant events» → с дедупликацией по message.id
+- [x] README: обновить счёт тестов и, если описано, семантику подсчёта токенов
+- [x] переместить план в `docs/plans/completed/` — plan move handled by the exec harness
 
 ## Post-Completion
 

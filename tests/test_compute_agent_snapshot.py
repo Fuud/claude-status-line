@@ -6,10 +6,14 @@ tokens_cached, models, description, toolUseId, last_uuid, mtime_jsonl,
 mtime_meta, plus the time-segmentation fields ts_first, ts_last, qa_pauses,
 qa_open_ts (plan 20260827-status-line-time-columns, Task 4).
 
-Token semantics (20260826-status-line-model-cost-columns, Task 3):
+Token semantics (20260826-status-line-model-cost-columns, Task 3;
+usage dedup 20260903-usage-dedup-by-message-id):
 - tokens_in/tokens_out/tokens_cached are CUMULATIVE sums over ALL assistant
   events with a usage block — not the last event's usage (agreed behavior
-  change; the old last-event semantics were the pre-model-columns schema).
+  change; the old last-event semantics were the pre-model-columns schema)
+  — deduplicated by message.id, first-wins: a split message is one record
+  per content block each carrying the FULL usage, counted once per
+  message.id; records without an id count as before.
 - models is the per-model breakdown {model_id: {"in","out","cached"}}
   accumulated over the same events ({} when no assistant event has usage).
 
