@@ -122,9 +122,9 @@ def _is_duplicate_usage(seen: set, msg: dict) -> bool:
 - Create: `tests/fixtures/agent_split_message.jsonl`
 - Modify: `tests/test_compute_agent_snapshot.py`
 
-- [ ] создать agent-fixture: 2+ assistant-сообщения, разрезанные на split-записи с полным usage
-- [ ] тест: `tokens_in/out/cached` и `models` считают каждое сообщение один раз (meta — переиспользовать `META_NORMAL`, `cache_entry=None`, по конвенции `tests/test_compute_agent_snapshot.py`)
-- [ ] прогнать новый тест — ДОЛЖЕН УПАСТЬ на текущем коде
+- [x] создать agent-fixture: 2+ assistant-сообщения, разрезанные на split-записи с полным usage
+- [x] тест: `tokens_in/out/cached` и `models` считают каждое сообщение один раз (meta — переиспользовать `META_NORMAL`, `cache_entry=None`, по конвенции `tests/test_compute_agent_snapshot.py`)
+- [x] прогнать новый тест — ДОЛЖЕН УПАСТЬ на текущем коде
 
 ### Task 3: Helper `_is_duplicate_usage` + гейт в main scan (TDD green)
 
@@ -144,9 +144,9 @@ def _is_duplicate_usage(seen: set, msg: dict) -> bool:
 
 - Modify: `status_line.py`
 
-- [ ] `_scan_agent_jsonl`: свой `seen_usage_ids` на вызов; тот же гейт вокруг usage-накопления
-- [ ] прогнать тест Task 2 — зелёный
-- [ ] прогнать полный suite — зелёный
+- [x] `_scan_agent_jsonl`: свой `seen_usage_ids` на вызов; тот же гейт вокруг usage-накопления
+- [x] прогнать тест Task 2 — зелёный
+- [x] прогнать полный suite — зелёный
 
 ### Task 5: Verify acceptance criteria
 

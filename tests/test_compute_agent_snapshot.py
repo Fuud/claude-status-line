@@ -70,6 +70,16 @@ AGENT_ERR_TOP_LEVEL = FIXTURES_DIR / "agent_err_top_level.jsonl"
 # out=5+8, cached=100+200) then one glm-5.3 event (in=30, out=12,
 # cached=300). Cumulative totals: in=60, out=25, cached=600.
 AGENT_MODEL_SWITCH = FIXTURES_DIR / "agent_model_switch.jsonl"
+# Real split format (plan 20260903-usage-dedup-by-message-id, Task 2): Claude
+# Code writes one jsonl record per content block of an assistant message,
+# each carrying the FULL message usage; requestId is null (Kimi adapter).
+#   msg-agent-split-a — 3 records (thinking + tool_use toolu_s1 +
+#                       tool_use toolu_s2), identical usage:
+#                       in=100, create=0, read=50, out=20
+#   msg-agent-split-b — 2 records (thinking + text), identical usage:
+#                       in=200, create=0, read=70, out=30
+# All records are model "kimi-k3".
+AGENT_SPLIT_MESSAGE = FIXTURES_DIR / "agent_split_message.jsonl"
 
 META_NORMAL = FIXTURES_DIR / "meta_normal.json"
 META_STOPPED_BY_USER = FIXTURES_DIR / "meta_stopped_by_user.json"
@@ -278,6 +288,33 @@ def test_model_switch_two_records_in_models() -> None:
     # Last event is the glm-5.3 end_turn assistant → ok; its uuid wins.
     assert result["status"] == "ok"
     assert result["last_uuid"] == "a1000000-0000-0000-0000-000000000005"
+
+
+# ---------------------------------------------------------------------------
+# usage dedup by message.id (plan 20260903-usage-dedup-by-message-id, Task 2)
+#
+# agent_split_message.jsonl mirrors the real split format: one jsonl record
+# per content block, each carrying the FULL message usage (requestId null).
+# Deduped first-wins by message.id:
+#   in = 100+200 = 300, out = 20+30 = 50, cached = 50+70 = 120
+# ---------------------------------------------------------------------------
+
+def test_agent_split_message_usage_counted_once_per_message() -> None:
+    """Each split message's usage must be summed ONCE (first-wins by
+    message.id), not once per content-block record — the agent scan must
+    not triple-count msg-agent-split-a (3 records) or double-count
+    msg-agent-split-b (2 records). models carries one kimi-k3 record with
+    the same deduped sums."""
+    result = compute_agent_snapshot(
+        AGENT_SPLIT_MESSAGE, META_NORMAL, cache_entry=None
+    )
+
+    assert result["tokens_in"] == 300
+    assert result["tokens_out"] == 50
+    assert result["tokens_cached"] == 120
+    assert result["models"] == {
+        "kimi-k3": {"in": 300, "out": 50, "cached": 120}
+    }
 
 
 def test_synthetic_zero_usage_event_keeps_model_record(tmp_path: Path) -> None:

@@ -1434,6 +1434,10 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
     """
     tokens_in = tokens_out = tokens_cached = 0
     models: dict[str, dict[str, int]] = {}
+    # message.id of every usage-bearing assistant message already counted —
+    # the split-record dedup key (see _is_duplicate_usage); fresh per call,
+    # i.e. per agent jsonl.
+    seen_usage_ids: set = set()
     last_assistant: dict | None = None
     last_event: dict | None = None
     # ---- time-segmentation state (plan 20260827-status-line-time-columns)
@@ -1475,17 +1479,23 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
             last_assistant = event
             msg = event.get("message") or {}
             usage = msg.get("usage") if isinstance(msg, dict) else None
-            if not isinstance(usage, dict):
-                continue
-            in_v = _to_int(usage.get("input_tokens", 0))
-            out_v = _to_int(usage.get("output_tokens", 0))
-            cached_v = _to_int(usage.get("cache_read_input_tokens", 0))
-            tokens_in += in_v
-            tokens_out += out_v
-            tokens_cached += cached_v
-            # Per-model breakdown — the same accumulation as the main
-            # scan's per_model (see _accumulate_model).
-            _accumulate_model(models, msg, in_v, out_v, cached_v)
+            # Dedup gate — one jsonl record per content block each carries
+            # the FULL message usage; count each message.id ONCE (first-wins;
+            # records without an id pass through). Gated: totals and the
+            # per-model accumulation. Everything above (last_assistant,
+            # timestamps, QA bookkeeping) sees ALL records.
+            if isinstance(usage, dict) and not _is_duplicate_usage(
+                seen_usage_ids, msg
+            ):
+                in_v = _to_int(usage.get("input_tokens", 0))
+                out_v = _to_int(usage.get("output_tokens", 0))
+                cached_v = _to_int(usage.get("cache_read_input_tokens", 0))
+                tokens_in += in_v
+                tokens_out += out_v
+                tokens_cached += cached_v
+                # Per-model breakdown — the same accumulation as the main
+                # scan's per_model (see _accumulate_model).
+                _accumulate_model(models, msg, in_v, out_v, cached_v)
     except OSError:
         # Degradation: the zeroed scan (fresh shallow copy — the
         # constant's empty list/dict values must never be handed out
