@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from status_line import _parse_ts, compute_main_cum
+from status_line import _is_duplicate_usage, _parse_ts, compute_main_cum
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -36,6 +36,7 @@ MAIN_TOOL_USE = FIXTURES_DIR / "main_with_tool_use.jsonl"
 MAIN_QUEUE_OPS = FIXTURES_DIR / "main_with_queue_ops.jsonl"
 MAIN_DUP_TASK = FIXTURES_DIR / "main_with_duplicate_task_id.jsonl"
 MAIN_MISSING_TAGS = FIXTURES_DIR / "main_with_missing_tags.jsonl"
+MAIN_SPLIT_MESSAGE = FIXTURES_DIR / "main_split_message.jsonl"
 
 # Last assistant uuid in MAIN_NORMAL — used as the cache-hit key in
 # tests that pre-seed the cache file with a known payload.
@@ -1187,3 +1188,123 @@ def test_assistant_event_without_model_field_uses_empty_key(tmp_path: Path) -> N
     result = compute_main_cum(jsonl, cache)
 
     assert result["per_model"] == {"": {"in": 100, "out": 10, "cached": 5}}
+
+
+# ---------------------------------------------------------------------------
+# usage dedup by message.id (plan 20260903-usage-dedup-by-message-id, Task 1)
+#
+# main_split_message.jsonl models Claude Code writing one jsonl record per
+# content block of an assistant message, each record carrying the FULL
+# message usage:
+#   msg-split-a — 3 records (thinking + tool_use tool_a1 + tool_use tool_a2),
+#                 identical usage: in=1000, create=100, read=200, out=50
+#   msg-split-b — 2 records (thinking + text),
+#                 identical usage: in=2000, create=0, read=300, out=80
+#   one assistant record WITHOUT message.id: in=500, create=0, read=100, out=10
+# All records are model "kimi-k3".
+#
+# Deduped (first-wins by message.id; no-id record can't be deduped → counted):
+#   in = 1000+2000+500 = 3500, out = 50+80+10 = 140, cached = 200+300+100 = 600
+# ---------------------------------------------------------------------------
+
+def test_split_message_usage_counted_once_per_message(tmp_path: Path) -> None:
+    """Each split message's usage must be summed ONCE (first-wins by
+    message.id), not once per content-block record. The no-id record is
+    counted as before — there is no key to dedup it by."""
+    cache = tmp_path / "main_split.json"
+    result = compute_main_cum(MAIN_SPLIT_MESSAGE, cache)
+
+    rec = result["per_model"]["kimi-k3"]
+    assert rec["in"] == 3500
+    assert rec["out"] == 140
+    assert rec["cached"] == 600
+
+
+def test_split_message_per_model_no_duplicate_accumulation(tmp_path: Path) -> None:
+    """per_model holds exactly one entry (the shared model) with the deduped
+    sums — no per-record re-accumulation of msg-split-a (3x) or
+    msg-split-b (2x). Persisted to the cache too."""
+    cache = tmp_path / "main_split_pm.json"
+    result = compute_main_cum(MAIN_SPLIT_MESSAGE, cache)
+
+    assert result["per_model"] == {
+        "kimi-k3": {"in": 3500, "out": 140, "cached": 600}
+    }
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
+    assert on_disk["per_model"] == result["per_model"]
+
+
+def test_split_message_tool_use_positions_from_all_records(tmp_path: Path) -> None:
+    """tool_use ids are collected from ALL split records of msg-split-a —
+    content processing must stay OUTSIDE the usage-dedup gate, or the
+    per-block tool_use ids (tool_a1 from record 2, tool_a2 from record 3)
+    would be lost."""
+    cache = tmp_path / "main_split_pos.json"
+    result = compute_main_cum(MAIN_SPLIT_MESSAGE, cache)
+
+    positions = result["tool_use_positions"]
+    assert set(positions.keys()) == {"tool_a1", "tool_a2"}
+    # 0-based line indices: tool_a1 on line 3, tool_a2 on line 4.
+    assert positions["tool_a1"] == 3
+    assert positions["tool_a2"] == 4
+    assert positions["tool_a1"] < positions["tool_a2"]
+
+
+def test_split_message_start_and_context_use_first_and_last_occurrence(
+    tmp_path: Path,
+) -> None:
+    """start_* mirror the FIRST usage-bearing occurrence (msg-split-a's
+    first record); context_tokens mirror the LAST usage record (the no-id
+    one: 500+0+100). The dedup gate must not disturb either capture."""
+    cache = tmp_path / "main_split_start.json"
+    result = compute_main_cum(MAIN_SPLIT_MESSAGE, cache)
+
+    assert result["start_in"] == 1000
+    assert result["start_out"] == 50
+    assert result["start_cached"] == 200
+    assert result["start_model"] == "kimi-k3"
+    assert result["context_tokens"] == 600
+
+
+# ---------------------------------------------------------------------------
+# _is_duplicate_usage helper (plan 20260903-usage-dedup-by-message-id, Task 3)
+# ---------------------------------------------------------------------------
+
+def test_is_duplicate_usage_missing_id_returns_false() -> None:
+    """A message with NO `id` key can't be deduped — False on every call,
+    and `seen` stays empty (no key to remember)."""
+    seen: set = set()
+    assert _is_duplicate_usage(seen, {"usage": {}}) is False
+    assert seen == set()
+    # A second id-less record behaves identically — never gated.
+    assert _is_duplicate_usage(seen, {"usage": {}}) is False
+    assert seen == set()
+
+
+def test_is_duplicate_usage_empty_or_nonstring_id_returns_false() -> None:
+    """Empty-string and non-string ids (None, int) → False and NOT added to
+    `seen` — only non-empty STRINGS are valid dedup keys."""
+    seen: set = set()
+    assert _is_duplicate_usage(seen, {"id": ""}) is False
+    assert _is_duplicate_usage(seen, {"id": None}) is False
+    assert _is_duplicate_usage(seen, {"id": 123}) is False
+    assert seen == set()
+
+
+def test_is_duplicate_usage_new_id_returns_false_and_adds() -> None:
+    """First occurrence of an id → False (count the usage) and the id lands
+    in `seen`, so the verdict is observable on the next call."""
+    seen: set = set()
+    assert _is_duplicate_usage(seen, {"id": "msg-split-a"}) is False
+    assert seen == {"msg-split-a"}
+    assert _is_duplicate_usage(seen, {"id": "msg-split-b"}) is False
+    assert seen == {"msg-split-a", "msg-split-b"}
+
+
+def test_is_duplicate_usage_repeat_id_returns_true() -> None:
+    """Second occurrence of the same id → True (skip the usage); the
+    duplicate call leaves `seen` unchanged."""
+    seen: set = set()
+    assert _is_duplicate_usage(seen, {"id": "msg-split-a"}) is False
+    assert _is_duplicate_usage(seen, {"id": "msg-split-a"}) is True
+    assert seen == {"msg-split-a"}

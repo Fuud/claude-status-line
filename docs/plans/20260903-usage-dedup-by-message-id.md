@@ -108,12 +108,12 @@ def _is_duplicate_usage(seen: set, msg: dict) -> bool:
 - Create: `tests/fixtures/main_split_message.jsonl`
 - Modify: `tests/test_compute_main_cum.py`
 
-- [ ] создать fixture: сообщение A разрезано на 3 записи (один `message.id`, идентичный usage, блоки `thinking`/`tool_use`/`tool_use` с разными tool_use id), сообщение B — 2 записи (другой id), плюс одна usage-запись без id; timestamps/uuid — по образцу `main_with_tool_use.jsonl`
-- [ ] тест: суммы in/out/cached считают каждое сообщение один раз (A один раз, B один раз, no-id запись посчитана)
-- [ ] тест: `per_model` не содержит дублированных накоплений
-- [ ] тест: tool_use positions содержат tool_use id со ВСЕХ split-записей (доказывает, что content-обработка не под гейтом)
-- [ ] тест: `start_*` — usage первого occurrence, `context_tokens` — последнего (гейт их не ломает)
-- [ ] прогнать новые тесты — ДОЛЖНЫ УПАСТЬ на текущем коде (подтверждение бага); полный прогон не требуется до Task 3
+- [x] создать fixture: сообщение A разрезано на 3 записи (один `message.id`, идентичный usage, блоки `thinking`/`tool_use`/`tool_use` с разными tool_use id), сообщение B — 2 записи (другой id), плюс одна usage-запись без id; timestamps/uuid — по образцу `main_with_tool_use.jsonl`
+- [x] тест: суммы in/out/cached считают каждое сообщение один раз (A один раз, B один раз, no-id запись посчитана)
+- [x] тест: `per_model` не содержит дублированных накоплений
+- [x] тест: tool_use positions содержат tool_use id со ВСЕХ split-записей (доказывает, что content-обработка не под гейтом)
+- [x] тест: `start_*` — usage первого occurrence, `context_tokens` — последнего (гейт их не ломает)
+- [x] прогнать новые тесты — ДОЛЖНЫ УПАСТЬ на текущем коде (подтверждение бага); полный прогон не требуется до Task 3
 
 ### Task 2: Падающий тест дедупликации для agent scan (TDD red)
 
@@ -132,11 +132,11 @@ def _is_duplicate_usage(seen: set, msg: dict) -> bool:
 
 - Modify: `status_line.py`
 
-- [ ] добавить `_is_duplicate_usage` рядом с `_accumulate_model` (docstring по образцу соседних helpers)
-- [ ] unit-тесты helper'а: отсутствующий id → False; пустой/не-строковый id → False; новый id → False + добавлен в seen; повторный id → True
-- [ ] main scan: `seen_usage_ids: set` в состоянии скана; обернуть usage-блок гейтом (внутри: `seen_first_usage`, `_accumulate_model`, `context_tokens`)
-- [ ] прогнать тесты Task 1 + helper'а — зелёные
-- [ ] прогнать ПОЛНЫЙ suite `python -m pytest tests/ -v` — зелёный, кроме пока красного теста Task 2 (принятое отклонение от правила all-green: TDD red для agent scan фиксится в Task 4 — не «чинить» переупорядочиванием)
+- [x] добавить `_is_duplicate_usage` рядом с `_accumulate_model` (docstring по образцу соседних helpers)
+- [x] unit-тесты helper'а: отсутствующий id → False; пустой/не-строковый id → False; новый id → False + добавлен в seen; повторный id → True
+- [x] main scan: `seen_usage_ids: set` в состоянии скана; обернуть usage-блок гейтом (внутри: `seen_first_usage`, `_accumulate_model`, `context_tokens`)
+- [x] прогнать тесты Task 1 + helper'а — зелёные
+- [x] прогнать ПОЛНЫЙ suite `python -m pytest tests/ -v` — зелёный, кроме пока красного теста Task 2 (принятое отклонение от правила all-green: TDD red для agent scan фиксится в Task 4 — не «чинить» переупорядочиванием)
 
 ### Task 4: Гейт в agent scan (TDD green)
 

@@ -729,6 +729,24 @@ def _accumulate_model(
     model_rec["cached"] += cached_v
 
 
+def _is_duplicate_usage(seen: set, msg: dict) -> bool:
+    """True when this assistant message's usage was already counted.
+
+    Claude Code writes one jsonl record per content block of an
+    assistant message, each carrying the FULL message usage (native
+    transcripts too, not only split-message adapters). message.id is
+    stable across those records, so first-wins by id is exact.
+    Records without an id can't be deduped — counted as before.
+    """
+    mid = msg.get("id")
+    if not isinstance(mid, str) or not mid:
+        return False
+    if mid in seen:
+        return True
+    seen.add(mid)
+    return False
+
+
 def _iter_events(jsonl_path: Path) -> Iterator[tuple[int, dict]]:
     """Yield (index, event) for every parsable dict event in a jsonl file.
 
@@ -1014,6 +1032,9 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
     per_model: dict[str, dict[str, int]] = {}
     last_uuid = ""
     seen_first_usage = False
+    # message.id of every usage-bearing assistant message already counted —
+    # the split-record dedup key (see _is_duplicate_usage).
+    seen_usage_ids: set = set()
 
     # ---- time segmentation (plan 20260827-status-line-time-columns):
     # ---- the scan loop only DISPATCHES stamped events into the
@@ -1041,7 +1062,14 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
             # usage
             msg = event.get("message") or {}
             usage = msg.get("usage") if isinstance(msg, dict) else None
-            if isinstance(usage, dict):
+            # Dedup gate — one jsonl record per content block each carries
+            # the FULL message usage; count each message.id ONCE (first-wins;
+            # records without an id pass through). Gated: first-message
+            # capture, per-model accumulation, context occupancy. Everything
+            # below (tool_use positions, content) sees ALL records.
+            if isinstance(usage, dict) and not _is_duplicate_usage(
+                seen_usage_ids, msg
+            ):
                 in_v = _to_int(usage.get("input_tokens", 0))
                 out_v = _to_int(usage.get("output_tokens", 0))
                 cache_read_v = _to_int(usage.get("cache_read_input_tokens", 0))
