@@ -78,15 +78,24 @@ def _run_main(
 
 _DUR_CELL = r"\d+:[0-5]\d"
 _DUR_CELL_RE = re.compile(_DUR_CELL)
+# Header branch cell — bounded by the next header field so any branch
+# name (including the empty best-effort miss) collapses to one token.
+_BRANCH_CELL_RE = re.compile(r"Branch: .*? \| Model:")
 
 
 def _mask_durations(text: str) -> str:
-    """Replace every HH:MM duration cell with "<DUR>".
+    """Replace every HH:MM duration cell with "<DUR>" and the header
+    branch cell with "<BRANCH>".
 
     Consecutive hook invocations over unchanged files differ ONLY in the
-    elapsed-time digits (live-now durations grow), so masking them makes
-    byte-level output comparisons meaningful again."""
-    return _DUR_CELL_RE.sub("<DUR>", text)
+    elapsed-time digits (live-now durations grow) and, legitimately, in
+    the branch cell: _get_branch is best-effort (empty string whenever
+    the `git branch --show-current` subprocess fails or times out under
+    load), so one invocation can report the branch a sibling missed.
+    Masking both makes byte-level output comparisons meaningful again."""
+    return _BRANCH_CELL_RE.sub(
+        "Branch: <BRANCH> | Model:", _DUR_CELL_RE.sub("<DUR>", text)
+    )
 
 
 def _hm_seconds(cell: str) -> int:
