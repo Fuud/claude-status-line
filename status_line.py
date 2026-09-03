@@ -735,8 +735,11 @@ def _accumulate_model(
     model_rec["cached"] += cached_v
 
 
-def _is_duplicate_usage(seen: set, msg: dict) -> bool:
+def _is_duplicate_usage(seen: set[str], msg: dict) -> bool:
     """True when this assistant message's usage was already counted.
+
+    Mutating predicate: the FIRST sighting of an id is recorded into
+    `seen` (that call returns False).
 
     Claude Code writes one jsonl record per content block of an
     assistant message, each carrying the FULL message usage (native
@@ -1047,9 +1050,8 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
     per_model: dict[str, dict[str, int]] = {}
     last_uuid = ""
     seen_first_usage = False
-    # message.id of every usage-bearing assistant message already counted —
-    # the split-record dedup key (see _is_duplicate_usage).
-    seen_usage_ids: set = set()
+    # usage-dedup key set — see _is_duplicate_usage
+    seen_usage_ids: set[str] = set()
 
     # ---- time segmentation (plan 20260827-status-line-time-columns):
     # ---- the scan loop only DISPATCHES stamped events into the
@@ -1077,11 +1079,8 @@ def _scan_main_jsonl(jsonl_path: Path) -> dict:
             # usage
             msg = event.get("message") or {}
             usage = msg.get("usage") if isinstance(msg, dict) else None
-            # Dedup gate — one jsonl record per content block each carries
-            # the FULL message usage; count each message.id ONCE (first-wins;
-            # records without an id pass through). Gated: first-message
-            # capture, per-model accumulation, context occupancy. Everything
-            # below (tool_use positions, content) sees ALL records.
+            # usage dedup gate — see _is_duplicate_usage (the content
+            # processing below stays ungated and sees ALL records)
             if isinstance(usage, dict) and not _is_duplicate_usage(
                 seen_usage_ids, msg
             ):
@@ -1459,10 +1458,9 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
     """
     tokens_in = tokens_out = tokens_cached = 0
     models: dict[str, dict[str, int]] = {}
-    # message.id of every usage-bearing assistant message already counted —
-    # the split-record dedup key (see _is_duplicate_usage); fresh per call,
-    # i.e. per agent jsonl.
-    seen_usage_ids: set = set()
+    # usage-dedup key set, fresh per call (per agent jsonl) — see
+    # _is_duplicate_usage
+    seen_usage_ids: set[str] = set()
     last_assistant: dict | None = None
     last_event: dict | None = None
     # ---- time-segmentation state (plan 20260827-status-line-time-columns)
@@ -1504,11 +1502,8 @@ def _scan_agent_jsonl(jsonl_path: Path) -> dict:
             last_assistant = event
             msg = event.get("message") or {}
             usage = msg.get("usage") if isinstance(msg, dict) else None
-            # Dedup gate — one jsonl record per content block each carries
-            # the FULL message usage; count each message.id ONCE (first-wins;
-            # records without an id pass through). Gated: totals and the
-            # per-model accumulation. Everything above (last_assistant,
-            # timestamps, QA bookkeeping) sees ALL records.
+            # usage dedup gate — see _is_duplicate_usage (last_assistant,
+            # timestamps and QA bookkeeping above stay ungated)
             if isinstance(usage, dict) and not _is_duplicate_usage(
                 seen_usage_ids, msg
             ):
@@ -1563,8 +1558,7 @@ def compute_agent_snapshot(
                         compared on cache hits so a classification fix
                         rescans even never-again-mutating agent jsonls.
         tokens_in     — cumulative input_tokens across ALL assistant events
-                        with a usage block, deduplicated by message.id
-                        first-wins (0 when there are none)
+                        with a usage block (0 when there are none)
         tokens_out    — cumulative output_tokens, same accumulation rules
         tokens_cached — cumulative cache_read_input_tokens, same rules.
                         cache_creation_input_tokens is NOT surfaced.
@@ -1594,10 +1588,9 @@ def compute_agent_snapshot(
     becomes an honest session total. Agreed visible behavior change (see
     plan 20260826-status-line-model-cost-columns, Overview).
 
-    The per-message.id dedup (first-wins; records without an id count as
-    before — see _is_duplicate_usage) keeps those totals honest for
-    split messages: one record per content block, each carrying the
-    FULL message usage (plan 20260903-usage-dedup-by-message-id).
+    Usage accumulation (tokens_* / models) is deduplicated by message.id,
+    first-wins; records without an id count as before (see
+    _is_duplicate_usage, plan 20260903-usage-dedup-by-message-id).
 
     Breakdown fields (tokens_* / models) are ALWAYS populated, even for
     status="run" (mid-flow) — the user sees totals so far, not blanks.

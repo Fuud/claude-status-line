@@ -82,8 +82,14 @@ AGENT_MODEL_SWITCH = FIXTURES_DIR / "agent_model_switch.jsonl"
 #                       in=100, create=0, read=50, out=20
 #   msg-agent-split-b — 2 records (thinking + text), identical usage:
 #                       in=200, create=0, read=70, out=30
-# All records are model "kimi-k3".
+# All records are model "kimi-k3". Deduped (first-wins):
+#   in=300, out=50, cached=120. Last record (msg-agent-split-b's text
+#   record, uuid ...0007) sets last_uuid/last_event → status "ok".
 AGENT_SPLIT_MESSAGE = FIXTURES_DIR / "agent_split_message.jsonl"
+# Variant of AGENT_SPLIT_MESSAGE plus one trailing no-id assistant usage
+# record (in=40, read=10, out=5, uuid ...0008) — it can't be deduped and
+# must be COUNTED: in=340, out=55, cached=130.
+AGENT_SPLIT_NO_ID = FIXTURES_DIR / "agent_split_message_no_id.jsonl"
 
 META_NORMAL = FIXTURES_DIR / "meta_normal.json"
 META_STOPPED_BY_USER = FIXTURES_DIR / "meta_stopped_by_user.json"
@@ -294,33 +300,6 @@ def test_model_switch_two_records_in_models() -> None:
     assert result["last_uuid"] == "a1000000-0000-0000-0000-000000000005"
 
 
-# ---------------------------------------------------------------------------
-# usage dedup by message.id (plan 20260903-usage-dedup-by-message-id, Task 2)
-#
-# agent_split_message.jsonl mirrors the real split format: one jsonl record
-# per content block, each carrying the FULL message usage (requestId null).
-# Deduped first-wins by message.id:
-#   in = 100+200 = 300, out = 20+30 = 50, cached = 50+70 = 120
-# ---------------------------------------------------------------------------
-
-def test_agent_split_message_usage_counted_once_per_message() -> None:
-    """Each split message's usage must be summed ONCE (first-wins by
-    message.id), not once per content-block record — the agent scan must
-    not triple-count msg-agent-split-a (3 records) or double-count
-    msg-agent-split-b (2 records). models carries one kimi-k3 record with
-    the same deduped sums."""
-    result = compute_agent_snapshot(
-        AGENT_SPLIT_MESSAGE, META_NORMAL, cache_entry=None
-    )
-
-    assert result["tokens_in"] == 300
-    assert result["tokens_out"] == 50
-    assert result["tokens_cached"] == 120
-    assert result["models"] == {
-        "kimi-k3": {"in": 300, "out": 50, "cached": 120}
-    }
-
-
 def test_synthetic_zero_usage_event_keeps_model_record(tmp_path: Path) -> None:
     """A <synthetic>-style assistant event (zero usage) still creates its
     model record with zeros — zero rows are skipped at RENDER time, not by
@@ -451,6 +430,50 @@ def test_assistant_event_without_model_field_uses_empty_key(tmp_path: Path) -> N
     assert result["tokens_out"] == 10
     assert result["tokens_cached"] == 5
     assert result["models"] == {"": {"in": 100, "out": 10, "cached": 5}}
+
+
+# ---------------------------------------------------------------------------
+# usage dedup by message.id (plan 20260903-usage-dedup-by-message-id, Task 2)
+# — fixture layout and deduped totals: see AGENT_SPLIT_MESSAGE above
+# ---------------------------------------------------------------------------
+
+def test_agent_split_message_usage_counted_once_per_message() -> None:
+    """Each split message's usage must be summed ONCE (first-wins by
+    message.id), not once per content-block record; models carries one
+    kimi-k3 record with the same deduped sums. last_uuid/status pin the
+    outside-the-gate contract: last_assistant/last_event bookkeeping sees
+    ALL split records — last_uuid must be the FINAL record's uuid (a
+    duplicate the usage gate skipped), or the agents-cache key would
+    change and finished agents would be misclassified."""
+    result = compute_agent_snapshot(
+        AGENT_SPLIT_MESSAGE, META_NORMAL, cache_entry=None
+    )
+
+    assert result["tokens_in"] == 300
+    assert result["tokens_out"] == 50
+    assert result["tokens_cached"] == 120
+    assert result["models"] == {
+        "kimi-k3": {"in": 300, "out": 50, "cached": 120}
+    }
+    # msg-agent-split-b's final record (a gated-out duplicate) still wins
+    # last_uuid, and status derives from it via last_event.
+    assert result["last_uuid"] == "c0000000-0000-0000-0000-000000000007"
+    assert result["status"] == "ok"
+
+
+def test_agent_no_id_usage_record_counted() -> None:
+    """A usage record WITHOUT message.id can't be deduped — counted as
+    before, alongside the deduped split messages (the agent-scan side of
+    the no-id branch; the main scan's side is covered by the no-id record
+    in MAIN_SPLIT_MESSAGE)."""
+    result = compute_agent_snapshot(AGENT_SPLIT_NO_ID, META_NORMAL, cache_entry=None)
+
+    assert result["tokens_in"] == 340
+    assert result["tokens_out"] == 55
+    assert result["tokens_cached"] == 130
+    assert result["models"] == {
+        "kimi-k3": {"in": 340, "out": 55, "cached": 130}
+    }
 
 
 # ---------------------------------------------------------------------------

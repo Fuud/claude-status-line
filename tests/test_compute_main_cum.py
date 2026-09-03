@@ -42,7 +42,22 @@ MAIN_TOOL_USE = FIXTURES_DIR / "main_with_tool_use.jsonl"
 MAIN_QUEUE_OPS = FIXTURES_DIR / "main_with_queue_ops.jsonl"
 MAIN_DUP_TASK = FIXTURES_DIR / "main_with_duplicate_task_id.jsonl"
 MAIN_MISSING_TAGS = FIXTURES_DIR / "main_with_missing_tags.jsonl"
+# Real split format (plan 20260903-usage-dedup-by-message-id, Task 1):
+# Claude Code writes one jsonl record per content block of an assistant
+# message, each record carrying the FULL message usage:
+#   msg-split-a — 3 records (thinking + tool_use tool_a1 + tool_use tool_a2),
+#                 identical usage: in=1000, create=100, read=200, out=50
+#   msg-split-b — 2 records (thinking + text),
+#                 identical usage: in=2000, create=0, read=300, out=80
+#   one assistant record WITHOUT message.id: in=500, create=0, read=100, out=10
+# All records are model "kimi-k3". Deduped (first-wins; the no-id record
+# can't be deduped → counted): in=3500, out=140, cached=600.
 MAIN_SPLIT_MESSAGE = FIXTURES_DIR / "main_split_message.jsonl"
+# Variant of MAIN_SPLIT_MESSAGE with no no-id record, where msg-split-b's
+# FINAL record carries a DIFFERENT usage (in=2500, out=999) — pins that the
+# FIRST record's payload wins: deduped in=1000+2000=3000, out=50+80=130,
+# cached=200+300=500; context_tokens=2000+0+300=2300 from b's first record.
+MAIN_SPLIT_FIRST_WINS = FIXTURES_DIR / "main_split_message_first_wins.jsonl"
 
 # Last assistant uuid in MAIN_NORMAL — used as the cache-hit key in
 # tests that pre-seed the cache file with a known payload.
@@ -1198,38 +1213,15 @@ def test_assistant_event_without_model_field_uses_empty_key(tmp_path: Path) -> N
 
 # ---------------------------------------------------------------------------
 # usage dedup by message.id (plan 20260903-usage-dedup-by-message-id, Task 1)
-#
-# main_split_message.jsonl models Claude Code writing one jsonl record per
-# content block of an assistant message, each record carrying the FULL
-# message usage:
-#   msg-split-a — 3 records (thinking + tool_use tool_a1 + tool_use tool_a2),
-#                 identical usage: in=1000, create=100, read=200, out=50
-#   msg-split-b — 2 records (thinking + text),
-#                 identical usage: in=2000, create=0, read=300, out=80
-#   one assistant record WITHOUT message.id: in=500, create=0, read=100, out=10
-# All records are model "kimi-k3".
-#
-# Deduped (first-wins by message.id; no-id record can't be deduped → counted):
-#   in = 1000+2000+500 = 3500, out = 50+80+10 = 140, cached = 200+300+100 = 600
+# — fixture layout and deduped totals: see MAIN_SPLIT_MESSAGE above
 # ---------------------------------------------------------------------------
 
-def test_split_message_usage_counted_once_per_message(tmp_path: Path) -> None:
-    """Each split message's usage must be summed ONCE (first-wins by
-    message.id), not once per content-block record. The no-id record is
-    counted as before — there is no key to dedup it by."""
-    cache = tmp_path / "main_split.json"
-    result = compute_main_cum(MAIN_SPLIT_MESSAGE, cache)
-
-    rec = result["per_model"]["kimi-k3"]
-    assert rec["in"] == 3500
-    assert rec["out"] == 140
-    assert rec["cached"] == 600
-
-
 def test_split_message_per_model_no_duplicate_accumulation(tmp_path: Path) -> None:
-    """per_model holds exactly one entry (the shared model) with the deduped
-    sums — no per-record re-accumulation of msg-split-a (3x) or
-    msg-split-b (2x). Persisted to the cache too."""
+    """Each split message's usage must be summed ONCE (first-wins by
+    message.id), not once per content-block record; the no-id record is
+    counted as before — there is no key to dedup it by. per_model therefore
+    holds exactly one entry (the shared model) with the deduped sums.
+    Persisted to the cache too."""
     cache = tmp_path / "main_split_pm.json"
     result = compute_main_cum(MAIN_SPLIT_MESSAGE, cache)
 
@@ -1238,6 +1230,69 @@ def test_split_message_per_model_no_duplicate_accumulation(tmp_path: Path) -> No
     }
     on_disk = json.loads(cache.read_text(encoding="utf-8"))
     assert on_disk["per_model"] == result["per_model"]
+
+
+def test_split_message_first_record_usage_wins(tmp_path: Path) -> None:
+    """First-wins is a semantic choice, not an accident of byte-identical
+    payloads: when a split message's FINAL record carries a different usage,
+    the FIRST record's payload is what counts — for the sums AND for
+    context_tokens, which the scan takes from the last record the gate let
+    through (a gated-out final record must not leave a stale or raw-last
+    value)."""
+    cache = tmp_path / "main_split_fw.json"
+    result = compute_main_cum(MAIN_SPLIT_FIRST_WINS, cache)
+
+    assert result["per_model"] == {
+        "kimi-k3": {"in": 3000, "out": 130, "cached": 500}
+    }
+    assert result["context_tokens"] == 2300
+    assert result["start_in"] == 1000
+
+
+def test_usage_gate_ignores_id_of_records_without_usage(tmp_path: Path) -> None:
+    """The gate's `isinstance(usage, dict)` operand short-circuits BEFORE the
+    dedup check: an id-bearing record WITHOUT a usage block must not consume
+    its message.id, or the later usage-bearing record of the SAME message
+    would be skipped as a duplicate (reordering the `and` operands does
+    exactly that — and the message's usage would be lost entirely)."""
+
+    def _record(uuid: str, with_usage: bool) -> str:
+        msg: dict = {
+            "id": "msg-x",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "not yet"}],
+            "model": "kimi-k3",
+            "stop_reason": None,
+        }
+        if with_usage:
+            msg["usage"] = {
+                "input_tokens": 700,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 70,
+                "output_tokens": 7,
+            }
+        return json.dumps({"type": "assistant", "message": msg, "uuid": uuid})
+
+    jsonl = tmp_path / "no_usage_first.jsonl"
+    jsonl.write_text(
+        # record 1: the id, but NO usage block — must not poison the key;
+        # records 2-3: usage-bearing siblings of the SAME message.id, the
+        # second one a duplicate of the first → counted once
+        _record("u1", with_usage=False) + "\n"
+        + _record("u2", with_usage=True) + "\n"
+        + _record("u3", with_usage=True) + "\n"
+    )
+    cache = tmp_path / "main_no_usage_first.json"
+
+    result = compute_main_cum(jsonl, cache)
+
+    # msg-x counted exactly once — from its FIRST usage-bearing record.
+    assert result["per_model"] == {
+        "kimi-k3": {"in": 700, "out": 7, "cached": 70}
+    }
+    assert result["start_in"] == 700
+    assert result["context_tokens"] == 770
 
 
 def test_split_message_tool_use_positions_from_all_records(tmp_path: Path) -> None:
@@ -1260,8 +1315,10 @@ def test_split_message_start_and_context_use_first_and_last_occurrence(
     tmp_path: Path,
 ) -> None:
     """start_* mirror the FIRST usage-bearing occurrence (msg-split-a's
-    first record); context_tokens mirror the LAST usage record (the no-id
-    one: 500+0+100). The dedup gate must not disturb either capture."""
+    first record); context_tokens mirror the LAST counted usage record
+    (the no-id one — context from a gated split record is pinned by
+    MAIN_SPLIT_FIRST_WINS above). The dedup gate must not disturb either
+    capture."""
     cache = tmp_path / "main_split_start.json"
     result = compute_main_cum(MAIN_SPLIT_MESSAGE, cache)
 

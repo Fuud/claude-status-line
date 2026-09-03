@@ -56,11 +56,14 @@ Line layout:
   `sum:` aggregate; its three time cells are always empty; in prices
   mode it carries that event's model and its priced cost.
 - `sum:` group (omitted if there are zero agents) — per-model merge of
-  the main session and every agent; each model keeps its own row (no
-  cross-model sums). Its time cells are the SESSION's union triple.
+  the main session and every agent (each side's usage already
+  deduplicated by `message.id` first-wins); each model keeps its own row
+  (no cross-model sums). Its time cells are the SESSION's union triple.
 - `main:` group — cumulative breakdown of the main session, one row per
-  model. Same session time triple as `sum:` — waiting on agents already
-  counts as main's work (see [Time columns](#time-columns-work--wait--total)).
+  model, with usage deduplicated by `message.id` first-wins (same rule
+  as the agent groups). Same session time triple as `sum:` — waiting on
+  agents already counts as main's work (see
+  [Time columns](#time-columns-work--wait--total)).
 - One group per agent — `[<status>]` icon and description on the FIRST
   row of the group only. Totals are cumulative across ALL of the agent's
   events (not the last API call's usage), deduplicated by `message.id`
@@ -310,6 +313,18 @@ are part of the cache-hit check: a pre-upgrade cache file that matches
 the key but lacks them is treated as a miss and rescanned once, then
 rewritten in the new shape.
 
+Usage-dedup migration note: the `message.id` dedup (plan
+`20260903-usage-dedup-by-message-id`) does NOT change the cache schema,
+so the hit check cannot detect it — cache files written before the fix
+keep serving the old INFLATED token sums indefinitely (closed sessions
+never mutate again, so the key never goes stale). Invalidating those
+caches automatically (a `_USAGE_REV`-style revision key) was considered
+and deliberately rejected in favor of a one-time manual cleanup:
+
+```bash
+rm ~/.claude/status_line/data/main_*.json ~/.claude/status_line/data/agents_*.json
+```
+
 Each per-agent entry in `agents_<sid>.json` is keyed by `agentId` and
 holds the fields `last_uuid`, `mtime_jsonl`, `mtime_meta`, `status`,
 `status_rev`, `tokens_in`, `tokens_out`, `tokens_cached`, `models`,
@@ -402,7 +417,7 @@ cd ~/.claude/status_line
 python -m pytest tests/ -v
 ```
 
-508 tests cover: pure functions (`format_tokens`, `format_duration`,
+510 tests cover: pure functions (`format_tokens`, `format_duration`,
 `union_work`, `_parse_ts` in `tests/test_format_duration.py` /
 `tests/test_union_work.py`, the agent pause/trim/extension geometry in
 `tests/test_agent_time_segments.py`, `detect_status`, `parse_stdin`),
