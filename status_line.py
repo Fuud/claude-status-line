@@ -2005,8 +2005,8 @@ _STATUS_GAP = "  "
 # Gap between the description column and the token column (2 spaces).
 _DESC_TOKEN_GAP = "  "
 # Width of the status-icon column (e.g. "[stop]") — the longest known
-# status name ("stop"/"kill") is 4 chars, plus 2 brackets = 6. Pad
-# shorter icons ("ok", "err") with trailing spaces so the description
+# status names ("stop"/"kill"/"lost") are 4 chars, plus 2 brackets = 6.
+# Pad shorter icons ("ok", "err") with trailing spaces so the description
 # column starts at the same x-position regardless of status length.
 _ICON_COL_WIDTH = 6
 # Recognized agent statuses — single source of truth for render_output's
@@ -2014,9 +2014,13 @@ _ICON_COL_WIDTH = 6
 # in _compute_agents may set "kill" when a main-log queue-operation
 # task-notification with <status>killed</status> is present and the
 # compute_agent_snapshot verdict is not "err" or "stop" (see plan
-# 20260824-subagent-status-via-queue-notifications). detect_status itself
-# still returns only {ok, err, stop, run}.
-_STATUSES = ("ok", "run", "err", "stop", "kill")
+# 20260824-subagent-status-via-queue-notifications). "lost" has the same
+# non-detect_status origin: it is set only by the cache-carryover branch
+# in _compute_agents, freezing an agent whose files disappeared from all
+# session dirs (status run/missing → lost; see plan
+# 20260905-retain-vanished-agents). detect_status itself still returns
+# only {ok, err, stop, run}.
+_STATUSES = ("ok", "run", "err", "stop", "kill", "lost")
 # Prefix prepended to every table row (everything except the session
 # header line). Claude Code strips leading whitespace from status-line
 # rows, which would left-shift the all-spaces token-header row and break

@@ -39,8 +39,8 @@ and right-aligned to a per-column width (max of label length, the widest
 formatted cell value, and _TOKEN_COLUMN_WIDTH=7). Each column's width is
 computed independently.
 
-Status icons: "[ok]", "[run]", "[err]", "[stop]", "[kill]". Description
->40 chars is truncated with U+2026.
+Status icons: "[ok]", "[run]", "[err]", "[stop]", "[kill]", "[lost]".
+Description >40 chars is truncated with U+2026.
 
 Line layout for a single-agent scenario without prices:
     [0] header
@@ -476,6 +476,72 @@ def test_kill_status_zero_breakdown_renders_zeros() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# [lost] status rendering (added per 20260905-retain-vanished-agents)
+# ---------------------------------------------------------------------------
+
+def test_lost_status_renders_as_lost_tag() -> None:
+    """Agent with status='lost' (cache carryover of a vanished subagent)
+    → line starts with '[lost]' tag, identical shape to the other status
+    lines (tabular format)."""
+    header = "Session: x"
+    agents = [
+        {
+            "status": "lost",
+            "tokens_in": 100,
+            "tokens_out": 50,
+            "tokens_cached": 20,
+            "description": "agent files vanished",
+        },
+    ]
+
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
+    lines = out.split("\n")
+    agent_line = lines[5]
+
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[lost]")
+    assert "agent files vanished" in agent_line
+    assert "100" in agent_line
+    assert "50" in agent_line
+    assert "20" in agent_line
+
+
+def test_lost_icon_padding_matches_stop_and_ok_columns() -> None:
+    """'[lost]' is 6 chars — exactly _ICON_COL_WIDTH, like '[stop]' — so it
+    needs no padding, while '[ok]' pads with trailing spaces; the
+    description column must start at the same x-position in all three
+    rows."""
+    assert len("[lost]") == _ICON_COL_WIDTH, (
+        "'[lost]' must fit the icon column exactly; if a longer status is "
+        "ever added, _ICON_COL_WIDTH must grow with it"
+    )
+    header = "Session: x"
+    agents = [
+        {"status": "ok", "description": "desc-ok", "tokens_in": 1, "tokens_out": 1, "tokens_cached": 1},
+        {"status": "stop", "description": "desc-stop", "tokens_in": 1, "tokens_out": 1, "tokens_cached": 1},
+        {"status": "lost", "description": "desc-lost", "tokens_in": 1, "tokens_out": 1, "tokens_cached": 1},
+    ]
+
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
+    lines = out.split("\n")
+
+    # The label column is left-aligned, so every row's icon is ljust'ed to
+    # _ICON_COL_WIDTH and the description starts at one shared x-position:
+    # len(_TABLE_ROW_PREFIX) + _ICON_COL_WIDTH + len(_STATUS_GAP).
+    for index, status in enumerate(("ok", "stop", "lost")):
+        agent_line = lines[5 + index]
+        expected_prefix = (
+            _TABLE_ROW_PREFIX
+            + f"[{status}]".ljust(_ICON_COL_WIDTH)
+            + _STATUS_GAP
+        )
+        desc = f"desc-{status}"
+        assert agent_line.startswith(expected_prefix + desc), (
+            f"{status} row must pad its icon to the shared column and put "
+            f"the description at the same x-position; got {agent_line!r}"
+        )
+
+
 def test_unknown_status_renders_as_question_mark() -> None:
     """Defensive: an unknown status value (not in _STATUSES tuple) surfaces
     as '[?]' rather than failing. Pre-existing behavior, regression check."""
@@ -484,7 +550,7 @@ def test_unknown_status_renders_as_question_mark() -> None:
     assert "kill" in _STATUSES, (
         f"kill must be in _STATUSES; got {_STATUSES}"
     )
-    assert set(_STATUSES) == {"ok", "run", "err", "stop", "kill"}, (
+    assert set(_STATUSES) == {"ok", "run", "err", "stop", "kill", "lost"}, (
         f"_STATUSES unexpected: {_STATUSES}"
     )
 
