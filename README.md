@@ -288,7 +288,10 @@ Code's status-line hook configuration.
 4. Iterates subagent jsonl files across ALL resolved dirs, computing a
    per-agent snapshot (`compute_agent_snapshot`) and merging them with
    dedup by `agentId` (first dir wins), using the agents cache at
-   `~/.claude/status_line/data/agents_<sid>.json`.
+   `~/.claude/status_line/data/agents_<sid>.json`; agents whose files
+   are absent from every session dir are carried over from the cache
+   with their last known state, a vanished `run` freezing to `[lost]`
+   (see [Edge cases](#edge-cases-handled)).
 5. Sorts agents by main-jsonl `tool_use` position (`sort_agents`).
 6. Computes the time columns: with `now = time.time()` the orchestrator
    unions main turns + agent lifetimes into the session work/wait/total
@@ -328,6 +331,12 @@ and deliberately rejected in favor of a one-time manual cleanup:
 ```bash
 rm ~/.claude/status_line/data/main_*.json ~/.claude/status_line/data/agents_*.json
 ```
+
+`agents_<sid>.json` also doubles as a retention store: entries whose
+files have vanished from every session dir are re-emitted into the
+output and written back (see the vanished-agent entry under Edge cases),
+so deleting `agents_*.json` — as the one-time cleanup above recommends —
+now also deletes that retained vanished-agent history.
 
 Each per-agent entry in `agents_<sid>.json` is keyed by `agentId` and
 holds the fields `last_uuid`, `mtime_jsonl`, `mtime_meta`, `status`,
@@ -411,9 +420,12 @@ Both files are written atomically (`.tmp` → `os.replace()`).
   session files move between project folders while the agent files are
   lost): vanished agents are retained from the per-session agents cache
   with their last-known status/tokens/time; a vanished running agent is
-  frozen to `[lost]` (its open question is closed, so the wait column
-  stops growing); the rows live until the session ends; if a file
-  returns to disk, the fresh scan wins.
+  frozen to `[lost]`, and any open question is closed — for terminal
+  ghosts too — so the wait column stops growing (when the unanswered
+  question is the agent's last event, the wait accrued since it has no
+  knowable end bound and is dropped: the wait cell may shrink at the
+  loss render, then freezes); the rows live until the session ends; if
+  a file returns to disk, the fresh scan wins.
 - **Missing/invalid `prices.json`** (no file, broken JSON, non-list,
   invalid entry): `load_prices` returns `None` → the model/cost columns
   are absent, the plain layout renders. Same for an unset
@@ -429,7 +441,7 @@ cd ~/.claude/status_line
 python -m pytest tests/ -v
 ```
 
-510 tests cover: pure functions (`format_tokens`, `format_duration`,
+533 tests cover: pure functions (`format_tokens`, `format_duration`,
 `union_work`, `_parse_ts` in `tests/test_format_duration.py` /
 `tests/test_union_work.py`, the agent pause/trim/extension geometry in
 `tests/test_agent_time_segments.py`, `detect_status`, `parse_stdin`),

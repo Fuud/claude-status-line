@@ -995,6 +995,61 @@ def test_dirless_session_skips_agents_cache_write(tmp_path: Path) -> None:
     assert (data_dir / f"main_{DIRLESS_SID}.json").exists()
 
 
+def test_dirless_session_with_ghost_cache_hides_agents_and_keeps_cache(
+    tmp_path: Path,
+) -> None:
+    """Dirless degradation with a POPULATED agents cache (retained ghosts
+    from before the session dirs vanished): the orchestrator's
+    `if session_dirs:` gate skips BOTH the scan and the carryover — no
+    ghost rows render (a broken gate would carry agent-ghost into the
+    table) — and the cache write is under the same gate, so the
+    retained-history file stays byte-identical: degradation without data
+    loss (the ghosts come back once session dirs exist again)."""
+    _build_dirless_session(tmp_path, DIRLESS_SID)
+    data_dir = tmp_path / ".claude" / "status_line" / "data"
+    data_dir.mkdir(parents=True)
+    ghost_entry = {
+        "status": "lost",
+        "tokens_in": 42,
+        "tokens_out": 7,
+        "tokens_cached": 0,
+        "models": {},
+        "description": "ghost nobody can show",
+        "toolUseId": "toolu_ghost",
+        "last_uuid": "ghost-uuid",
+        "mtime_jsonl": 111.0,
+        "mtime_meta": 112.0,
+        "ts_first": 1000.0,
+        "ts_last": 2000.0,
+        "qa_pauses": [],
+        "qa_open_ts": 0.0,
+    }
+    cache_path = data_dir / f"agents_{DIRLESS_SID}.json"
+    cache_path.write_text(
+        json.dumps({"agent-ghost": ghost_entry}), encoding="utf-8"
+    )
+    cache_before = cache_path.read_bytes()
+    stdin = json.dumps({"session_id": DIRLESS_SID, "model": {"display_name": "X"}})
+
+    result = _run_main(stdin, tmp_path)
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    out = result.stdout.decode("utf-8")
+    lines = out.splitlines()
+    assert len(lines) == 4, (
+        f"expected 4 lines (header, labels, start, main — no agent/sum "
+        f"rows); got {len(lines)}: {lines!r}"
+    )
+    assert not any(l.startswith("| [") for l in lines), (
+        f"no ghost rows may render for a dirless session; got:\n{out!r}"
+    )
+    assert "sum:" not in out and "ghost nobody can show" not in out
+    assert cache_path.read_bytes() == cache_before, (
+        "the retained-history cache must stay byte-identical when the "
+        "dirless gate skips the agents pipeline"
+    )
+
+
 def test_no_jsonl_anywhere_still_header_only(tmp_path: Path) -> None:
     """Session id with neither a session dir, nor a transcript_path, nor a
     globbable jsonl → header-only degrade (the historical no-dir behavior)."""

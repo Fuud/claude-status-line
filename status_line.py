@@ -50,8 +50,10 @@ Module-level invariants:
   deletes an agent's files (subagents/agent-*.jsonl vanish from ALL
   session dirs on a cwd change), the agent is re-emitted from the agents
   cache with its last known tokens/times; a carried "run" (or missing)
-  status is frozen to the terminal "lost" and its open AskUserQuestion
-  is closed, so the agent's durations stop growing. Known limitations:
+  status is frozen to the terminal "lost" and any open AskUserQuestion
+  is closed — on every carried entry, terminal ghosts included, or the
+  wait column would grow forever for a question that can never be
+  answered — so the agent's durations stop growing. Known limitations:
   carried ghosts never expire (they live in the cache and the table for
   the session's lifetime); status_rev re-classification cannot apply to
   ghosts (there is no file to rescan — the status stays as of the freeze
@@ -1375,8 +1377,16 @@ _DESCRIPTION_MAX_LEN = 40
 _DESCRIPTION_ELLIPSIS = "…"  # …
 
 
-def _truncate_description(s: str) -> str:
-    """Truncate `s` to at most 40 chars; if longer, take first 39 + U+2026."""
+def _truncate_description(s: object) -> str:
+    """Truncate `s` to at most 40 chars; if longer, take first 39 + U+2026.
+
+    Non-str input degrades to "" — the string-field counterpart of
+    _to_int's junk→0 convention: a hand-corrupted cache/meta description
+    value (truthy non-string, so the call sites' `or ""` does not catch
+    it) must render an empty cell, never raise TypeError out of len()
+    and take down the whole render."""
+    if not isinstance(s, str):
+        return ""
     if len(s) > _DESCRIPTION_MAX_LEN:
         return s[: _DESCRIPTION_MAX_LEN - 1] + _DESCRIPTION_ELLIPSIS
     return s
@@ -1613,15 +1623,24 @@ def compute_agent_snapshot(
     Agents with no assistant events or no usage blocks get zeros and an
     empty models dict.
 
-    Cache hit: if `cache_entry` is provided AND its last_uuid AND
-    mtime_jsonl AND mtime_meta match the current on-disk state AND all
+    Cache hit: a `cache_entry` that is not a dict (hand-corrupted cache)
+    is coerced to a plain miss. If `cache_entry` is provided AND its
+    last_uuid AND mtime_jsonl AND mtime_meta match the current on-disk
+    state AND all
     three breakdown fields AND `models` AND the four time-segmentation
-    fields (ts_first / ts_last / qa_pauses / qa_open_ts) are present in
-    cache_entry AND its status_rev equals the current _STATUS_REV, the
+    fields (ts_first / ts_last / qa_pauses / qa_open_ts) AND `status`
+    are present in cache_entry AND its status_rev equals the current
+    _STATUS_REV, the
     cache_entry is returned unchanged. The field-presence checks guard
     against stale pre-upgrade caches (which would render zeros via
     `int(a.get(field) or 0)` — and, for the time fields, empty
-    work/wait/total cells — until the next jsonl mutation); the
+    work/wait/total cells — until the next jsonl mutation); `status`
+    presence additionally guards a hand-corrupted entry with the key
+    deleted — the hit return re-injects only agentId, and
+    _compute_agents' queue override reads `agent["status"]` directly,
+    so a KeyError there (before the caller's cache write) would degrade
+    the whole status line persistently instead of missing once and
+    self-healing; the
     status_rev check guards against pre-rev STATUS LOGIC (a cached
     "run" classified before an _is_assistant_error fix would otherwise
     outlive the fix for agents whose jsonl never mutates again).
@@ -1652,7 +1671,14 @@ def compute_agent_snapshot(
     # and the four time-segmentation fields are REQUIRED: a pre-upgrade
     # cache (old format) would otherwise satisfy the key-match but lack
     # the new fields, leading to render zeros / empty model cells / empty
-    # time cells until the next jsonl mutation. The status_rev equality
+    # time cells until the next jsonl mutation. `status` presence is
+    # required for a different reason: a hand-corrupted entry with the
+    # key deleted would otherwise hit (the hit return re-injects only
+    # agentId) and flow into _compute_agents' queue-override guard,
+    # whose direct `agent["status"]` read raises KeyError BEFORE the
+    # caller's cache write — one junk entry would degrade the whole
+    # status line persistently instead of missing once and self-healing.
+    # The status_rev equality
     # check plays the same role for STATUS-LOGIC upgrades: a dead agent's
     # jsonl never mutates again, so a cached "run" from a pre-rev
     # classifier would otherwise survive the fix forever.
@@ -1661,6 +1687,17 @@ def compute_agent_snapshot(
     # agent_id is needed both for the cache-hit dict-shape invariant (see
     # _AGENT_CACHE_FIELDS comment) and below in the cache-miss builder.
     agent_id = jsonl_path.stem
+    # A hand-corrupted cache may hold a non-dict entry for an agent whose
+    # file IS on disk (_load_dict_cache validates only the outer dict;
+    # the disk-scan path in _compute_agents passes the entry here as-is,
+    # unlike the carryover block, which has its own isinstance check).
+    # Coerce to None → plain cache miss: the snapshot is re-scanned from
+    # disk and the caller's _write_agents_cache rewrites the junk entry,
+    # so the corruption self-heals on the very next render instead of
+    # crashing (AttributeError on .get / TypeError on `in`) through to
+    # main's catch-all and degrading the whole status line persistently.
+    if not isinstance(cache_entry, dict):
+        cache_entry = None
     if cache_entry is not None:
         breakdown_present = all(
             f in cache_entry for f in ("tokens_in", "tokens_out", "tokens_cached")
@@ -1676,6 +1713,7 @@ def compute_agent_snapshot(
             and breakdown_present
             and "models" in cache_entry
             and time_fields_present
+            and "status" in cache_entry
             and cache_entry.get("status_rev") == _STATUS_REV
         ):
             # Preserve the invariant: the returned snapshot always has
@@ -2738,13 +2776,20 @@ def _compute_agents(
     carried status of "run" (or a missing status) is frozen into the
     terminal "lost": without its files the agent physically cannot be
     working, while a live "run" would keep stretching life_end to `now`
-    in _agent_time_segments forever. The freeze also CLOSES the open
-    question: qa_open_ts folds into the closed pause [qa_open_ts,
-    ts_last] (when ts_last is ahead) and resets to 0.0 — the qa_open_ts
-    branch in _agent_time_segments is evaluated BEFORE the status check,
-    so a lingering open ts would grow the wait column (now − qa_open_ts,
+    in _agent_time_segments forever. The carryover also CLOSES any open
+    question on EVERY carried entry, terminal statuses included (a
+    kill/stop ghost whose question was never answered would otherwise
+    grow the wait column forever): qa_open_ts folds into the closed
+    pause [qa_open_ts, ts_last] — when ts_last is ahead; an unanswered
+    question is often the agent's LAST event (ts_last == qa_open_ts), in
+    which case the unbounded open gap is dropped rather than guessed —
+    and resets to 0.0, because the qa_open_ts branch in
+    _agent_time_segments is evaluated BEFORE the status check, so a
+    lingering open ts would grow the wait column (now − qa_open_ts,
     uncapped) on every render. Corrupt cache entries (not a dict) are
-    skipped.
+    skipped in the carryover; on the disk-scan path the same junk is
+    coerced to a cache miss inside compute_agent_snapshot (re-scan from
+    disk, rewrite self-heals the entry).
 
     After building all snapshots, apply the orchestrator-level queue override
     to the MERGED list: for each agent whose `agentId` (with the `agent-`
@@ -2799,26 +2844,37 @@ def _compute_agents(
 
     # Carryover of vanished agents (see the docstring's carryover
     # paragraph): agents the disk scan did NOT see are appended from the
-    # cache with their last known state. The freeze to "lost" closes the
-    # open question via the SAME [start, end] fold _agent_time_segments
-    # applies when a question is answered — _to_float guards a corrupted
-    # cache the same way the read path does.
+    # cache with their last known state. The open question is closed on
+    # EVERY carried entry — not just the lost freeze — via the SAME
+    # [start, end] fold _agent_time_segments applies when a question is
+    # answered; _to_float guards a corrupted cache the same way the read
+    # path does.
     for agent_id, entry in agents_cache.items():
         if agent_id in seen_agent_ids or not isinstance(entry, dict):
             continue
         carried = {**entry, "agentId": agent_id}
+        # Close the open question even for TERMINAL ghosts (kill/stop set
+        # by the queue override or meta while the agent hung on an
+        # unanswered AskUserQuestion): _agent_time_segments evaluates the
+        # qa_open_ts branch BEFORE the status check, so a lingering open
+        # ts would add (now − qa_open_ts) to the wait column on every
+        # render — unbounded growth for a question that can never be
+        # answered. When ts_last <= qa_open (the unanswered question IS
+        # often the agent's last event) there is no knowable end bound,
+        # so the accrued open gap is dropped rather than guessed.
+        qa_open = _to_float(carried.get("qa_open_ts")) or 0.0
+        ts_last = _to_float(carried.get("ts_last")) or 0.0
+        if qa_open > 0.0:
+            if ts_last > qa_open:
+                pauses = carried.get("qa_pauses")
+                if isinstance(pauses, list):
+                    # Fresh list, never an in-place append — {**entry} is
+                    # a SHALLOW copy, so the cached entry's qa_pauses list
+                    # is shared with `carried` until replaced here.
+                    carried["qa_pauses"] = [*pauses, [qa_open, ts_last]]
+            carried["qa_open_ts"] = 0.0
         if carried.get("status") in (None, "run"):
             carried["status"] = "lost"
-            # close the open question, else wait grows forever
-            # (_agent_time_segments checks qa_open_ts BEFORE status)
-            qa_open = _to_float(carried.get("qa_open_ts")) or 0.0
-            ts_last = _to_float(carried.get("ts_last")) or 0.0
-            if qa_open > 0.0:
-                if ts_last > qa_open:
-                    pauses = carried.get("qa_pauses")
-                    if isinstance(pauses, list):
-                        pauses.append([qa_open, ts_last])
-                carried["qa_open_ts"] = 0.0
         agents.append(carried)
 
     # Orchestrator-level queue override (with err/stop guard). See [deviation]

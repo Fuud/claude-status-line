@@ -21,11 +21,14 @@ Cache semantics:
 - If `cache_entry` (a dict) is provided and its last_uuid + mtime_jsonl +
   mtime_meta all match the current file state AND breakdown fields
   (tokens_in/out/cached) AND `models` AND the four time-segmentation
-  fields (ts_first/ts_last/qa_pauses/qa_open_ts) are present in
-  cache_entry AND its status_rev equals the current _STATUS_REV →
+  fields (ts_first/ts_last/qa_pauses/qa_open_ts) AND `status` are present
+  in cache_entry AND its status_rev equals the current _STATUS_REV →
   return the cache_entry unchanged (cache hit). The field-presence
   checks guard against stale caches from pre-upgrade schemas (including
-  pre-time-column ones); the status_rev check guards against pre-rev
+  pre-time-column ones); `status` presence guards a hand-corrupted entry
+  with the key deleted (a hit would flow into _compute_agents' direct
+  `agent["status"]` queue-override read → KeyError, before the caller's
+  cache write); the status_rev check guards against pre-rev
   STATUS LOGIC — a cached "run" from before an _is_assistant_error fix
   must not outlive the fix for agents whose jsonl never mutates again.
 - Otherwise → re-parse the jsonl, compute fields fresh, and return.
@@ -52,6 +55,7 @@ from status_line import (
     _compute_agents,
     _write_agents_cache,
     compute_agent_snapshot,
+    render_output,
 )
 
 
@@ -1555,7 +1559,11 @@ def test_compute_agents_single_str_path_is_normalized(tmp_path: Path) -> None:
 
 
 def test_compute_agents_empty_dirs_list_returns_empty(tmp_path: Path) -> None:
-    """An empty list of session dirs → no agents (no crash, no fs access)."""
+    """An empty list of session dirs with NO cache file → no agents (no
+    crash). The empty-list contract changed with the vanished-agent
+    carryover: a POPULATED cache now yields only its carried ghosts
+    (locked by test_compute_agents_carries_entry_without_status_as_lost);
+    this test pins the cache-absent precondition under which [] stays []."""
     agents_cache = tmp_path / "agents_cache.json"
 
     assert _compute_agents([], agents_cache) == []
@@ -1845,6 +1853,302 @@ def test_compute_agents_skips_non_dict_cache_entry_in_carryover(
     )
 
 
+def test_compute_agents_non_dict_cache_entry_with_file_on_disk_self_heals(
+    tmp_path: Path,
+) -> None:
+    """The disk-scan counterpart of the carryover junk test above: the
+    agent's file IS on disk while its cache entry is a hand-corrupted
+    non-dict. The unguarded cache-hit check inside compute_agent_snapshot
+    would call .get on the junk (AttributeError; TypeError for
+    non-iterables like ints) and crash through to main's catch-all —
+    BEFORE _write_agents_cache runs, so the junk would never be rewritten
+    and the whole status line would degrade to header-only on EVERY render
+    until the cache is deleted by hand. Instead: no crash, the snapshot is
+    computed from disk, and the orchestrator's write-after-compute rewrites
+    the junk entry with the valid snapshot (self-heal). The junk entry is
+    written straight to the cache file because _write_agents_cache only
+    ever produces dict entries."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_COMPLETED, AGENT_COMPLETED_META
+    )
+    agents_cache.write_text(
+        json.dumps({agent_id: [1, 2, 3]}), encoding="utf-8"
+    )
+
+    agents = _compute_agents(session_dir, agents_cache)
+
+    assert len(agents) == 1, (
+        f"on-disk agent must render once, not vanish or duplicate; got "
+        f"{[a['agentId'] for a in agents]!r}"
+    )
+    fresh = agents[0]
+    # Computed from disk, not from the (unusable) cache: AGENT_COMPLETED's
+    # exact re-scanned totals (in=50+60, out=20+30, cached=100+120) and
+    # its end_turn → ok classification.
+    assert fresh["status"] == "ok"
+    assert fresh["tokens_in"] == 110
+    assert fresh["tokens_out"] == 50
+    assert fresh["tokens_cached"] == 220
+
+    # Self-heal: the same write main() performs right after _compute_agents
+    # replaces the junk entry with the valid snapshot dict.
+    _write_agents_cache(agents_cache, agents)
+    rewritten = json.loads(agents_cache.read_text(encoding="utf-8"))
+    assert isinstance(rewritten[agent_id], dict), (
+        f"junk entry must be rewritten as a dict; got "
+        f"{rewritten.get(agent_id)!r}"
+    )
+    assert rewritten[agent_id]["status"] == "ok"
+    assert rewritten[agent_id]["tokens_in"] == 110
+
+
+def test_compute_agents_statusless_cache_entry_with_file_on_disk_self_heals(
+    tmp_path: Path,
+) -> None:
+    """Sibling of the non-dict junk test above: the cache entry IS a dict
+    and satisfies EVERY cache-hit condition (built by a real round-trip,
+    so last_uuid/mtimes/breakdown/models/time fields/status_rev all
+    match) — but the "status" KEY was hand-deleted. Pre-fix this still
+    hits: the hit return re-injects only agentId, so the snapshot flows
+    into _compute_agents' queue-override guard, whose direct
+    `agent["status"]` read raises KeyError whenever the agent has a
+    task-notification (here the ordinary {"<task-id>": "ok"} of any
+    session with a completed Agent call) — BEFORE _write_agents_cache
+    runs, so the junk would never self-heal and the whole status line
+    would degrade to header-only on EVERY render until the cache is
+    deleted by hand. Requiring "status" presence in the hit check turns
+    the junk into a plain miss: no crash, the snapshot is re-scanned
+    from disk, and the orchestrator's write-after-compute restores the
+    key (self-heal on the same render)."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_COMPLETED, AGENT_COMPLETED_META
+    )
+    task_key = agent_id[len("agent-"):]  # "test"
+    # Real round-trip → an entry satisfying every hit condition...
+    first = _compute_agents(session_dir, agents_cache)
+    _write_agents_cache(agents_cache, first)
+    # ...then hand-corrupt exactly one thing out of it: the status key.
+    corrupt = json.loads(agents_cache.read_text(encoding="utf-8"))
+    del corrupt[agent_id]["status"]
+    agents_cache.write_text(json.dumps(corrupt), encoding="utf-8")
+
+    agents = _compute_agents(
+        session_dir, agents_cache, task_notifications={task_key: "ok"}
+    )
+
+    assert len(agents) == 1, (
+        f"on-disk agent must render once, not vanish or duplicate; got "
+        f"{[a['agentId'] for a in agents]!r}"
+    )
+    fresh = agents[0]
+    # Computed from disk, not from the statusless hit: AGENT_COMPLETED's
+    # exact re-scanned totals (in=50+60, out=20+30, cached=100+120) and
+    # its end_turn → ok classification (the queue override's "ok"
+    # agrees, so the value proves the re-scan, not just the override).
+    assert fresh["status"] == "ok"
+    assert fresh["tokens_in"] == 110
+    assert fresh["tokens_out"] == 50
+    assert fresh["tokens_cached"] == 220
+
+    # Self-heal: the same write main() performs right after _compute_agents
+    # restores the deleted key with the re-scanned value.
+    _write_agents_cache(agents_cache, agents)
+    rewritten = json.loads(agents_cache.read_text(encoding="utf-8"))
+    assert rewritten[agent_id]["status"] == "ok", (
+        f"the statusless entry must be rewritten with the re-scanned "
+        f"status; got {rewritten.get(agent_id)!r}"
+    )
+
+
+def test_compute_agents_terminal_ghost_open_question_also_closed(
+    tmp_path: Path,
+) -> None:
+    """A carried TERMINAL status (here "kill" — set by the queue override
+    while the agent hung on an unanswered AskUserQuestion, then the files
+    vanished) must ALSO have its open question closed by the carryover:
+    the qa_open_ts branch in _agent_time_segments runs BEFORE the status
+    check, so a lingering open ts would add (now − qa_open_ts) to the
+    wait column on every render — unbounded growth for a ghost that can
+    never be answered."""
+    agents_cache = tmp_path / "agents_cache.json"
+    ghost = {
+        "agentId": "agent-killed",
+        "status": "kill",  # terminal — the lost freeze must NOT touch it
+        "status_rev": _STATUS_REV,
+        "tokens_in": 1,
+        "tokens_out": 2,
+        "tokens_cached": 3,
+        "models": {},
+        "description": "killed while asking",
+        "toolUseId": "toolu_killed",
+        "last_uuid": "u-killed",
+        "mtime_jsonl": 111.0,
+        "mtime_meta": 112.0,
+        "ts_first": 1000.0,
+        "ts_last": 2500.0,
+        "qa_pauses": [],
+        "qa_open_ts": 2000.0,
+    }
+    _write_agents_cache(agents_cache, [ghost])
+    session_dir = tmp_path / "session-abc"  # exists, but has no subagents/
+
+    agents = _compute_agents(session_dir, agents_cache)
+
+    carried = agents[0]
+    assert carried["status"] == "kill", (
+        f"terminal status must carry over unfrozen; got {carried['status']!r}"
+    )
+    assert carried["qa_open_ts"] == 0.0, (
+        "the open question must close for terminal ghosts too"
+    )
+    assert carried["qa_pauses"] == [[2000.0, 2500.0]], (
+        f"the open gap must fold into a closed pause; "
+        f"qa_pauses={carried['qa_pauses']!r}"
+    )
+    # Frozen durations: later `now` must not grow the wait column.
+    seg_early = _agent_time_segments(carried, now=10_000.0)
+    seg_late = _agent_time_segments(carried, now=20_000.0)
+    assert seg_early is not None and seg_late is not None
+    assert seg_early[2] == seg_late[2] == 500.0, (
+        f"wait must be frozen at the folded 500s gap; "
+        f"got {seg_early[2]!r} / {seg_late[2]!r}"
+    )
+
+
+def test_compute_agents_lost_freeze_with_question_as_last_event(
+    tmp_path: Path,
+) -> None:
+    """ts_last == qa_open_ts (the unanswered AskUserQuestion IS the agent's
+    last event — the common hanging shape): the freeze has no knowable end
+    bound for the open gap, so it is DROPPED (not folded) and qa_open_ts
+    resets to 0.0. The displayed wait may shrink at the loss render —
+    ts_last is the only anchor — but must then stay FROZEN: no residual
+    open ts, no growth across renders, no crash."""
+    agents_cache = tmp_path / "agents_cache.json"
+    ghost = {
+        "agentId": "agent-hanging",
+        "status": "run",
+        "status_rev": _STATUS_REV,
+        "tokens_in": 1,
+        "tokens_out": 2,
+        "tokens_cached": 3,
+        "models": {},
+        "description": "hung on a question",
+        "toolUseId": "toolu_hanging",
+        "last_uuid": "u-hanging",
+        "mtime_jsonl": 111.0,
+        "mtime_meta": 112.0,
+        "ts_first": 1000.0,
+        "ts_last": 2000.0,  # == qa_open: question is the last event
+        "qa_pauses": [[1500.0, 1600.0]],
+        "qa_open_ts": 2000.0,
+    }
+    _write_agents_cache(agents_cache, [ghost])
+    session_dir = tmp_path / "session-abc"
+
+    agents = _compute_agents(session_dir, agents_cache)
+
+    carried = agents[0]
+    assert carried["status"] == "lost"
+    assert carried["qa_open_ts"] == 0.0, "no residual open ts may survive"
+    assert carried["qa_pauses"] == [[1500.0, 1600.0]], (
+        f"no fold is possible without an end bound — the existing pauses "
+        f"must pass through untouched; got {carried['qa_pauses']!r}"
+    )
+    # Wait freezes at the closed-pause total (100s), never at the dropped
+    # open gap, and never grows between renders.
+    seg_early = _agent_time_segments(carried, now=10_000.0)
+    seg_late = _agent_time_segments(carried, now=20_000.0)
+    assert seg_early is not None and seg_late is not None
+    assert seg_early[2] == seg_late[2] == 100.0, (
+        f"wait must freeze at the closed-pause total; "
+        f"got {seg_early[2]!r} / {seg_late[2]!r}"
+    )
+    assert seg_early[3] == seg_late[3] == 1000.0
+
+
+def test_compute_agents_lost_freeze_junk_qa_pauses_drops_fold(
+    tmp_path: Path,
+) -> None:
+    """Corrupt-field branch of the freeze: qa_open_ts > 0 but qa_pauses is
+    junk (a string from a hand-corrupted cache) → the fold is impossible,
+    the pause is silently DROPPED (the junk field passes through
+    untouched), but qa_open_ts is still reset — the unbounded wait growth
+    is closed even when the pause list is unusable; _agent_time_segments'
+    own isinstance guard then treats the junk as no pauses at all."""
+    agents_cache = tmp_path / "agents_cache.json"
+    ghost = {
+        "agentId": "agent-junkpauses",
+        "status": "run",
+        "status_rev": _STATUS_REV,
+        "tokens_in": 1,
+        "tokens_out": 2,
+        "tokens_cached": 3,
+        "models": {},
+        "description": "junk pauses ghost",
+        "toolUseId": "toolu_junk",
+        "last_uuid": "u-junk",
+        "mtime_jsonl": 111.0,
+        "mtime_meta": 112.0,
+        "ts_first": 1000.0,
+        "ts_last": 2500.0,
+        "qa_pauses": "definitely not a list",
+        "qa_open_ts": 2000.0,
+    }
+    _write_agents_cache(agents_cache, [ghost])
+    session_dir = tmp_path / "session-abc"
+
+    agents = _compute_agents(session_dir, agents_cache)
+
+    carried = agents[0]
+    assert carried["status"] == "lost"
+    assert carried["qa_open_ts"] == 0.0, (
+        "the ts reset must not depend on the pause list being usable"
+    )
+    assert carried["qa_pauses"] == "definitely not a list", (
+        f"junk field must pass through untouched (fold dropped); "
+        f"got {carried['qa_pauses']!r}"
+    )
+    # Downstream degrade, not crash: junk pauses read as no pauses.
+    seg_early = _agent_time_segments(carried, now=10_000.0)
+    seg_late = _agent_time_segments(carried, now=20_000.0)
+    assert seg_early is not None and seg_late is not None
+    assert seg_early[2] == seg_late[2] == 0.0
+    assert seg_early[3] == seg_late[3] == 1500.0
+
+
+def test_compute_agents_fieldless_carried_entry_renders_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """A field-less carried entry ({} — maximal cache corruption that is
+    still a dict) degrades through the whole pipeline: _compute_agents
+    freezes it to lost (missing status), and render_output renders a
+    zero/empty-cell row without crashing — one junk entry must not take
+    down the whole render."""
+    agents_cache = tmp_path / "agents_cache.json"
+    agents_cache.write_text(
+        json.dumps({"agent-bare": {}}), encoding="utf-8"
+    )
+    session_dir = tmp_path / "session-abc"
+
+    agents = _compute_agents(session_dir, agents_cache)
+
+    assert len(agents) == 1, (
+        f"the bare entry must still be carried; got {agents!r}"
+    )
+    assert agents[0]["agentId"] == "agent-bare"
+    assert agents[0]["status"] == "lost"
+
+    out = render_output("Session: x", 0, 0, 0, {}, agents)
+    agent_line = next(
+        l for l in out.split("\n") if l.startswith("| [lost]")
+    )
+    # Zero token cells render — the row exists, degraded but visible.
+    assert agent_line.split()[-3:] == ["0", "0", "0"], (
+        f"a field-less ghost renders zero cells; got {agent_line!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _compute_agents carryover interplay — queue override + file return
 # (added per 20260905-retain-vanished-agents, Task 3: the carried ghost
@@ -1995,6 +2299,58 @@ def test_compute_agents_returned_file_beats_carried_ghost(
     assert fresh["tokens_out"] == 50
     assert fresh["tokens_cached"] == 220
     assert fresh["tokens_in"] != ghost["tokens_in"]
+
+
+def test_compute_agents_restored_identical_file_cache_hits_carried_lost(
+    tmp_path: Path,
+) -> None:
+    """Accepted edge (plan Design p.4): the file RETURNS with IDENTICAL
+    bytes and mtimes reset to the cached stamps (mv preserves mtime, and
+    last_uuid is content-derived so it matches too) → the cache key still
+    matches and compute_agent_snapshot takes the cache HIT, returning the
+    carried ghost with its frozen "lost" — the agent genuinely did stop;
+    only a content or mtime change triggers a re-scan (the previous test
+    pins that side of the edge)."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+    jsonl = session_dir / "subagents" / f"{agent_id}.jsonl"
+    meta = session_dir / "subagents" / f"{agent_id}.meta.json"
+    first = _compute_agents(session_dir, agents_cache)
+    assert first[0]["status"] == "run"
+    _write_agents_cache(agents_cache, first)
+    saved_jsonl, saved_meta = jsonl.read_bytes(), meta.read_bytes()
+    _vanish_agent_files(session_dir, agent_id)
+    ghost = _compute_agents(session_dir, agents_cache)[0]
+    assert ghost["status"] == "lost"
+    # A real second render persists the ghost before the file returns.
+    _write_agents_cache(agents_cache, [ghost])
+
+    # Restore byte-identical files and rewind their mtimes to exactly the
+    # cached stamps (os.utime with the cached float reproduces the same
+    # st_mtime the first render cached — asserted right below, so a
+    # platform that rounds differently fails loudly here, not silently
+    # in the cache-hit assert).
+    jsonl.write_bytes(saved_jsonl)
+    meta.write_bytes(saved_meta)
+    os.utime(jsonl, (ghost["mtime_jsonl"], ghost["mtime_jsonl"]))
+    os.utime(meta, (ghost["mtime_meta"], ghost["mtime_meta"]))
+    assert jsonl.stat().st_mtime == ghost["mtime_jsonl"]
+    assert meta.stat().st_mtime == ghost["mtime_meta"]
+
+    agents = _compute_agents(session_dir, agents_cache)
+
+    assert len(agents) == 1, (
+        f"the restored agent must not be duplicated; got {agents!r}"
+    )
+    # The discriminator: a fresh scan of AGENT_RUNNING would say "run";
+    # only the cache hit can return the frozen ghost.
+    assert agents[0]["status"] == "lost", (
+        f"identical bytes + mtimes → cache hit returns the carried lost; "
+        f"got {agents[0]['status']!r}"
+    )
+    assert agents[0]["tokens_in"] == ghost["tokens_in"]
+    assert agents[0]["description"] == ghost["description"]
 
 
 # ---------------------------------------------------------------------------

@@ -542,6 +542,40 @@ def test_lost_icon_padding_matches_stop_and_ok_columns() -> None:
         )
 
 
+def test_non_string_description_renders_empty_not_crash() -> None:
+    """A non-string description (hand-corrupted agents cache — the carryover
+    feeds any cache entry into render, and the projection loop's
+    `a.get('description', '') or ''` only coerces FALSY junk) must degrade
+    to an empty description cell, never raise TypeError out of
+    _truncate_description's len() — one corrupt value must not take down
+    the whole render (the _to_int convention applied to the one string
+    field)."""
+    header = "Session: x"
+    agents = [
+        {
+            "status": "lost",
+            "tokens_in": 100,
+            "tokens_out": 50,
+            "tokens_cached": 20,
+            "description": 12345,  # truthy non-string
+        },
+    ]
+
+    out = render_output(header, 0, 0, 0, _main(0, 0, 0), agents)
+    lines = out.split("\n")
+    agent_line = lines[5]
+
+    assert agent_line.startswith(_TABLE_ROW_PREFIX + "[lost]"), (
+        f"the junk-description agent must still render; got {agent_line!r}"
+    )
+    assert "12345" not in agent_line, (
+        f"non-string description degrades to an empty cell, not str() junk; "
+        f"got {agent_line!r}"
+    )
+    # The row's token cells still render — the rest of the agent survives.
+    assert "100" in agent_line and "50" in agent_line
+
+
 def test_unknown_status_renders_as_question_mark() -> None:
     """Defensive: an unknown status value (not in _STATUSES tuple) surfaces
     as '[?]' rather than failing. Pre-existing behavior, regression check."""
