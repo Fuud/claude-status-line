@@ -1846,6 +1846,158 @@ def test_compute_agents_skips_non_dict_cache_entry_in_carryover(
 
 
 # ---------------------------------------------------------------------------
+# _compute_agents carryover interplay — queue override + file return
+# (added per 20260905-retain-vanished-agents, Task 3: the carried ghost
+# must interact correctly with the orchestrator's queue override and with
+# a file that COMES BACK to disk after the carryover already ran)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_agents_queue_signal_overrides_carried_lost_to_ok(
+    tmp_path: Path,
+) -> None:
+    """A carried ghost frozen to "lost" + a task-notification saying the
+    task actually completed → the orchestrator override wins: the real
+    outcome from the main jsonl replaces the pessimistic "lost" (the
+    override's err/stop guard does not protect "lost" — by design, the
+    queue knows the true fate of the task)."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+    first = _compute_agents(session_dir, agents_cache)
+    assert first[0]["status"] == "run"
+    _write_agents_cache(agents_cache, first)
+    _vanish_agent_files(session_dir, agent_id)
+    task_key = agent_id[len("agent-"):]  # "test"
+
+    second = _compute_agents(
+        session_dir, agents_cache, task_notifications={task_key: "ok"}
+    )
+
+    assert len(second) == 1
+    assert second[0]["status"] == "ok", (
+        f"notification must override the frozen lost; got "
+        f"{second[0]['status']!r}"
+    )
+
+
+def test_compute_agents_queue_signal_overrides_carried_lost_to_kill(
+    tmp_path: Path,
+) -> None:
+    """Same interplay with a kill-notification: the queue's "kill" is the
+    agent's true fate, so it must replace the frozen "lost" too — the
+    override applies to carried ghosts for ANY notification value, not
+    just "ok"."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+    first = _compute_agents(session_dir, agents_cache)
+    assert first[0]["status"] == "run"
+    _write_agents_cache(agents_cache, first)
+    _vanish_agent_files(session_dir, agent_id)
+    task_key = agent_id[len("agent-"):]
+
+    second = _compute_agents(
+        session_dir, agents_cache, task_notifications={task_key: "kill"}
+    )
+
+    assert len(second) == 1
+    assert second[0]["status"] == "kill", (
+        f"kill-notification must override the frozen lost; got "
+        f"{second[0]['status']!r}"
+    )
+
+
+def test_compute_agents_guard_keeps_carried_err_and_stop(
+    tmp_path: Path,
+) -> None:
+    """Carried terminal "err"/"stop" + a task-notification → NOT overridden:
+    the queue-override guard (`status not in ("err", "stop")`) protects a
+    carried snapshot exactly as it protects a disk-scanned one — a
+    "completed" queue signal must not downgrade the real failure/stop the
+    cache remembers."""
+    session_dir = tmp_path / "session-abc"
+    _add_agent_to_session(
+        session_dir, "agent-err", AGENT_ERR_API, AGENT_ERR_API_META
+    )
+    _add_agent_to_session(
+        session_dir, "agent-stop", AGENT_OK, META_STOPPED_BY_USER
+    )
+    agents_cache = tmp_path / "agents_cache.json"
+    first = _compute_agents(session_dir, agents_cache)
+    assert {a["agentId"]: a["status"] for a in first} == {
+        "agent-err": "err",
+        "agent-stop": "stop",
+    }
+    _write_agents_cache(agents_cache, first)
+    _vanish_agent_files(session_dir, "agent-err")
+    _vanish_agent_files(session_dir, "agent-stop")
+
+    second = _compute_agents(
+        session_dir,
+        agents_cache,
+        task_notifications={"err": "ok", "stop": "ok"},
+    )
+
+    statuses = {a["agentId"]: a["status"] for a in second}
+    assert statuses == {"agent-err": "err", "agent-stop": "stop"}, (
+        f"carried err/stop must win over notifications (guard); got "
+        f"{statuses!r}"
+    )
+
+
+def test_compute_agents_returned_file_beats_carried_ghost(
+    tmp_path: Path,
+) -> None:
+    """The agent's file COMES BACK to disk (CC restored the directory) with a
+    NEWER mtime and different content → the fresh disk scan wins over the
+    carried ghost: status comes from detect_status over the returned jsonl
+    (here "ok" — it ends with end_turn), tokens are re-scanned from the new
+    content, and the agent is not duplicated (carryover skips ids seen on
+    disk, and the changed last_uuid/mtime prevents a stale cache hit)."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+    first = _compute_agents(session_dir, agents_cache)
+    assert first[0]["status"] == "run"
+    _write_agents_cache(agents_cache, first)
+    _vanish_agent_files(session_dir, agent_id)
+    ghost = _compute_agents(session_dir, agents_cache)[0]
+    assert ghost["status"] == "lost"
+    # A real second render persists the ghost before the file returns.
+    _write_agents_cache(agents_cache, [ghost])
+
+    # Return the file with new content (agent finished elsewhere: ends with
+    # end_turn) and a mtime clearly newer than the ghost's cache stamp —
+    # write_bytes already stamps a fresh mtime, the explicit utime bump
+    # keeps "newer" independent of mtime tick granularity.
+    returned_jsonl = _add_agent_to_session(
+        session_dir, agent_id, AGENT_COMPLETED, AGENT_COMPLETED_META
+    )
+    newer = ghost["mtime_jsonl"] + 100.0
+    os.utime(returned_jsonl, (newer, newer))
+
+    agents = _compute_agents(session_dir, agents_cache)
+
+    assert len(agents) == 1, (
+        f"returned agent must not be duplicated by carryover; got "
+        f"{[a['agentId'] for a in agents]!r}"
+    )
+    fresh = agents[0]
+    assert fresh["status"] == "ok", (
+        f"fresh scan must supply the status (detect_status: end_turn → ok); "
+        f"got {fresh['status']!r}"
+    )
+    # Tokens re-scanned from the returned content — AGENT_COMPLETED has two
+    # distinct message ids (msg-c001, msg-c002): in=50+60, out=20+30,
+    # cached=100+120 — NOT the ghost's frozen running-agent values (in=40).
+    assert fresh["tokens_in"] == 110
+    assert fresh["tokens_out"] == 50
+    assert fresh["tokens_cached"] == 220
+    assert fresh["tokens_in"] != ghost["tokens_in"]
+
+
+# ---------------------------------------------------------------------------
 # cache-fields invariant — _AGENT_CACHE_FIELDS is the persisted shape,
 # agentId is NOT inside each entry (it's the dict key)
 # ---------------------------------------------------------------------------

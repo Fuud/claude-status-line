@@ -20,7 +20,12 @@ from pathlib import Path
 
 import pytest
 
-from status_line import _AGENT_CACHE_FIELDS, _STATUS_REV, _write_agents_cache
+from status_line import (
+    _AGENT_CACHE_FIELDS,
+    _STATUS_REV,
+    _compute_agents,
+    _write_agents_cache,
+)
 
 
 def _snapshot(agent_id: str, **overrides) -> dict:
@@ -158,6 +163,47 @@ def test_time_fields_round_trip(tmp_path: Path) -> None:
     assert entry_b["ts_last"] == 600.0
     assert entry_b["qa_pauses"] == []
     assert entry_b["qa_open_ts"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# carryover round-trip (20260905-retain-vanished-agents, Task 3)
+# ---------------------------------------------------------------------------
+
+def test_write_then_compute_round_trips_carried_ghost(tmp_path: Path) -> None:
+    """A carried ghost (frozen "lost", open question closed) must be STABLE
+    across renders: _write_agents_cache persists it with exactly the frozen
+    fields, and a second _compute_agents over the still-missing files
+    returns the same ghost — not a re-freeze, not a loss, not a duplicate."""
+    cache = tmp_path / "agents_ghost.json"
+    # What the first render persisted while the agent was alive with an
+    # open question (files were still on disk then).
+    _write_agents_cache(
+        cache,
+        [_snapshot("agent-ghost", status="run", qa_open_ts=1250.0)],
+    )
+
+    # Files gone (empty session list → nothing on disk) → carried + frozen.
+    first = _compute_agents([], cache)
+    assert len(first) == 1
+    ghost = first[0]
+    assert ghost["status"] == "lost"
+    assert ghost["qa_open_ts"] == 0.0, "freeze must close the open question"
+    assert [1250.0, 1300.0] in ghost["qa_pauses"], (
+        "the open gap must survive as a closed pause on disk"
+    )
+
+    # The orchestrator persists the carried ghost after the render...
+    _write_agents_cache(cache, first)
+    on_disk = json.loads(cache.read_text(encoding="utf-8"))
+    assert on_disk["agent-ghost"]["status"] == "lost"
+    assert on_disk["agent-ghost"]["qa_open_ts"] == 0.0
+
+    # ...and the next render (files still absent) returns the same ghost:
+    # "lost" is terminal for the freeze-guard, so no field moves again.
+    second = _compute_agents([], cache)
+    assert second == first, (
+        f"ghost must be stable across renders; got {second!r} vs {first!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
