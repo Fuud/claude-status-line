@@ -2246,3 +2246,175 @@ def test_real_session_time_columns_invariants(fake_home_with_real_session) -> No
         f"expected at least one agent row with duration cells:\n"
         + "\n".join(agent_rows[:5])
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. Incident repro — vanished subagent files retained via cache carryover
+#     (20260905-retain-vanished-agents, Task 5). The 2026-09-05 incident,
+#     session 31a67402: CC moved a session between project dirs on a cwd
+#     change and LOST the subagents/agent-*.jsonl files; the next render
+#     then dropped those agents from BOTH the table and the agents cache
+#     (the cache was a pure mirror of the disk scan — the data was in our
+#     hands and we erased it ourselves). The tests below reproduce the loss
+#     against the REAL render pipeline (`_main_unsafe(now=…)`, frozen clock)
+#     on an isolated fake home: Path.home → tmp_path is the same cache
+#     isolation mechanism as the fake_home_with_real_session fixture, taken
+#     in-process (per the plan's Testing Strategy) so three renders can pin
+#     three different `now` values — impossible across a subprocess
+#     boundary, and required by the freeze assertions below. The session
+#     content is synthetic (built in tmp dirs) because the repro needs a
+#     CONTROLED victim: a running agent with an open AskUserQuestion, plus
+#     an untouched survivor — the gitignored real_session fixture cannot
+#     guarantee either shape.
+# ---------------------------------------------------------------------------
+
+INCIDENT_SID = "31a67402-0000-4000-8000-000000000005"
+
+_INCIDENT_SURVIVOR_DESC = "Survivor: still on disk"
+_INCIDENT_VICTIM_DESC = "Victim: runner with open QA"
+
+# Timeline (seconds from the frozen base _FROZEN_BASE):
+#   main turn ............. [0, 60]    one finished turn, idle afterwards
+#   survivor (ok) ......... [60, 360]  stays on disk for the whole test
+#   victim (run + open QA)  user at 60, AskUserQuestion at 1800 — the last
+#                             event, so qa_open_ts == ts_last == 1800
+# Renders: R1 now=1800 (everything on disk, cache fills), R2 now=5400
+# (victim's files deleted after R1), R3 now=9000 (freeze check).
+#
+# Frozen victim geometry after the loss: carryover closes the open question
+# (qa_open_ts → 0.0; the [1800, 1800] fold is empty because ts_last is NOT
+# strictly ahead of the question) and status "lost" pins life_end at
+# ts_last → work = total = 1740 → "00:29", wait = 0 → "00:00". WITHOUT the
+# question-close the open gap (now − qa_open_ts) would keep growing on
+# every render: 3600s ("01:00") at R2, 7200s ("02:00") at R3.
+_INCIDENT_VICTIM_CELLS = ["00:29", "00:00", "00:29"]
+
+
+def test_incident_repro_vanished_agents_retained_then_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """THE incident, end to end: two agents render once and fill the cache;
+    CC then loses the RUNNING agent's files on a cwd change; every later
+    render must still show the vanished agent with its last-known tokens
+    and description frozen to [lost], the on-disk survivor unchanged and
+    unduplicated — and a third, even later render must not grow the
+    vanished agent's durations."""
+    _build_synth_session(
+        tmp_path,
+        INCIDENT_SID,
+        _fz_main_done_turn(),
+        [
+            ("agent-survivor", _fz_agent_jsonl(60, 360),
+             _agent_meta(_INCIDENT_SURVIVOR_DESC, "toolu_survivor")),
+            ("agent-victim", _fz_qa_agent_jsonl(60, 1800),
+             _agent_meta(_INCIDENT_VICTIM_DESC, "toolu_victim")),
+        ],
+        encoded="incident-project",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        status_line,
+        "_PRICES_PATH",
+        tmp_path / ".claude" / "status_line" / "prices.json",
+    )
+    payload = json.dumps({"session_id": INCIDENT_SID, "model": {"display_name": "X"}})
+
+    def _render(now_offset: float) -> list[str]:
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        rc = status_line._main_unsafe(now=_fzep(now_offset))
+        assert rc == 0
+        return capsys.readouterr().out.splitlines()
+
+    # --- R1 (now=1800): everything on disk; the cache fills with BOTH
+    # agents, including the victim's open-question stamp.
+    first = _render(1800)
+    assert len(first) == 7, (
+        f"expected 7 lines (header, labels, start, sum, main, 2 agents), "
+        f"got {len(first)}: {first!r}"
+    )
+    survivor_row = next(l for l in first if _INCIDENT_SURVIVOR_DESC in l)
+    victim_row = next(l for l in first if _INCIDENT_VICTIM_DESC in l)
+    assert survivor_row.split()[1] == "[ok]", f"survivor row: {survivor_row!r}"
+    assert victim_row.split()[1] == "[run]", f"victim row: {victim_row!r}"
+    agents_cache_path = (
+        tmp_path / ".claude" / "status_line" / "data" / f"agents_{INCIDENT_SID}.json"
+    )
+    cached = json.loads(agents_cache_path.read_text(encoding="utf-8"))
+    assert set(cached) == {"agent-survivor", "agent-victim"}
+    assert cached["agent-victim"]["status"] == "run"
+    assert cached["agent-victim"]["qa_open_ts"] == _fzep(1800), (
+        "pre-incident render must persist the open question stamp"
+    )
+    # Last-known token cells for the assertions below (in=50 out=5 cached=0
+    # — the AskUserQuestion event's usage).
+    victim_tokens = victim_row.split()[-6:-3]
+
+    # --- THE INCIDENT: CC moves the session (cwd change) and loses the
+    # running agent's files.
+    subagents_dir = (
+        tmp_path / ".claude" / "projects" / "incident-project" / INCIDENT_SID
+        / "subagents"
+    )
+    (subagents_dir / "agent-victim.jsonl").unlink()
+    (subagents_dir / "agent-victim.meta.json").unlink()
+
+    # --- R2 (now=5400, much later): the vanished agent is STILL rendered,
+    # from the cache, with its last-known state.
+    second = _render(5400)
+    assert len(second) == 7, (
+        f"the vanished agent's row must survive the file loss; "
+        f"got {len(second)} lines: {second!r}"
+    )
+    victim2 = next(l for l in second if _INCIDENT_VICTIM_DESC in l)
+    assert victim2.split()[1] == "[lost]", (
+        f"vanished runner must freeze to [lost]; got: {victim2!r}"
+    )
+    assert victim2.split()[-6:-3] == victim_tokens == ["50", "5", "0"], (
+        f"last-known tokens must survive the loss: {victim2!r}"
+    )
+    assert victim2.split()[-3:] == _INCIDENT_VICTIM_CELLS, (
+        f"vanished agent's durations must be frozen at the loss moment "
+        f"(would be 01:00 wait without the question-close): {victim2!r}"
+    )
+    # The surviving on-disk agent renders UNCHANGED: byte-identical row
+    # (its ok-durations were already pinned at ts_last, and the icon-width
+    # normalization keeps the column layout stable across the victim's
+    # [run]→[lost] transition).
+    survivor2 = next(l for l in second if _INCIDENT_SURVIVOR_DESC in l)
+    assert survivor2 == survivor_row, (
+        f"survivor row changed after the incident:\n"
+        f"before: {survivor_row!r}\nafter:  {survivor2!r}"
+    )
+    # No duplicate rows: exactly two agent rows, each description once.
+    assert sum(1 for l in second if l.startswith("| [")) == 2, (
+        f"expected exactly 2 agent rows, got:\n{second!r}"
+    )
+    assert sum(_INCIDENT_SURVIVOR_DESC in l for l in second) == 1, (
+        f"survivor must appear exactly once, got:\n{second!r}"
+    )
+    assert sum(_INCIDENT_VICTIM_DESC in l for l in second) == 1, (
+        f"vanished victim must appear exactly once, got:\n{second!r}"
+    )
+    # Carried tokens still count toward the session totals (spend history
+    # survives the loss): main 100/10 + survivor 50/5 + victim 50/5.
+    sum1 = next(l for l in first if l.startswith("| sum:")).split()
+    sum2 = next(l for l in second if l.startswith("| sum:")).split()
+    assert sum1[2:5] == sum2[2:5] == ["200", "20", "0"], (
+        f"sum tokens must be unchanged by the loss: {sum1!r} vs {sum2!r}"
+    )
+    # The retention store round-trips: the ghost is re-persisted with the
+    # frozen state (status lost, open question closed).
+    cached2 = json.loads(agents_cache_path.read_text(encoding="utf-8"))
+    assert set(cached2) == {"agent-survivor", "agent-victim"}
+    assert cached2["agent-victim"]["status"] == "lost"
+    assert cached2["agent-victim"]["qa_open_ts"] == 0.0
+
+    # --- R3 (now=9000, even later): the vanished agent's durations do NOT
+    # grow — the whole row stays byte-identical to R2.
+    third = _render(9000)
+    assert len(third) == 7, f"unexpected line count: {third!r}"
+    victim3 = next(l for l in third if _INCIDENT_VICTIM_DESC in l)
+    assert victim3 == victim2, (
+        f"vanished agent's row must be frozen across renders:\n"
+        f"R2: {victim2!r}\nR3: {victim3!r}"
+    )
