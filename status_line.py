@@ -2700,7 +2700,31 @@ def _compute_agents(
     compute_agent_snapshot: an agentId already produced by an earlier
     directory is skipped, so the first directory wins and a duplicate is
     never parsed twice. A directory without `subagents/` is skipped (the
-    rest of the list still runs); an empty list → [].
+    rest of the list still runs); an empty list scans nothing on disk, so
+    the result is ONLY the agents carried over from the cache (next
+    paragraph).
+
+    Carryover of vanished agents (plan 20260905-retain-vanished-agents):
+    CC can lose agent-*.jsonl files when a session moves between project
+    dirs (cwd change) — the scan cannot resurrect files that are gone, but
+    the cache still holds those agents' last known snapshots. AFTER the
+    disk scan and BEFORE the queue override, every cache entry whose
+    agentId was NOT seen on disk is appended as `{**entry, "agentId":
+    agent_id}` — tokens, times, description and toolUseId survive the
+    loss, and the terminal statuses (ok/err/stop/kill) carry over
+    unchanged. Invariant: a snapshot originates on disk OR in the cache,
+    never both — seen_agent_ids (the multi-dir dedup key) doubles as the
+    carryover guard, so an agent still on disk is never duplicated. A
+    carried status of "run" (or a missing status) is frozen into the
+    terminal "lost": without its files the agent physically cannot be
+    working, while a live "run" would keep stretching life_end to `now`
+    in _agent_time_segments forever. The freeze also CLOSES the open
+    question: qa_open_ts folds into the closed pause [qa_open_ts,
+    ts_last] (when ts_last is ahead) and resets to 0.0 — the qa_open_ts
+    branch in _agent_time_segments is evaluated BEFORE the status check,
+    so a lingering open ts would grow the wait column (now − qa_open_ts,
+    uncapped) on every render. Corrupt cache entries (not a dict) are
+    skipped.
 
     After building all snapshots, apply the orchestrator-level queue override
     to the MERGED list: for each agent whose `agentId` (with the `agent-`
@@ -2724,7 +2748,9 @@ def _compute_agents(
             be iterated character by character and silently yield no
             agents).
         agents_cache_path: cache file holding previous per-agent snapshots,
-            used to short-circuit re-parse when file mtimes haven't changed.
+            used to short-circuit re-parse when file mtimes haven't changed
+            and to carry over agents whose files have vanished from every
+            session dir (see the carryover paragraph above).
         task_notifications: dict mapping `<task-id>` → one of {"ok","kill","err"}
             (extracted from `<task-notification>` queue-operation events in the
             main jsonl by compute_main_cum). May be empty or None.
@@ -2750,6 +2776,30 @@ def _compute_agents(
             cache_entry = agents_cache.get(agent_id)
             snapshot = compute_agent_snapshot(jsonl_path, meta_path, cache_entry)
             agents.append(snapshot)
+
+    # Carryover of vanished agents (see the docstring's carryover
+    # paragraph): agents the disk scan did NOT see are appended from the
+    # cache with their last known state. The freeze to "lost" closes the
+    # open question via the SAME [start, end] fold _agent_time_segments
+    # applies when a question is answered — _to_float guards a corrupted
+    # cache the same way the read path does.
+    for agent_id, entry in agents_cache.items():
+        if agent_id in seen_agent_ids or not isinstance(entry, dict):
+            continue
+        carried = {**entry, "agentId": agent_id}
+        if carried.get("status") in (None, "run"):
+            carried["status"] = "lost"
+            # close the open question, else wait grows forever
+            # (_agent_time_segments checks qa_open_ts BEFORE status)
+            qa_open = _to_float(carried.get("qa_open_ts")) or 0.0
+            ts_last = _to_float(carried.get("ts_last")) or 0.0
+            if qa_open > 0.0:
+                if ts_last > qa_open:
+                    pauses = carried.get("qa_pauses")
+                    if isinstance(pauses, list):
+                        pauses.append([qa_open, ts_last])
+                carried["qa_open_ts"] = 0.0
+        agents.append(carried)
 
     # Orchestrator-level queue override (with err/stop guard). See [deviation]
     # note above for why this lives here, not in compute_agent_snapshot.

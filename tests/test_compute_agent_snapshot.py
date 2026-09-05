@@ -48,7 +48,9 @@ import status_line
 from status_line import (
     _AGENT_CACHE_FIELDS,
     _STATUS_REV,
+    _agent_time_segments,
     _compute_agents,
+    _write_agents_cache,
     compute_agent_snapshot,
 )
 
@@ -1599,6 +1601,248 @@ def test_compute_agents_queue_override_reaches_second_dir_agent(
     )
     # the notification targets only bbb — aaa keeps its snapshot status
     assert statuses["agent-aaa"] == "run"
+
+
+# ---------------------------------------------------------------------------
+# _compute_agents cache carryover of vanished agents
+# (added per 20260905-retain-vanished-agents: CC loses agent-*.jsonl files
+# when a session moves between project dirs with a cwd change — the cache
+# is then the only holder of those agents' last known snapshots, so agents
+# present in the cache but NOT on disk are carried into the output)
+# ---------------------------------------------------------------------------
+
+
+def _vanish_agent_files(session_dir: Path, agent_id: str) -> None:
+    """Delete an agent's jsonl + meta from session_dir/subagents/ — the
+    on-disk simulation of CC losing the files during a session move (the
+    incident that motivated the carryover)."""
+    (session_dir / "subagents" / f"{agent_id}.jsonl").unlink()
+    (session_dir / "subagents" / f"{agent_id}.meta.json").unlink()
+
+
+def test_compute_agents_carries_over_vanished_agent_last_known_state(
+    tmp_path: Path,
+) -> None:
+    """Agent files vanish AFTER the cache was written → the agent stays in
+    the output with its last known tokens/description/toolUseId, and a
+    TERMINAL status ("ok") is carried unchanged (no freeze needed — the
+    agent had already finished)."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_OK, META_NORMAL
+    )
+    first = _compute_agents(session_dir, agents_cache)
+    assert len(first) == 1
+    # The orchestrator (main) owns cache persistence — seed it the way a
+    # real first render does.
+    _write_agents_cache(agents_cache, first)
+    _vanish_agent_files(session_dir, agent_id)
+
+    second = _compute_agents(session_dir, agents_cache)
+
+    assert len(second) == 1, (
+        f"vanished agent must survive via cache carryover; got {second!r}"
+    )
+    carried = second[0]
+    assert carried["agentId"] == agent_id
+    for field in (
+        "status",
+        "tokens_in",
+        "tokens_out",
+        "tokens_cached",
+        "models",
+        "description",
+        "toolUseId",
+    ):
+        assert carried[field] == first[0][field], (
+            f"{field} must survive the loss: "
+            f"cache had {first[0][field]!r}, got {carried[field]!r}"
+        )
+    assert carried["status"] == "ok"
+
+
+def test_compute_agents_freezes_vanished_running_agent_to_lost(
+    tmp_path: Path,
+) -> None:
+    """Cache says "run" but the files are gone → the carried status is
+    frozen to "lost": without its files the agent physically cannot be
+    working, while a live "run" would keep stretching its durations to
+    `now` in _agent_time_segments forever."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+    first = _compute_agents(session_dir, agents_cache)
+    assert first[0]["status"] == "run"
+    _write_agents_cache(agents_cache, first)
+    _vanish_agent_files(session_dir, agent_id)
+
+    second = _compute_agents(session_dir, agents_cache)
+
+    assert len(second) == 1
+    assert second[0]["status"] == "lost", (
+        f"vanished run must freeze to lost; got {second[0]['status']!r}"
+    )
+
+
+def test_compute_agents_lost_freeze_closes_open_question(
+    tmp_path: Path,
+) -> None:
+    """Freezing to "lost" must CLOSE the open question: qa_open_ts folds
+    into a closed [qa_open_ts, ts_last] pause and resets to 0.0. The
+    qa_open_ts branch in _agent_time_segments is evaluated BEFORE the
+    status check, so a lingering open ts would add (now − qa_open_ts) to
+    the wait column on every render, growing without bound. With the
+    question closed, two _agent_time_segments calls with different `now`
+    must agree — the vanished agent's durations are frozen."""
+    agents_cache = tmp_path / "agents_cache.json"
+    ts_first, qa_open, ts_last = 1000.0, 2000.0, 2500.0
+    # A cache-only agent (files already gone): seeded directly via
+    # _write_agents_cache, the same shape a real first render persists.
+    ghost = {
+        "agentId": "agent-ghost",
+        "status": "run",
+        "status_rev": _STATUS_REV,
+        "tokens_in": 1,
+        "tokens_out": 2,
+        "tokens_cached": 3,
+        "models": {},
+        "description": "ghost agent",
+        "toolUseId": "toolu_ghost",
+        "last_uuid": "ghost-uuid",
+        "mtime_jsonl": 111.0,
+        "mtime_meta": 112.0,
+        "ts_first": ts_first,
+        "ts_last": ts_last,
+        "qa_pauses": [[1500.0, 1600.0]],
+        "qa_open_ts": qa_open,
+    }
+    _write_agents_cache(agents_cache, [ghost])
+    session_dir = tmp_path / "session-abc"  # exists, but has no subagents/
+
+    agents = _compute_agents(session_dir, agents_cache)
+
+    carried = agents[0]
+    assert carried["status"] == "lost"
+    assert carried["qa_open_ts"] == 0.0, (
+        "freeze must close the open question (qa_open_ts → 0.0)"
+    )
+    assert [qa_open, ts_last] in carried["qa_pauses"], (
+        f"the open gap must fold into a closed pause; "
+        f"qa_pauses={carried['qa_pauses']!r}"
+    )
+    # Frozen durations: later `now` must not change wait/total. The pause
+    # list holds [1500,1600] (100s) + the folded [2000,2500] (500s).
+    seg_early = _agent_time_segments(carried, now=10_000.0)
+    seg_late = _agent_time_segments(carried, now=20_000.0)
+    assert seg_early is not None and seg_late is not None
+    assert seg_early[2] == seg_late[2] == 600.0, (
+        f"wait must be frozen at 600.0s; got {seg_early[2]!r} / {seg_late[2]!r}"
+    )
+    assert seg_early[3] == seg_late[3] == ts_last - ts_first, (
+        f"total must be frozen at ts_last−ts_first; "
+        f"got {seg_early[3]!r} / {seg_late[3]!r}"
+    )
+
+
+def test_compute_agents_carries_entry_without_status_as_lost(
+    tmp_path: Path,
+) -> None:
+    """A cache entry with NO "status" key is carried as "lost" (freeze-guard
+    treats a missing status like "run": its outcome is unknown). Also locks
+    the empty-list contract: with no session dirs to scan, the output is
+    ONLY the agents carried over from the cache."""
+    agents_cache = tmp_path / "agents_cache.json"
+    entry = {
+        # deliberately no "status" key
+        "status_rev": _STATUS_REV,
+        "tokens_in": 5,
+        "tokens_out": 6,
+        "tokens_cached": 7,
+        "models": {},
+        "description": "statusless ghost",
+        "toolUseId": "toolu_statusless",
+        "last_uuid": "u",
+        "mtime_jsonl": 1.0,
+        "mtime_meta": 1.0,
+        "ts_first": 100.0,
+        "ts_last": 200.0,
+        "qa_pauses": [],
+        "qa_open_ts": 0.0,
+    }
+    _write_agents_cache(agents_cache, [{"agentId": "agent-x", **entry}])
+
+    agents = _compute_agents([], agents_cache)
+
+    assert len(agents) == 1
+    assert agents[0]["agentId"] == "agent-x"
+    assert agents[0]["status"] == "lost", (
+        f"missing status must freeze to lost; got {agents[0]['status']!r}"
+    )
+
+
+def test_compute_agents_no_duplicate_for_agent_still_on_disk(
+    tmp_path: Path,
+) -> None:
+    """Agent still on disk + a cache entry for it → exactly ONE snapshot:
+    carryover dedups by seen_agent_ids (the same key the multi-dir merge
+    uses), so a present agent is never duplicated from the cache."""
+    session_dir, agents_cache, agent_id = _make_session_with_agent(
+        tmp_path, AGENT_RUNNING, META_NORMAL
+    )
+    first = _compute_agents(session_dir, agents_cache)
+    _write_agents_cache(agents_cache, first)
+
+    second = _compute_agents(session_dir, agents_cache)
+
+    assert len(second) == 1, (
+        f"on-disk agent must not be duplicated from cache; got "
+        f"{[a['agentId'] for a in second]!r}"
+    )
+    assert second[0]["agentId"] == agent_id
+    assert second[0]["status"] == "run", (
+        "the disk scan's snapshot must win for a present agent"
+    )
+
+
+def test_compute_agents_skips_non_dict_cache_entry_in_carryover(
+    tmp_path: Path,
+) -> None:
+    """A corrupt cache entry (not a dict — here a list) is skipped without
+    a crash; the valid sibling entry is still carried. The junk entry is
+    written straight to the cache file because _write_agents_cache only
+    ever produces dict entries."""
+    agents_cache = tmp_path / "agents_cache.json"
+    valid_entry = {
+        "status": "ok",
+        "status_rev": _STATUS_REV,
+        "tokens_in": 1,
+        "tokens_out": 1,
+        "tokens_cached": 1,
+        "models": {},
+        "description": "valid ghost",
+        "toolUseId": "toolu_valid",
+        "last_uuid": "u",
+        "mtime_jsonl": 1.0,
+        "mtime_meta": 1.0,
+        "ts_first": 100.0,
+        "ts_last": 200.0,
+        "qa_pauses": [],
+        "qa_open_ts": 0.0,
+    }
+    cache_payload = {
+        "agent-junk": ["not", "a", "dict"],
+        "agent-valid": valid_entry,
+    }
+    agents_cache.write_text(
+        json.dumps(cache_payload), encoding="utf-8"
+    )
+    session_dir = tmp_path / "session-abc"  # no subagents/ at all
+
+    agents = _compute_agents(session_dir, agents_cache)
+
+    assert [a["agentId"] for a in agents] == ["agent-valid"], (
+        f"junk entry must be skipped, valid one carried; got "
+        f"{[a['agentId'] for a in agents]!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
