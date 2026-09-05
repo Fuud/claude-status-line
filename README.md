@@ -100,6 +100,10 @@ wider than the other rows suggested.
 | `[stop]` | `meta.stoppedByUser=true` OR user event with         |
 |          | `[Request interrupted by user]` marker               |
 | `[run]`  | mid-flow (last assistant had `stop_reason=tool_use`) |
+| `[kill]` | queue-kill override from a main-log                  |
+|          | `<status>killed</status>` task-notification          |
+| `[lost]` | agent files vanished from all session dirs —         |
+|          | carried from the agents cache (see Edge cases)       |
 
 The `[err]` markers (`error` / `isApiErrorMessage` / `apiErrorStatus>=400`)
 are looked up BOTH inside `message` (legacy event shape) AND at the event
@@ -402,6 +406,14 @@ Both files are written atomically (`.tmp` → `os.replace()`).
   copy): all matching dirs are resolved, agents merged across them, and
   duplicates deduped by `agentId` — the `transcript_path`'s dir wins;
   without a `transcript_path`, glob order decides.
+- **Vanished agent files** (CC can delete `subagents/agent-*.jsonl`
+  when a session changes cwd or is restarted — observed 2026-09-05: the
+  session files move between project folders while the agent files are
+  lost): vanished agents are retained from the per-session agents cache
+  with their last-known status/tokens/time; a vanished running agent is
+  frozen to `[lost]` (its open question is closed, so the wait column
+  stops growing); the rows live until the session ends; if a file
+  returns to disk, the fresh scan wins.
 - **Missing/invalid `prices.json`** (no file, broken JSON, non-list,
   invalid entry): `load_prices` returns `None` → the model/cost columns
   are absent, the plain layout renders. Same for an unset

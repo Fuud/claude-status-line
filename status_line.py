@@ -42,6 +42,22 @@ Module-level invariants:
   agent.status="kill" when a main-log queue-operation task-notification with
   <status>killed</status> is present and the compute_agent_snapshot verdict
   is not "err" or "stop" (see plan 20260824-subagent-status-via-queue-notifications).
+- The full agent-status vocabulary is {ok, run, err, stop, kill, lost}.
+  detect_status itself returns only {ok, run, err, stop}; "kill" comes from
+  the queue-notification override above, and "lost" originates ONLY from
+  the cache-carryover branch in _compute_agents (plan
+  20260905-retain-vanished-agents) — never from detect_status. When CC
+  deletes an agent's files (subagents/agent-*.jsonl vanish from ALL
+  session dirs on a cwd change), the agent is re-emitted from the agents
+  cache with its last known tokens/times; a carried "run" (or missing)
+  status is frozen to the terminal "lost" and its open AskUserQuestion
+  is closed, so the agent's durations stop growing. Known limitations:
+  carried ghosts never expire (they live in the cache and the table for
+  the session's lifetime); status_rev re-classification cannot apply to
+  ghosts (there is no file to rescan — the status stays as of the freeze
+  moment); a session with NO session dirs at all shows no ghosts (the
+  orchestrator's `if session_dirs:` gate skips carryover and leaves the
+  cache untouched).
 """
 
 from __future__ import annotations
@@ -2590,7 +2606,11 @@ _STATUS_REV = 2
 # bookkeeping, plan 20260827-status-line-time-columns): they persist so
 # cache-HIT cycles can still extend live work windows and split waits;
 # their presence is likewise part of the hit check (pre-time-column
-# caches rebuild once). The derived time_work/time_wait/time_total rows
+# caches rebuild once). Since plan 20260905-retain-vanished-agents the
+# cache also doubles as the retention store for vanished agents: entries
+# whose files disappeared from all session dirs are carried into the
+# output by _compute_agents and written back here, round-tripping these
+# fields unchanged. The derived time_work/time_wait/time_total rows
 # are injected AFTER the cache write and are deliberately NOT here.
 _AGENT_CACHE_FIELDS = (
     "last_uuid",
