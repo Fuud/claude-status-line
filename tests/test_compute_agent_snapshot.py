@@ -1309,6 +1309,35 @@ def _make_session_with_agent(
     return session_dir, agents_cache, agent_id
 
 
+def _ghost(**overrides) -> dict:
+    """Build a cache-only agent snapshot (its files are already gone) for
+    the carryover tests: seeded via _write_agents_cache, the same shape a
+    real first render persists. Defaults mirror the freeze tests' ghost
+    (lifetime 1000→2500, an open question at 2000); each dict literal is
+    fresh per call, so tests may pass junk overrides (qa_pauses="not a
+    list") or delete keys without touching other ghosts."""
+    base = {
+        "agentId": "agent-ghost",
+        "status": "run",
+        "status_rev": _STATUS_REV,
+        "tokens_in": 1,
+        "tokens_out": 2,
+        "tokens_cached": 3,
+        "models": {},
+        "description": "ghost agent",
+        "toolUseId": "toolu_ghost",
+        "last_uuid": "ghost-uuid",
+        "mtime_jsonl": 111.0,
+        "mtime_meta": 112.0,
+        "ts_first": 1000.0,
+        "ts_last": 2500.0,
+        "qa_pauses": [],
+        "qa_open_ts": 2000.0,
+    }
+    base.update(overrides)
+    return base
+
+
 def test_compute_agents_no_task_notifications_backwards_compat(
     tmp_path: Path,
 ) -> None:
@@ -1558,7 +1587,9 @@ def test_compute_agents_single_str_path_is_normalized(tmp_path: Path) -> None:
     assert agents[0]["status"] == "run"
 
 
-def test_compute_agents_empty_dirs_list_returns_empty(tmp_path: Path) -> None:
+def test_compute_agents_empty_dirs_and_no_cache_returns_empty(
+    tmp_path: Path,
+) -> None:
     """An empty list of session dirs with NO cache file → no agents (no
     crash). The empty-list contract changed with the vanished-agent
     carryover: a POPULATED cache now yields only its carried ghosts
@@ -1705,24 +1736,12 @@ def test_compute_agents_lost_freeze_closes_open_question(
     ts_first, qa_open, ts_last = 1000.0, 2000.0, 2500.0
     # A cache-only agent (files already gone): seeded directly via
     # _write_agents_cache, the same shape a real first render persists.
-    ghost = {
-        "agentId": "agent-ghost",
-        "status": "run",
-        "status_rev": _STATUS_REV,
-        "tokens_in": 1,
-        "tokens_out": 2,
-        "tokens_cached": 3,
-        "models": {},
-        "description": "ghost agent",
-        "toolUseId": "toolu_ghost",
-        "last_uuid": "ghost-uuid",
-        "mtime_jsonl": 111.0,
-        "mtime_meta": 112.0,
-        "ts_first": ts_first,
-        "ts_last": ts_last,
-        "qa_pauses": [[1500.0, 1600.0]],
-        "qa_open_ts": qa_open,
-    }
+    ghost = _ghost(
+        ts_first=ts_first,
+        ts_last=ts_last,
+        qa_open_ts=qa_open,
+        qa_pauses=[[1500.0, 1600.0]],
+    )
     _write_agents_cache(agents_cache, [ghost])
     session_dir = tmp_path / "session-abc"  # exists, but has no subagents/
 
@@ -1754,36 +1773,32 @@ def test_compute_agents_lost_freeze_closes_open_question(
 def test_compute_agents_carries_entry_without_status_as_lost(
     tmp_path: Path,
 ) -> None:
-    """A cache entry with NO "status" key is carried as "lost" (freeze-guard
-    treats a missing status like "run": its outcome is unknown). Also locks
-    the empty-list contract: with no session dirs to scan, the output is
-    ONLY the agents carried over from the cache."""
+    """A cache entry with no usable status — the key MISSING, or a
+    hand-corrupted present-but-falsy EMPTY STRING — is carried as "lost"
+    (the freeze-guard treats both encodings of "no information" like
+    "run": the outcome is unknown; an unfrozen "" would otherwise render
+    "[?]" forever). Also locks the empty-list contract: with no session
+    dirs to scan, the output is ONLY the agents carried over from the
+    cache."""
     agents_cache = tmp_path / "agents_cache.json"
-    entry = {
-        # deliberately no "status" key
-        "status_rev": _STATUS_REV,
-        "tokens_in": 5,
-        "tokens_out": 6,
-        "tokens_cached": 7,
-        "models": {},
-        "description": "statusless ghost",
-        "toolUseId": "toolu_statusless",
-        "last_uuid": "u",
-        "mtime_jsonl": 1.0,
-        "mtime_meta": 1.0,
-        "ts_first": 100.0,
-        "ts_last": 200.0,
-        "qa_pauses": [],
-        "qa_open_ts": 0.0,
-    }
-    _write_agents_cache(agents_cache, [{"agentId": "agent-x", **entry}])
+    ghost_x = _ghost(
+        agentId="agent-x",
+        description="statusless ghost",
+        toolUseId="toolu_statusless",
+    )
+    # deliberately no "status" key
+    del ghost_x["status"]
+    ghost_y = _ghost(
+        agentId="agent-y", description="empty-status ghost", status=""
+    )
+    _write_agents_cache(agents_cache, [ghost_x, ghost_y])
 
     agents = _compute_agents([], agents_cache)
 
-    assert len(agents) == 1
-    assert agents[0]["agentId"] == "agent-x"
-    assert agents[0]["status"] == "lost", (
-        f"missing status must freeze to lost; got {agents[0]['status']!r}"
+    statuses = {a["agentId"]: a["status"] for a in agents}
+    assert statuses == {"agent-x": "lost", "agent-y": "lost"}, (
+        f"both no-information status encodings must freeze to lost; "
+        f"got {statuses!r}"
     )
 
 
@@ -1819,23 +1834,12 @@ def test_compute_agents_skips_non_dict_cache_entry_in_carryover(
     written straight to the cache file because _write_agents_cache only
     ever produces dict entries."""
     agents_cache = tmp_path / "agents_cache.json"
-    valid_entry = {
-        "status": "ok",
-        "status_rev": _STATUS_REV,
-        "tokens_in": 1,
-        "tokens_out": 1,
-        "tokens_cached": 1,
-        "models": {},
-        "description": "valid ghost",
-        "toolUseId": "toolu_valid",
-        "last_uuid": "u",
-        "mtime_jsonl": 1.0,
-        "mtime_meta": 1.0,
-        "ts_first": 100.0,
-        "ts_last": 200.0,
-        "qa_pauses": [],
-        "qa_open_ts": 0.0,
-    }
+    valid_entry = _ghost(
+        agentId="agent-valid",
+        status="ok",
+        description="valid ghost",
+        toolUseId="toolu_valid",
+    )
     cache_payload = {
         "agent-junk": ["not", "a", "dict"],
         "agent-valid": valid_entry,
@@ -1971,24 +1975,13 @@ def test_compute_agents_terminal_ghost_open_question_also_closed(
     wait column on every render — unbounded growth for a ghost that can
     never be answered."""
     agents_cache = tmp_path / "agents_cache.json"
-    ghost = {
-        "agentId": "agent-killed",
-        "status": "kill",  # terminal — the lost freeze must NOT touch it
-        "status_rev": _STATUS_REV,
-        "tokens_in": 1,
-        "tokens_out": 2,
-        "tokens_cached": 3,
-        "models": {},
-        "description": "killed while asking",
-        "toolUseId": "toolu_killed",
-        "last_uuid": "u-killed",
-        "mtime_jsonl": 111.0,
-        "mtime_meta": 112.0,
-        "ts_first": 1000.0,
-        "ts_last": 2500.0,
-        "qa_pauses": [],
-        "qa_open_ts": 2000.0,
-    }
+    ghost = _ghost(
+        agentId="agent-killed",
+        status="kill",  # terminal — the lost freeze must NOT touch it
+        description="killed while asking",
+        toolUseId="toolu_killed",
+        last_uuid="u-killed",
+    )
     _write_agents_cache(agents_cache, [ghost])
     session_dir = tmp_path / "session-abc"  # exists, but has no subagents/
 
@@ -2025,24 +2018,14 @@ def test_compute_agents_lost_freeze_with_question_as_last_event(
     ts_last is the only anchor — but must then stay FROZEN: no residual
     open ts, no growth across renders, no crash."""
     agents_cache = tmp_path / "agents_cache.json"
-    ghost = {
-        "agentId": "agent-hanging",
-        "status": "run",
-        "status_rev": _STATUS_REV,
-        "tokens_in": 1,
-        "tokens_out": 2,
-        "tokens_cached": 3,
-        "models": {},
-        "description": "hung on a question",
-        "toolUseId": "toolu_hanging",
-        "last_uuid": "u-hanging",
-        "mtime_jsonl": 111.0,
-        "mtime_meta": 112.0,
-        "ts_first": 1000.0,
-        "ts_last": 2000.0,  # == qa_open: question is the last event
-        "qa_pauses": [[1500.0, 1600.0]],
-        "qa_open_ts": 2000.0,
-    }
+    ghost = _ghost(
+        agentId="agent-hanging",
+        description="hung on a question",
+        toolUseId="toolu_hanging",
+        last_uuid="u-hanging",
+        ts_last=2000.0,  # == qa_open: the question is the last event
+        qa_pauses=[[1500.0, 1600.0]],
+    )
     _write_agents_cache(agents_cache, [ghost])
     session_dir = tmp_path / "session-abc"
 
@@ -2077,24 +2060,13 @@ def test_compute_agents_lost_freeze_junk_qa_pauses_drops_fold(
     is closed even when the pause list is unusable; _agent_time_segments'
     own isinstance guard then treats the junk as no pauses at all."""
     agents_cache = tmp_path / "agents_cache.json"
-    ghost = {
-        "agentId": "agent-junkpauses",
-        "status": "run",
-        "status_rev": _STATUS_REV,
-        "tokens_in": 1,
-        "tokens_out": 2,
-        "tokens_cached": 3,
-        "models": {},
-        "description": "junk pauses ghost",
-        "toolUseId": "toolu_junk",
-        "last_uuid": "u-junk",
-        "mtime_jsonl": 111.0,
-        "mtime_meta": 112.0,
-        "ts_first": 1000.0,
-        "ts_last": 2500.0,
-        "qa_pauses": "definitely not a list",
-        "qa_open_ts": 2000.0,
-    }
+    ghost = _ghost(
+        agentId="agent-junkpauses",
+        description="junk pauses ghost",
+        toolUseId="toolu_junk",
+        last_uuid="u-junk",
+        qa_pauses="definitely not a list",  # junk: the fold must drop
+    )
     _write_agents_cache(agents_cache, [ghost])
     session_dir = tmp_path / "session-abc"
 

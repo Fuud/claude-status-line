@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 import status_line
-from status_line import _parse_ts
+from status_line import _STATUS_REV, _parse_ts
 
 FIXTURES = Path(__file__).parent / "fixtures"
 REAL_SESSION_SID = "f5044e4f-3e01-4330-be72-eb008a1d035e"
@@ -995,21 +995,15 @@ def test_dirless_session_skips_agents_cache_write(tmp_path: Path) -> None:
     assert (data_dir / f"main_{DIRLESS_SID}.json").exists()
 
 
-def test_dirless_session_with_ghost_cache_hides_agents_and_keeps_cache(
-    tmp_path: Path,
-) -> None:
-    """Dirless degradation with a POPULATED agents cache (retained ghosts
-    from before the session dirs vanished): the orchestrator's
-    `if session_dirs:` gate skips BOTH the scan and the carryover — no
-    ghost rows render (a broken gate would carry agent-ghost into the
-    table) — and the cache write is under the same gate, so the
-    retained-history file stays byte-identical: degradation without data
-    loss (the ghosts come back once session dirs exist again)."""
-    _build_dirless_session(tmp_path, DIRLESS_SID)
-    data_dir = tmp_path / ".claude" / "status_line" / "data"
-    data_dir.mkdir(parents=True)
-    ghost_entry = {
+def _ghost_cache_entry(**overrides) -> dict:
+    """A retained-ghost agents-cache entry: the last known snapshot of a
+    vanished agent, in the shape an earlier render's _write_agents_cache
+    persisted (no agentId inside — the cache file is keyed by agent id).
+    Defaults mirror the dirless-degradation ghost; tests override just
+    the bits they care about."""
+    base = {
         "status": "lost",
+        "status_rev": _STATUS_REV,
         "tokens_in": 42,
         "tokens_out": 7,
         "tokens_cached": 0,
@@ -1024,6 +1018,24 @@ def test_dirless_session_with_ghost_cache_hides_agents_and_keeps_cache(
         "qa_pauses": [],
         "qa_open_ts": 0.0,
     }
+    base.update(overrides)
+    return base
+
+
+def test_dirless_session_with_ghost_cache_hides_agents_and_keeps_cache(
+    tmp_path: Path,
+) -> None:
+    """Dirless degradation with a POPULATED agents cache (retained ghosts
+    from before the session dirs vanished): the orchestrator's
+    `if session_dirs:` gate skips BOTH the scan and the carryover — no
+    ghost rows render (a broken gate would carry agent-ghost into the
+    table) — and the cache write is under the same gate, so the
+    retained-history file stays byte-identical: degradation without data
+    loss (the ghosts come back once session dirs exist again)."""
+    _build_dirless_session(tmp_path, DIRLESS_SID)
+    data_dir = tmp_path / ".claude" / "status_line" / "data"
+    data_dir.mkdir(parents=True)
+    ghost_entry = _ghost_cache_entry()
     cache_path = data_dir / f"agents_{DIRLESS_SID}.json"
     cache_path.write_text(
         json.dumps({"agent-ghost": ghost_entry}), encoding="utf-8"
