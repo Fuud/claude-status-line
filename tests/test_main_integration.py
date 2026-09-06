@@ -1385,15 +1385,18 @@ _UNIT_PRICES_AT_HOST = [
     {"model": "glm-5.3@api.z.ai", "in": 1, "out": 1, "cache": 1, "per": 1_000_000, "units": "$"},
 ]
 
-# Fixture main jsonl per-model cumulative totals (verified against the file):
-#   kimi-k3:     in=6613240 out=265021 cached=36263168
-#   glm-5.3:     in=414451  out=16739  cached=7183936
+# Fixture main jsonl per-model cumulative totals (verified against the file,
+# with usage deduplicated by message.id per plan
+# 20260903-usage-dedup-by-message-id — split-block messages each used to
+# count their full usage again):
+#   kimi-k3:     in=2586584 out=92320 cached=16008448
+#   glm-5.3:     in=378958  out=8272  cached=2900544
 #   <synthetic>: all zero → skipped at render
-# format_tokens → "6.6M"/"265K"/"36.3M" and "414K"/"17K"/"7.2M".
-# Cost with _UNIT_PRICES = (in+out+cached)/1e6 → 43.141429 → "$43.1" and
-# 7.615126 → "$7.6".
-_MAIN_KIMI_ROW = ["|", "main:", "kimi-k3", "6.6M", "265K", "36.3M", "$43.1"]
-_MAIN_GLM_ROW = ["|", "glm-5.3", "414K", "17K", "7.2M", "$7.6"]
+# format_tokens → "2.6M"/"92K"/"16.0M" and "379K"/"8K"/"2.9M".
+# Cost with _UNIT_PRICES = (in+out+cached)/1e6 → 18.687352 → "$18.7" and
+# 3.287774 → "$3.3".
+_MAIN_KIMI_ROW = ["|", "main:", "kimi-k3", "2.6M", "92K", "16.0M", "$18.7"]
+_MAIN_GLM_ROW = ["|", "glm-5.3", "379K", "8K", "2.9M", "$3.3"]
 
 # With prices the fixture renders 45 lines: header + table header + start
 # + sum(2 models) + main(2 models) + 38 agent rows (27 kimi-k3, 6 glm-5.3,
