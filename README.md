@@ -64,6 +64,11 @@ Line layout:
   as the agent groups). Same session time triple as `sum:` — waiting on
   agents already counts as main's work (see
   [Time columns](#time-columns-work--wait--total)).
+- `[skipped N agents]` marker row — only when the session has more than
+  15 agents. Beyond the cap only the NEWEST 15 agents render (render
+  order is oldest first), and this label-only row right after `main:`
+  counts the rest. The cap is display-only: `sum:` and the session time
+  triple still aggregate EVERY agent.
 - One group per agent — `[<status>]` icon and description on the FIRST
   row of the group only. Totals are cumulative across ALL of the agent's
   events (not the last API call's usage), deduplicated by `message.id`
@@ -77,7 +82,8 @@ Per-model rows whose tokens are all zero (e.g. `<synthetic>` events)
 are skipped; a group left with no rows after that — an agent with no
 events, or one whose events are all zero-token — still renders ONE row
 with three zero cells and an empty `model` cell. Groups (and therefore
-agents) are never skipped.
+agents) are never skipped. The one exception is render-space capping,
+which is a display cap rather than a skip (see the marker row above).
 
 `cache_creation` tokens are tracked but NOT displayed and not priced.
 

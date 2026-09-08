@@ -164,14 +164,16 @@ def fake_home_with_real_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 # ---------------------------------------------------------------------------
-# 1. Real session → 43 lines (header + table header + start + sum + main + 38
-#    agents)
+# 1. Real session → 21 lines (header + table header + start + sum + main +
+#    [skipped 23 agents] marker + the 15 newest of 38 agents)
 # ---------------------------------------------------------------------------
 
 def test_real_session_38_agents(fake_home_with_real_session) -> None:
-    """Feed the real session through main(); expect 43 lines, presence of
-    [ok]/[err] tags, and 'Review implementation plan' as the first agent
-    line (lowest toolUseId position in main jsonl).
+    """Feed the real session through main(); expect 21 lines: the render cap
+    (_MAX_RENDERED_AGENTS=15) keeps only the NEWEST 15 of the 38 agents,
+    with a "[skipped 23 agents]" marker right after main:. Presence of
+    [ok]/[err] tags, and 'Fixer retry: finish findings' as the first
+    RENDERED agent line (the 24th in the oldest-first render order).
 
     [deviation] The f5044e4f session evolved after the plan was written —
     when the fixture was copied the session had no agents with
@@ -191,9 +193,10 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
     )
     output = result.stdout.decode("utf-8")
     lines = output.splitlines()
-    # header + table header + start + sum + main + 38 agents = 43
-    assert len(lines) == 43, (
-        f"expected 43 lines, got {len(lines)}; first 5: {lines[:5]}; "
+    # header + table header + start + sum + main + marker + 15 agents = 21
+    assert len(lines) == _NO_PRICES_LINE_COUNT, (
+        f"expected {_NO_PRICES_LINE_COUNT} lines, got {len(lines)}; "
+        f"first 5: {lines[:5]}; "
         f"stderr: {result.stderr.decode('utf-8', 'replace')}"
     )
     # All three status tags must appear (real session covers ok/err/stop).
@@ -212,25 +215,27 @@ def test_real_session_38_agents(fake_home_with_real_session) -> None:
     assert lines[2].startswith("| start:"), f"line 2: {lines[2]!r}"
     assert lines[3].startswith("| sum:"), f"line 3: {lines[3]!r}"
     assert lines[4].startswith("| main:"), f"line 4: {lines[4]!r}"
-    # All agent lines start with the table prefix + a bracketed status tag
-    for line in lines[5:]:
+    # The marker row sits right after main:, before any agent row.
+    assert lines[5] == "| [skipped 23 agents]", f"marker row: {lines[5]!r}"
+    # The 15 rendered agent lines start with the table prefix + a bracketed
+    # status tag
+    for line in lines[6:]:
         assert line.startswith("| ["), f"agent line missing status tag: {line!r}"
-    # The first agent in the output should be the one with the LOWEST
-    # tool_use position in main jsonl. In the f5044e4f session that's
-    # "Review implementation plan" (toolUseId=Agent_61, position 260 in
-    # the main jsonl) — not Task 1 (Agent_103, position 431). The plan's
-    # assertion "Task 1 first" assumed Task 1 was at position 0; the real
-    # session has Agent_61/62/... before Agent_103. We check for the actual
-    # first-sorted agent instead.
-    first_agent = lines[5]
-    assert "Review implementation plan" in first_agent, (
-        f"first agent should be 'Review implementation plan' (lowest toolUseId "
-        f"in main jsonl), got: {first_agent!r}"
+    # The first RENDERED agent is the 24th in the oldest-first sort order —
+    # the [err] "Fixer retry: finish findings". Everything before it
+    # ("Review: implementation" at 19th, "Review implementation plan" —
+    # toolUseId=Agent_61, the lowest position in the main jsonl — earlier
+    # still) is among the 23 SKIPPED agents and must NOT render.
+    first_agent = lines[6]
+    assert "Fixer retry: finish findings" in first_agent, (
+        f"first rendered agent should be 'Fixer retry: finish findings' "
+        f"(24th in render order, first after the cap), got: {first_agent!r}"
     )
-    # And Task 1 should appear SOMEWHERE in the output (just not first).
-    assert any("Task 1" in line for line in lines), (
-        "Task 1 should appear in the output even if not first"
+    assert "Review implementation plan" not in output, (
+        "the oldest agents are capped out of the render (only the marker "
+        "row references them)"
     )
+    assert "Task 1" not in output, "Task 1 (an early agent) is capped out too"
 
 
 # ---------------------------------------------------------------------------
@@ -451,9 +456,11 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
     )
     first_output = first.stdout.decode("utf-8")
     first_lines = first_output.splitlines()
-    assert len(first_lines) == 43, (
-        f"first call should produce 43 lines (header + table header + start + "
-        f"sum + main + 38 agents), got {len(first_lines)}; first 3: {first_lines[:3]}"
+    assert len(first_lines) == _NO_PRICES_LINE_COUNT, (
+        f"first call should produce {_NO_PRICES_LINE_COUNT} lines (header + "
+        f"table header + start + sum + main + [skipped 18 agents] marker + "
+        f"20 rendered agents), got {len(first_lines)}; "
+        f"first 3: {first_lines[:3]}"
     )
 
     # Sanity: the agents cache file must exist after the first call.
@@ -469,9 +476,10 @@ def test_second_call_after_cache(fake_home_with_real_session) -> None:
     )
     second_output = second.stdout.decode("utf-8")
     second_lines = second_output.splitlines()
-    assert len(second_lines) == 43, (
-        f"second call should also produce 43 lines (cache-hit path), "
-        f"got {len(second_lines)}; first 3: {second_lines[:3]}; "
+    assert len(second_lines) == _NO_PRICES_LINE_COUNT, (
+        f"second call should also produce {_NO_PRICES_LINE_COUNT} lines "
+        f"(cache-hit path), got {len(second_lines)}; "
+        f"first 3: {second_lines[:3]}; "
         f"this indicates compute_agent_snapshot cache-hit is missing agentId "
         f"and _write_agents_cache raised KeyError, which main() swallowed "
         f"into the fallback header"
@@ -1398,11 +1406,15 @@ _UNIT_PRICES_AT_HOST = [
 _MAIN_KIMI_ROW = ["|", "main:", "kimi-k3", "2.6M", "92K", "16.0M", "$18.7"]
 _MAIN_GLM_ROW = ["|", "glm-5.3", "379K", "8K", "2.9M", "$3.3"]
 
-# With prices the fixture renders 45 lines: header + table header + start
-# + sum(2 models) + main(2 models) + 38 agent rows (27 kimi-k3, 6 glm-5.3,
-# 5 zero-token agents as single zero rows with an empty model cell).
-_PRICES_LINE_COUNT = 45
-_NO_PRICES_LINE_COUNT = 43
+# With prices the fixture renders 23 lines: header + table header + start
+# + sum(2 models) + main(2 models) + 1 "[skipped 23 agents]" marker + 15
+# agent rows (8 kimi-k3, 6 glm-5.3, 1 zero-token agent as a single zero
+# row with an empty model cell). The render cap
+# (status_line._MAX_RENDERED_AGENTS=15) keeps only the NEWEST 15 of the
+# session's 38 agents — render order is oldest first, so the tail of the
+# sorted list renders and the head is replaced by the marker row.
+_PRICES_LINE_COUNT = 23
+_NO_PRICES_LINE_COUNT = 21
 
 
 def _write_prices(home: Path, payload: object) -> Path:
@@ -1476,11 +1488,17 @@ def test_prices_plain_key_adds_model_and_cost_columns(
     assert len(cont_got) == len(_MAIN_GLM_ROW), (
         f"continuation row must end at its cost cell: {lines[6]!r}"
     )
-    # 38 agent rows, one per agent: single-model agents collapse to one row.
-    agent_lines = lines[7:]
-    assert len(agent_lines) == 38, f"expected 38 agent rows, got {len(agent_lines)}"
+    # The render cap replaces the 23 oldest agents with a marker row (line 7,
+    # right after main's two rows); the 15 rendered agents follow, one per
+    # agent: single-model agents collapse to one row. Among the rendered 15
+    # the model mix is 8 kimi-k3 / 6 glm-5.3 / 1 zero-token agent (empty
+    # model cell) — a DIFFERENT mix than the full 38 (27/6/5), pinning that
+    # the cap keeps the tail, not a prefix.
+    assert lines[7] == "| [skipped 23 agents]", f"marker row: {lines[7]!r}"
+    agent_lines = lines[8:]
+    assert len(agent_lines) == 15, f"expected 15 agent rows, got {len(agent_lines)}"
     assert all(line.startswith("| [") for line in agent_lines)
-    assert sum(1 for l in agent_lines if "kimi-k3" in l.split()) == 27
+    assert sum(1 for l in agent_lines if "kimi-k3" in l.split()) == 8
     assert sum(1 for l in agent_lines if "glm-5.3" in l.split()) == 6
     # Zero-token <synthetic> records are never displayed (main or agents).
     assert "<synthetic>" not in output
@@ -1555,7 +1573,9 @@ def test_prices_host_key_without_env_is_na(fake_home_with_real_session) -> None:
 
 def test_prices_absent_no_columns(fake_home_with_real_session) -> None:
     """No prices.json in the (fake) home → no model/cost columns; the layout
-    is the pre-model-columns one (43 lines, plain in/out/cached header)."""
+    is the pre-model-columns one (21 lines — the capped agent rows + marker
+    keep their plain single-row-per-agent shape, plain in/out/cached
+    header)."""
     tmp_path, sid = fake_home_with_real_session
     assert not (tmp_path / ".claude" / "status_line" / "prices.json").exists()
 

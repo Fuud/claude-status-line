@@ -32,6 +32,11 @@ Module-level invariants:
   per-model records are skipped and a group left empty renders ONE zero
   row with an empty model cell (groups are never skipped). The start row
   is a reference row and never carries model/cost or time cells.
+- render_output caps agent ROWS at _MAX_RENDERED_AGENTS=15: only the
+  newest 15 agents (render order is oldest first) get rows, and a
+  label-only "[skipped N agents]" marker row follows main:. The cap is
+  display-only — sum: and the session time triple still aggregate every
+  agent.
 - The orchestrator (main() → _main_unsafe(now=time.time())) computes the
   session work/wait/total union triple (main turns + agent lifetimes,
   live-now extensions applied; AskUserQuestion pauses excluded) and each
@@ -2081,6 +2086,15 @@ _STATUSES = ("ok", "run", "err", "stop", "kill", "lost")
 # alignment is preserved.
 _TABLE_ROW_PREFIX = "| "
 
+# Cap on RENDERED agent rows (not on aggregation): beyond this many agents
+# only the most recent _MAX_RENDERED_AGENTS render (render order is oldest
+# first — sort_agents — so the tail is the newest), and a
+# "[skipped N agents]" marker row takes their place right after main:. The
+# sum: row and the session time triple still aggregate EVERY agent — the
+# cap is display-only (a 100-agent session keeps honest totals but a
+# bounded status line).
+_MAX_RENDERED_AGENTS = 15
+
 
 # Floor for the label/description column: an agent row's minimum
 # footprint — the icon padded to _ICON_COL_WIDTH plus the status gap.
@@ -2373,7 +2387,8 @@ def render_output(
         | start: <model> <in> <out> <cached> <cost>   # time cells empty
         | sum:   <model> <in> <out> <cached> <cost> work wait total
         | main:  <model> <in> <out> <cached> <cost> work wait total
-        | for each agent (in input order):
+        | [skipped N agents]   # only when N > _MAX_RENDERED_AGENTS-cap
+        | for each of the LAST _MAX_RENDERED_AGENTS agents (input order):
               [<status>]  <description>  <model> <in> <out> <cached>
               <cost> work wait total
 
@@ -2408,7 +2423,12 @@ def render_output(
     with main first), main, and each agent expand to one row PER MODEL;
     per-model records with all-zero tokens (e.g. <synthetic>) are skipped
     entirely; a group left with no rows renders ONE zero row with an
-    EMPTY model cell — groups (and therefore agents) are never skipped.
+    EMPTY model cell — groups (and therefore agents) are never skipped BY
+    DATA. Render-space capping is the one exception and is not a skip:
+    beyond _MAX_RENDERED_AGENTS only the NEWEST agents get rows (render
+    order is oldest first), a label-only "[skipped N agents]" marker row
+    sits right after main:, and the sum: row still aggregates EVERY
+    agent — display is capped, totals are not.
 
     The start row is the FIRST table row: the first assistant event's
     breakdown (the session's baseline message). It is a reference row —
@@ -2474,6 +2494,17 @@ def render_output(
     if not isinstance(main_models, dict):
         main_models = {}
 
+    # Render cap (see _MAX_RENDERED_AGENTS): `projected` keeps EVERY agent
+    # — the sum: aggregates below and the caller's session-time union
+    # already ran over the full list — while `visible` holds only the
+    # newest _MAX_RENDERED_AGENTS rows that expand into table rows. The
+    # marker row replacing the rest rides right after main: in BOTH
+    # layouts. A list at/below the cap keeps skipped_count 0 and the
+    # marker row suppressed — small sessions render exactly as before.
+    skipped_count = max(0, len(projected) - _MAX_RENDERED_AGENTS)
+    visible = projected[len(projected) - _MAX_RENDERED_AGENTS :] if skipped_count else projected
+    skipped_label = f"[skipped {skipped_count} agents]" if skipped_count else ""
+
     # 2. Column specs + rows. The label column's gap is the historical
     # 2-space description gap; token columns keep the single-space
     # separators. prices=None drops the model/cost columns entirely — but
@@ -2525,7 +2556,12 @@ def render_output(
                 *session_cells,
             ]
         )
-        for p in projected:
+        if skipped_label:
+            # Label-only marker row; the remaining cells pad to the
+            # column count so render_table's one-cell-per-column contract
+            # holds (they rstrip away — the line ends at the label).
+            rows.append([skipped_label] + [""] * (len(columns) - 1))
+        for p in visible:
             rows.append(
                 [
                     p["label"],
@@ -2588,7 +2624,10 @@ def render_output(
         rows.extend(
             _group_model_rows("main:", main_models, prices, host, session_cells)
         )
-        for p in projected:
+        if skipped_label:
+            # Label-only marker row — same shape rule as the plain layout.
+            rows.append([skipped_label] + [""] * (len(columns) - 1))
+        for p in visible:
             rows.extend(
                 _group_model_rows(p["label"], p["models"], prices, host, p["time"])
             )

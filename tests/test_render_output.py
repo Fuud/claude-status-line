@@ -7,8 +7,12 @@ agents, prices=None, host="") returns a string built as:
     | start: <in> <out> <cached>
     | sum: [<model>] <in> <out> <cached> [<cost>]  # only if len(agents) > 0
     | main: [<model>] <in> <out> <cached> [<cost>]
-    | for each agent (in input order):
+    | [skipped N agents]  # only if len(agents) > _MAX_RENDERED_AGENTS
+    | for each of the LAST _MAX_RENDERED_AGENTS agents (input order):
         "[<status>]  <description>  [<model>]  <in> <out> <cached> [<cost>]"
+
+The render cap (_MAX_RENDERED_AGENTS=15) is display-only: the sum row and
+the session time triple still aggregate EVERY agent.
 
 main_models is the per-model breakdown dict {model_id: {"in","out","cached"}}
 (the flat main_in/main_out/main_cached triple is gone — the main row's
@@ -158,20 +162,27 @@ def test_zero_agents_no_sum_line() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 38 agents → 43 lines (header + table header + start + sum + main + 38 agents)
+# 38 agents → render cap: 15 newest rows + a [skipped N agents] marker
+# (_MAX_RENDERED_AGENTS)
 # ---------------------------------------------------------------------------
 
-def test_38_agents_produce_43_lines() -> None:
-    """38 agents → 43 lines: 1 header + 1 table header + 1 start + 1 sum +
-    1 main + 38 agent lines."""
+def test_38_agents_cap_to_15_rows_plus_marker() -> None:
+    """38 agents → 21 lines: 1 header + 1 table header + 1 start + 1 sum +
+    1 main + 1 "[skipped 23 agents]" marker + 15 agent rows. The marker sits
+    right after main:, and only the NEWEST 15 agents render (render order is
+    oldest first — the tail of the sorted list)."""
+    from status_line import _MAX_RENDERED_AGENTS
+
     header = "Session: big | Branch: m | Model: X | User: u"
+    # Zero-padded descriptions — substring assertions below must not have
+    # "Agent 2" match "Agent 20".
     agents = [
         {
             "status": "ok",
             "tokens_in": (i + 1) * 10,
             "tokens_out": (i + 1) * 5,
             "tokens_cached": (i + 1) * 3,
-            "description": f"Agent {i}",
+            "description": f"Agent {i:02d}",
         }
         for i in range(38)
     ]
@@ -179,16 +190,118 @@ def test_38_agents_produce_43_lines() -> None:
     out = render_output(header, 100, 30, 200, _main(5000, 2000, 1000), agents)
     lines = out.split("\n")
 
-    assert len(lines) == 43
+    assert len(lines) == 6 + _MAX_RENDERED_AGENTS, (
+        f"expected 6 + cap lines, got {len(lines)}: {lines!r}"
+    )
     assert lines[0] == header
     # table header is line 1
     assert "in" in lines[1] and "out" in lines[1] and "cached" in lines[1]
     assert lines[2].startswith(_TABLE_ROW_PREFIX + "start:")
     assert lines[3].startswith(_TABLE_ROW_PREFIX + "sum:")
     assert lines[4].startswith(_TABLE_ROW_PREFIX + "main:")
-    # remaining 38 lines all start with the table prefix + a status tag
-    for line in lines[5:]:
+    # marker row right after main:
+    assert lines[5] == _TABLE_ROW_PREFIX + "[skipped 23 agents]", lines[5]
+    # remaining 15 lines all start with the table prefix + a status tag
+    for line in lines[6:]:
         assert line.startswith(_TABLE_ROW_PREFIX + "[")
+    # the NEWEST 15 render (Agent 23..37), the oldest 23 do not
+    assert "Agent 23" in out and "Agent 37" in out
+    assert "Agent 00" not in out and "Agent 22" not in out
+
+
+def test_cap_sum_still_aggregates_every_agent() -> None:
+    """The cap is display-only: the sum row aggregates ALL 38 agents, not
+    just the rendered 15. tokens_out = 100*(1+2+...+38) = 74100 → "74K";
+    the 15 rendered agents alone (i=23..37) would sum to 46500 → "47K"."""
+    from status_line import _MAX_RENDERED_AGENTS
+
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": 0,
+            "tokens_out": (i + 1) * 100,
+            "tokens_cached": 0,
+            "description": f"Agent {i:02d}",
+        }
+        for i in range(38)
+    ]
+    assert len(agents) > _MAX_RENDERED_AGENTS
+
+    out = render_output("Session: x", 0, 0, 0, _main(0, 0, 0), agents)
+    sum_line = out.split("\n")[3]
+
+    assert sum_line.split() == ["|", "sum:", "0", "74K", "0"], sum_line
+    assert "47K" not in out, "sum must aggregate every agent, not the rendered 15"
+
+
+def test_cap_boundary_exactly_max_agents_no_marker() -> None:
+    """Exactly _MAX_RENDERED_AGENTS agents → every agent renders, NO marker
+    row: the cap suppresses nothing at or below the limit (small sessions
+    render exactly as before the cap existed)."""
+    from status_line import _MAX_RENDERED_AGENTS
+
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": 1,
+            "tokens_out": 1,
+            "tokens_cached": 1,
+            "description": f"Agent {i}",
+        }
+        for i in range(_MAX_RENDERED_AGENTS)
+    ]
+
+    out = render_output("Session: x", 0, 0, 0, _main(0, 0, 0), agents)
+    lines = out.split("\n")
+
+    assert len(lines) == 5 + _MAX_RENDERED_AGENTS, (
+        f"expected 5 + { _MAX_RENDERED_AGENTS } lines, got {len(lines)}"
+    )
+    assert "skipped" not in out, out
+    assert lines[5].startswith(_TABLE_ROW_PREFIX + "[ok]")
+
+
+def test_cap_marker_row_prices_mode_after_main() -> None:
+    """Prices mode: the "[skipped N agents]" marker row sits right after the
+    main: GROUP's rows (main expands to one row per model), before the
+    agent rows — same placement rule as the plain layout. The marker is
+    label-only: no model/token/cost/time cells."""
+    from status_line import _MAX_RENDERED_AGENTS
+
+    agents = [
+        {
+            "status": "ok",
+            "tokens_in": 10,
+            "tokens_out": 5,
+            "tokens_cached": 2,
+            "description": f"Agent {i:02d}",
+            "models": {"glm-5.3": {"in": 10, "out": 5, "cached": 2}},
+        }
+        for i in range(_MAX_RENDERED_AGENTS + 3)
+    ]
+    main_models = {
+        "kimi-k3": {"in": 2_000_000, "out": 100_000, "cached": 0},
+        "glm-5.3": {"in": 100, "out": 10, "cached": 5},
+    }
+
+    out = render_output("Session: x", 0, 0, 0, main_models, agents,
+                        prices=_PRICES, host="")
+    lines = out.split("\n")
+
+    # header + label + start + sum(2 models) + main(2 models) + marker
+    # + 15 agent rows
+    assert len(lines) == 8 + _MAX_RENDERED_AGENTS, (
+        f"expected 8 + cap lines, got {len(lines)}: {lines!r}"
+    )
+    # main group spans lines 5-6 (kimi-k3 first per first-appearance order)
+    assert lines[5].split()[:2] == ["|", "main:"], lines[5]
+    assert lines[6].split()[:1] == ["|"] and "glm-5.3" in lines[6], lines[6]
+    # marker row right after the main group, label-only
+    assert lines[7] == _TABLE_ROW_PREFIX + "[skipped 3 agents]", lines[7]
+    # agent rows follow, newest 20 only
+    assert lines[8].startswith(_TABLE_ROW_PREFIX + "[ok]"), lines[8]
+    assert "Agent 00" not in out and "Agent 02" not in out
+    assert "Agent 03" in out
 
 
 # ---------------------------------------------------------------------------
